@@ -1,0 +1,217 @@
+# Mission plan — m-c22294
+
+**Goal:** Run the engine's existing secret scan over each feature's own commit range when the worker's run ends, using the allowlist pinned at the approval base, so an unwaived finding in a worker-made commit is reported against that feature (fingerprint, rule, location, never the matched text) before the milestone gate, while the merge and push scans stay unchanged.
+
+Branch `kranz/mission-m-c22294` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Authority granted on approval
+
+Approving this plan grants the following to the mission's sessions with no further prompt.
+
+**Commands** (2; each is a prefix, so `x` also allows `x <anything>`):
+- `cargo run -q --locked -p kranz -- scan`
+- `cargo run --locked --package kranz -- knowledge-refresh`
+
+**Write paths** (5; glob patterns the mission may change):
+- `crates/engine/src/git_ops.rs`
+- `crates/engine/src/orchestrator.rs`
+- `crates/engine/tests/git_ops_test.rs`
+- `crates/engine/tests/mission_test.rs`
+- `docs/knowledge/**`
+
+## Cost estimate
+
+Estimated **$7.76 – $38.81** (expected ~$17.87). Rough estimate — live usage is authoritative; based on 49 completed mission(s).
+
+Context-fit check (corpus p90 over 57 plan(s): 4213 chars / 23 files):
+- **f-1-2** (Sequential path: scan the feature's commit range before judgement) — spec is 6702 chars (corpus p90: 4213)
+- **f-2-1** (Parallel and pool paths: scan each worktree's commit range) — spec is 4747 chars (corpus p90: 4213)
+
+## Considered alternatives
+
+**Chosen approach:** A deterministic engine-side scan of each feature's net commit range, immediately before the judgement turn. It reuses one shared GitRepo helper with a separately named allowlist commit (the pinned approval base). Sequential findings respawn the worker with the findings as guidance, and on exhaustion the feature fails and the milestone blocks. Parallel findings fail the feature without merging; pool findings are recorded. This is the earliest point where the whole feature's work is final. It honours the frozen allowlist by giving the worker the only exit available mid-mission (rewording), and leaves merge.rs and exec.rs byte-identical.
+
+Rejected shapes:
+- **Fail the feature immediately on any finding, with no respawn** — The base allowlist is frozen at approval, so a false-positive fixture could only be cleared by an operator-driven fix feature, which costs more than a bounded respawn that tells the worker what to reword.
+- **Feed the findings into the model judgement turn and let the orchestrator decide** — A model could judge a policy refusal 'complete', and the turn costs tokens; the scan verdict must be engine-decided like the checkpoint and merge refusals.
+- **Scan in the milestone validation round, or scan the whole tree** — Too late (the feature is already paid for and attributed), and a whole-tree scan would refuse pre-existing base content the mission merely touches.
+- **Scan each worker commit individually instead of the net range** — This diverges from the merge and push rules: it would refuse a line the worker already reworded, which merge would accept.
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** Sequential path: when a worker commits a detector canary inside its session, the feature does not complete. Once the respawn budget is spent it is failed with a reason naming the fingerprint, the rule id and the path:line location, and its milestone blocks without ever reaching validating.
+  `out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_refuses_worker_committed_canary 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+- **[a2]** Sequential path: a worker commit with no secret findings passes the feature-range scan, and the feature completes through the normal judgement.
+  `out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_passes_clean_worker_commit 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+- **[a3]** A canary whose fingerprint is on the allowlist committed at the pinned approval base does not fail the feature.
+  `out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_honours_base_allowlist 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+- **[a4]** An allowlist entry for the canary's fingerprint, added inside the mission's own range (even by the same worker commit), waives nothing: the feature is still refused.
+  `out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_ignores_allowlist_added_in_range 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+- **[a5]** A finding is reported to the worker: the respawned worker's prompt names the fingerprint and location. When the respawned worker removes the flagged line in a new commit, the feature completes.
+  `out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_respawn_after_rewording_completes 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+- **[a6]** The matched canary text never appears in events.jsonl or in any worker or orchestrator session prompt during a feature-range refusal.
+  `out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_never_quotes_matched_text 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+- **[a7]** Parallel path: a worker that commits a canary in its parallel worktree has its feature failed, with a reason naming fingerprint, rule and location. Its branch is never merged into the mission branch.
+  `out=$(cargo test -p kranz-engine --test mission_test -- --exact parallel_worktree_scan_refuses_worker_committed_canary 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+- **[a8]** Dispatch pool: a candidate whose committed range carries an unwaived finding has the fingerprint, rule and location noted on its line in the dispatch decision record. The record does not quote the matched text.
+  `out=$(cargo test -p kranz-engine --lib pool_candidate_line_notes_feature_range_findings 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+- **[a9]** The shared range-scan helper takes its allowlist from a separately named commit, waives only fingerprints present at that commit, and returns an error (never an empty pass) when the range cannot be read.
+  `out=$(cargo test -p kranz-engine --test git_ops_test -- --exact secret_scan_range_reads_allowlist_from_a_separate_commit 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]' && out=$(cargo test -p kranz-engine --test git_ops_test -- --exact secret_scan_range_errors_on_unreadable_range 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+- **[a10]** The merge and push scans are unchanged and still refuse the same content: merge.rs and exec.rs are byte-identical to the base, and the existing merge, push and range-scan refusal tests pass.
+  `git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/merge.rs crates/cli/src/exec.rs && out=$(cargo test -p kranz-engine --test merge_test secret 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [3-9]' && out=$(cargo test -p kranz-engine --test git_ops_test -- --exact range_scan_refuses_a_secret_and_ignores_a_self_added_waiver 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]' && out=$(cargo test -p kranz push_is_refused_when_the_mission_range_fails_the_secret_scan 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+- **[a11]** The engine's existing dirty-tree checkpoint refusals still behave as before (sequential fail-and-block, parallel recorded refusal).
+  `out=$(cargo test -p kranz-engine --test mission_test secret_scan_refusal 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [3-9]'`
+- **[a12]** The mission itself adds no unwaived secret finding and does not touch the secret allowlist, so its own merge scan will pass.
+  `git diff --quiet $KRANZ_BASE_SHA -- .kranz/secret-allowlist && cargo run -q --locked -p kranz -- scan --range $KRANZ_BASE_SHA..HEAD`
+- **[a13]** Contract files change additively only: docs/protocol.md, crates/engine/src/events.rs and crates/engine/schemas/ have no removed lines relative to the base.
+  `! git diff -U0 $KRANZ_BASE_SHA -- docs/protocol.md crates/engine/src/events.rs crates/engine/schemas | grep -vE '^--- (a/|/dev/null)' | grep -qE '^-'`
+- **[a14]** Formatting is clean across the workspace.
+  `cargo fmt --all --check`
+- **[a15]** Clippy passes across the workspace with warnings denied.
+  `cargo clippy --workspace --all-targets -- -D warnings`
+- **[a16]** The full workspace test suite passes.
+  `cargo test --workspace`
+- **[a17]** The knowledge vault is fresh: no note citing a file this mission changed is left stale or unverifiable.
+  `cargo run --locked --package kranz -- knowledge-refresh`
+- **[a18]** docs/knowledge/validation/gates.md accurately describes the new feature-range scan. It covers when it runs (each worker run, before judgement, on sequential and parallel paths; record-only for pool candidates), the range it reads (the feature's own base..HEAD net diff), the allowlist source (the pinned approval base; in-range edits waive nothing), what happens on a finding (respawn with the findings as guidance, then fail-and-block), and that the merge and push scans are unchanged. *(agent judgement)*
+## Contract lint
+
+Each `check: command` assertion above was run once against the untouched base tree at approval time. Suspects are assertions that already pass (or could not reach a verdict) before this plan's work lands — a possible polarity/vacuity bug in the assertion itself. This never blocks approval.
+
+author-bug suspects (already pass / no verdict on the untouched base): [a10] git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/merge.rs crates/cli/src/exec.rs && out=$(cargo test -p kranz-engine --test merge_test secret 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [3-9]' && out=$(cargo test -p kranz-engine --test git_ops_test -- --exact range_scan_refuses_a_secret_and_ignores_a_self_added_waiver 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]' && out=$(cargo test -p kranz push_is_refused_when_the_mission_range_fails_the_secret_scan 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'; [a11] out=$(cargo test -p kranz-engine --test mission_test secret_scan_refusal 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [3-9]'; [a12] git diff --quiet $KRANZ_BASE_SHA -- .kranz/secret-allowlist && cargo run -q --locked -p kranz -- scan --range $KRANZ_BASE_SHA..HEAD; [a13] ! git diff -U0 $KRANZ_BASE_SHA -- docs/protocol.md crates/engine/src/events.rs crates/engine/schemas | grep -vE '^--- (a/|/dev/null)' | grep -qE '^-'; [a14] cargo fmt --all --check; [a15] cargo clippy --workspace --all-targets -- -D warnings
+base-expected-to-fail (benign): [a1] out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_refuses_worker_committed_canary 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'; [a2] out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_passes_clean_worker_commit 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'; [a3] out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_honours_base_allowlist 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'; [a4] out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_ignores_allowlist_added_in_range 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'; [a5] out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_respawn_after_rewording_completes 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'; [a6] out=$(cargo test -p kranz-engine --test mission_test -- --exact feature_range_scan_never_quotes_matched_text 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'; [a7] out=$(cargo test -p kranz-engine --test mission_test -- --exact parallel_worktree_scan_refuses_worker_committed_canary 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'; [a8] out=$(cargo test -p kranz-engine --lib pool_candidate_line_notes_feature_range_findings 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'; [a9] out=$(cargo test -p kranz-engine --test git_ops_test -- --exact secret_scan_range_reads_allowlist_from_a_separate_commit 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]' && out=$(cargo test -p kranz-engine --test git_ops_test -- --exact secret_scan_range_errors_on_unreadable_range 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'; [a16] cargo test --workspace
+not linted (never run on the base): [a17] cargo run --locked --package kranz -- knowledge-refresh
+
+named contract gates (defect classes):
+- vacuous-filter: PASS
+- wrong-polarity: PASS
+- passes-on-base: FAIL
+  [a10] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/merge.rs crates/cli/src/exec.rs && out=$(cargo test -p kranz-engine --test merge_test secret 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [3-9]' && out=$(cargo test -p kranz-engine --test git_ops_test -- --exact range_scan_refuses_a_secret_and_ignores_a_self_added_waiver 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]' && out=$(cargo test -p kranz push_is_refused_when_the_mission_range_fails_the_secret_scan 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [1-9]'`
+  [a11] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `out=$(cargo test -p kranz-engine --test mission_test secret_scan_refusal 2>&1) && printf '%s' "$out" | grep -qE 'test result: ok\. [3-9]'`
+  [a12] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `git diff --quiet $KRANZ_BASE_SHA -- .kranz/secret-allowlist && cargo run -q --locked -p kranz -- scan --range $KRANZ_BASE_SHA..HEAD`
+  [a13] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `! git diff -U0 $KRANZ_BASE_SHA -- docs/protocol.md crates/engine/src/events.rs crates/engine/schemas | grep -vE '^--- (a/|/dev/null)' | grep -qE '^-'`
+  [a14] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo fmt --all --check`
+  [a15] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo clippy --workspace --all-targets -- -D warnings`
+- env-sensitive: PASS
+
+
+## Milestone 1 — Sequential missions refuse a worker-committed secret at the feature
+
+### 1.1 Shared range-scan helper with a separate allowlist commit
+
+Repository: Kranz, a Rust workspace (crates/engine is package `kranz-engine`, crates/cli is package `kranz`). Read docs/knowledge/validation/gates.md (section 'Secret scanning') and docs/merge-gates.md first.
+
+Context: crates/engine/src/git_ops.rs has `GitRepo::secret_scan_range_refusal(&self, base_sha: &str, tip: &str) -> Result<Option<String>>` (around line 1280). It diffs `base_sha..tip` with `self.diff_full`, reads `.kranz/secret-allowlist` from `base_sha` via `self.show_file(base_sha, scrub::SECRET_ALLOWLIST_PATH)`, filters with `scrub::filter_allowed(scrub::scan_unified_diff(&diff), &allowed)` and formats a refusal with `scrub::format_findings`. `kranz exec --push` (crates/cli/src/exec.rs:508) calls it. A later feature needs the same scan where the RANGE START (a feature's own base) differs from the ALLOWLIST COMMIT (the mission's approval-pinned base), and it needs the structured findings, not a string.
+
+Do this:
+1. Add `pub fn secret_scan_range(&self, allowlist_sha: Option<&str>, from: &str, to: &str) -> Result<Vec<scrub::SecretFinding>>` to `GitRepo`. It returns unwaived findings among the ADDED lines of `diff_full(from, to)`. The allowlist is read from `allowlist_sha` with `show_file`; `None` means an empty allowlist (waives nothing). A missing allowlist file at that commit is also an empty allowlist. Any git error reading the diff or the allowlist commit returns `Err`, never `Ok(vec![])`. Give it a doc comment explaining why the allowlist commit is separate: a mission's own allowlist edits waive nothing.
+2. Reimplement `secret_scan_range_refusal` on top of it (`self.secret_scan_range(Some(base_sha), base_sha, tip)`), keeping its output text byte-identical. Do NOT edit crates/engine/src/merge.rs or crates/cli/src/exec.rs at all; they must stay byte-identical to the base.
+3. Add tests to crates/engine/tests/git_ops_test.rs, following the style of the existing `range_scan_refuses_a_secret_and_ignores_a_self_added_waiver` (uses `setup()`, `seeded_repo()`, `write`, `raw_git`):
+   - `secret_scan_range_reads_allowlist_from_a_separate_commit`. Commit an allowlist (`git add -f .kranz/secret-allowlist`) holding the canary's fingerprint at commit A. Get the fingerprint from `kranz_engine::scrub::scan_text` on the canary line, or from a first unwaived scan. Then commit the canary at a later commit, so the range B..tip does not include A. Assert: `secret_scan_range(Some(A), B, tip)` returns no findings. `secret_scan_range(Some(B_before_allowlist_or_base), ...)` and `secret_scan_range(None, ...)` return the finding with the expected rule id and a location of the form `path:line`. An allowlist added only inside the range does not waive.
+   - `secret_scan_range_errors_on_unreadable_range`: a nonexistent sha as `from` returns `Err`.
+   No assertion message may print a finding's matched text.
+
+SECRET-FIXTURE RULE (critical): this mission's own merge scans its diff against the base allowlist, and an allowlist edit inside the mission waives nothing. Reuse ONLY canary values already present in the test files, for example the literal used in `range_scan_refuses_a_secret_and_ignores_a_self_added_waiver`. Fingerprints are rule+value, so an existing value is already waived. Never invent a new secret-shaped literal and never edit .kranz/secret-allowlist. Before reporting, run `cargo run -q --locked -p kranz -- scan --range $(git merge-base HEAD main)..HEAD` (or against the mission base) and confirm 'secret scan passed'.
+
+Run bare, reading exit codes: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p kranz-engine --test git_ops_test`, `cargo test -p kranz push_is_refused_when_the_mission_range_fails_the_secret_scan`.
+
+Done when:
+- `cargo test -p kranz-engine --test git_ops_test -- --exact secret_scan_range_reads_allowlist_from_a_separate_commit` passes, and proves waiver only by a fingerprint present at the named allowlist commit, no waiver for None or for an in-range allowlist, and a `path:line` location with the rule id
+- `cargo test -p kranz-engine --test git_ops_test -- --exact secret_scan_range_errors_on_unreadable_range` passes (Err, never an empty pass)
+- `range_scan_refuses_a_secret_and_ignores_a_self_added_waiver` and the cli test `push_is_refused_when_the_mission_range_fails_the_secret_scan` still pass unmodified
+- `git diff --quiet <base> -- crates/engine/src/merge.rs crates/cli/src/exec.rs .kranz/secret-allowlist` exits 0
+- `kranz scan --range <base>..HEAD` reports 'secret scan passed' over the feature's diff
+
+### 1.2 Sequential path: scan the feature's commit range before judgement
+
+Repository: Kranz (Rust; crates/engine = package `kranz-engine`). Read docs/knowledge/validation/gates.md ('Secret scanning') first.
+
+Prerequisite already on the branch: `GitRepo::secret_scan_range(&self, allowlist_sha: Option<&str>, from: &str, to: &str) -> Result<Vec<scrub::SecretFinding>>` in crates/engine/src/git_ops.rs. It returns unwaived findings among the added lines of from..to, with the allowlist read from allowlist_sha (None = empty), and errors when the diff is unreadable. `scrub::format_findings(&[SecretFinding])` renders `fingerprint [rule] path:line bytes a..b`, never the matched value.
+
+Problem: in crates/engine/src/orchestrator.rs, `run_feature`'s post-run flow (around lines 3810–3910) does the following. It runs the dirty-tree checkpoint (`resolve_dirty_tree`, which scans only the engine's own checkpoint commit). It computes `commits = self.record_feature_progress(mi, fi, &feature_base_sha)?`, then the worker-deny grant park, `emit_worker_escalation`, `emit_worker_questions`, and then `judge_worker_run` (a model turn), whose `Complete` emits `feature.completed`. Commits the worker made inside its session are never scanned there; they are found only at merge or push.
+
+Implement, in the sequential `run_feature` flow, IMMEDIATELY BEFORE the `judge_worker_run` call (after the deny-grant park and the escalation/question emissions):
+1. Run `self.active_repo().secret_scan_range(self.state.mission.base_sha.as_deref(), &feature_base_sha, "HEAD")`. `feature_base_sha` is the feature's recorded base, stable across respawns, so the scan covers the NET diff of the whole feature and a later rewording commit clears an earlier finding, exactly as the merge scan would. The allowlist always comes from the mission's approval-pinned `base_sha`; a legacy mission with no pinned sha uses an empty allowlist.
+2. On `Err`: emit an orchestrator decision and `EventKind::FeatureFailed` (reason starting `feature-range secret scan could not read the feature's diff: ...`, commits = the recorded commits), then return Ok(()). Never treat it as a pass, and never `?` it out of the run loop.
+3. On a non-empty finding list, the ENGINE decides deterministically, with no model judgement turn:
+   - `emit_decision` with summary `feature-range secret scan for <feature_id>: N unwaived finding(s)` and detail = `format_findings` output.
+   - If the respawn budget remains (mirror the existing `JudgementOutcome::Respawn` arm exactly: `respawns.saturating_sub(grant_respawns) < self.state.config.max_respawns`), set `guidance` to an engine-written message and `continue` the loop. The message: `The engine's feature-range secret scan found N unwaived finding(s) in this feature's commits (<feature_base_sha>..HEAD), judged against the secret allowlist pinned at plan approval:\n<format_findings>\nRemove or reword each flagged line in a NEW commit. Editing .kranz/secret-allowlist inside the mission waives nothing.`
+   - Otherwise emit `FeatureFailed { reason: "feature-range secret scan: N unwaived finding(s) against the allowlist pinned at approval:\n<format_findings>", commits }`. Then emit `MilestoneBlocked { block_context: Some(BlockContext::engine(BlockCause::SecretScan)), milestone_id, reason }`, where the reason names the feature, the fingerprints and locations, and states that the pinned allowlist cannot be extended mid-mission, so the flagged lines must be removed or reworded (for example via a fix feature after an operator message). Return Ok(()). The milestone must not reach validating.
+   No text may quote the matched value; only format_findings output and fixed prose.
+4. Do not change `resolve_dirty_tree`, the checkpoint scan, merge.rs, exec.rs, events.rs or any event shape: reuse the existing events and `BlockCause::SecretScan`.
+
+Tests: add to crates/engine/tests/mission_test.rs, next to section '13. Checkpoint secret-scan refusals' (around line 10427). Reuse `LEAKED_SECRET`, `MockBackend::with_scripts`, `MockScript::single_shot_json(...).writes_file(path, contents).commits_all(msg)` (commits_all runs `git add -A && git commit` in the session cwd after the writes, which makes a worker-shaped commit), plus `orch_script`, `make_engine`, `test_cfg`, `simple_plan`, `read_log` and `backend.started_specs()`. Set `max_respawns` explicitly in each test's MissionConfig. Respawned workers can use a no-write passing script, since the canary stays in the feature range. Exact test names (each must pass alone with `-- --exact`):
+   - `feature_range_scan_refuses_worker_committed_canary`: the worker commits a file containing the canary and reports pass. Assert the feature ends Failed. The `feature.failed` reason contains the fingerprint (computed with `kranz_engine::scrub::scan_text` on the committed content), the rule id `anthropic-api-key` and `<file>:<line>`. There is no `feature.completed` for it, the milestone is Blocked with a SecretScan block, and there is no `milestone.validating` event.
+   - `feature_range_scan_passes_clean_worker_commit`: the worker commits a clean file, and the feature completes after a normal judgement turn.
+   - `feature_range_scan_honours_base_allowlist`: before `approve_plan`, commit `.kranz/secret-allowlist` (use `git add -f`) holding the canary's fingerprint to the test repo. The worker commits the canary, and the feature completes.
+   - `feature_range_scan_ignores_allowlist_added_in_range`: the worker's own commit adds both the canary and an allowlist entry for it, and the feature is still refused.
+   - `feature_range_scan_respawn_after_rewording_completes`: the first worker commits the canary. The respawned worker overwrites the file with clean content and commits. Assert the second worker spawn's prompt contains the fingerprint and `<file>:<line>` but not the canary, and that the feature completes.
+   - `feature_range_scan_never_quotes_matched_text`: across a refusal run, neither the raw events.jsonl text nor any started session's prompt contains `LEAKED_SECRET`.
+
+SECRET-FIXTURE RULE (critical): this mission's own merge scans its diff against the base allowlist, and in-mission allowlist edits waive nothing. Reference only the existing `LEAKED_SECRET` constant (and existing canary literals) in new test code, copying the `ANTHROPIC_API_KEY=[REDACTED] shape from `worker_leaks_secret`. Never write a new secret-shaped literal, and never edit .kranz/secret-allowlist. Before reporting, run `cargo run -q --locked -p kranz -- scan --range <mission base>..HEAD` and confirm 'secret scan passed'.
+
+Run bare, reading exit codes: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p kranz-engine --test mission_test`, `cargo test -p kranz-engine --lib`.
+
+Done when:
+- Each of `feature_range_scan_refuses_worker_committed_canary`, `feature_range_scan_passes_clean_worker_commit`, `feature_range_scan_honours_base_allowlist`, `feature_range_scan_ignores_allowlist_added_in_range`, `feature_range_scan_respawn_after_rewording_completes` and `feature_range_scan_never_quotes_matched_text` passes alone via `cargo test -p kranz-engine --test mission_test -- --exact <name>`
+- The refusal's feature.failed reason contains fingerprint, rule id and path:line; the milestone is Blocked with cause SecretScan, and no milestone.validating event is emitted
+- A respawn's worker prompt names the fingerprint and location and never the canary
+- The existing tests matching `secret_scan_refusal` in mission_test still pass
+- merge.rs, exec.rs, events.rs and .kranz/secret-allowlist are unchanged; `kranz scan --range <base>..HEAD` passes
+
+
+## Milestone 2 — Parallel worktrees and dispatch-pool candidates are scanned, and the gate docs describe it
+
+### 2.1 Parallel and pool paths: scan each worktree's commit range
+
+Repository: Kranz (Rust; crates/engine = package `kranz-engine`). Read docs/knowledge/validation/gates.md ('Secret scanning') first.
+
+Already on the branch: `GitRepo::secret_scan_range(&self, allowlist_sha: Option<&str>, from: &str, to: &str) -> Result<Vec<scrub::SecretFinding>>` in crates/engine/src/git_ops.rs. It returns unwaived findings among the added lines, with the allowlist read from allowlist_sha (None = empty), and errors when the range is unreadable. `scrub::format_findings` renders fingerprint, [rule] and path:line without the matched value. The sequential `run_feature` path in crates/engine/src/orchestrator.rs already runs this scan before judgement; search for `feature-range secret scan` to match its wording.
+
+Part 1, parallel worktrees. In crates/engine/src/orchestrator.rs, `append_and_judge_worktree` (around lines 5404–5476) checkpoints the worktree, computes commits over `start_sha..HEAD` in `wt_repo`, then calls `judge_worker_run`. `Complete` returns `WorktreeDisposition::Ready`; otherwise it returns `NotReady`. The caller (around line 5198) fails NotReady features with the generic reason 'worker run did not complete in its parallel worktree' and never merges their branch. Change it so that, after the checkpoint and before `judge_worker_run`, it runs `wt_repo.secret_scan_range(self.state.mission.base_sha.as_deref(), start_sha, "HEAD")` (the worktree shares the object database, so the base sha resolves).
+   - On findings: `emit_decision` (summary `feature-range secret scan for <feature_id>: N unwaived finding(s)`, detail = format_findings) and return a disposition whose `feature.failed` reason is `feature-range secret scan: N unwaived finding(s) against the allowlist pinned at approval:\n<format_findings>`. You may extend the private `WorktreeDisposition` enum, for example with a variant carrying a reason string. The branch must not be merged.
+   - On `Err`: fail the feature the same way, with a reason saying the diff could not be read.
+   - No judgement turn runs for a refused worktree.
+
+Part 2, dispatch pool. In `run_dispatch_pool_inner` (around lines 4407–4513), each inspected candidate gets a line `- candidate i/n: ... — run ..., K commit(s){note}`. After the checkpoint and commit count, run `wt_repo.secret_scan_range(self.state.mission.base_sha.as_deref(), pre_run_sha, "HEAD")`. Append to `note`, for findings, `; feature-range secret scan: N unwaived finding(s): <format_findings joined with "; ">`, or for an Err, `; feature-range secret scan could not read the range (<error>)`. This is record-only: the pool still parks for human judgement exactly as before, and the candidate still joins `inspected`.
+
+Do not change merge.rs, exec.rs, events.rs, the checkpoint scan, or any event shape. Never quote matched text.
+
+Tests:
+   - In crates/engine/tests/mission_test.rs, `parallel_worktree_scan_refuses_worker_committed_canary`. Model it on `parallel_secret_scan_refusal_is_recorded_not_swallowed`: max_parallel_workers 2, `orch_script(vec![parallel_plan(&["f-1-1","f-1-2"])])`, workers `MockScript::single_shot_json(pass report).writes_file("leak.txt", format!("ANTHROPIC_API_KEY=[REDACTED]")).commits_all("worker commit")`. Both workers leak, because worker-to-feature pairing is scheduler-dependent. Assert each feature is Failed, with a reason containing the fingerprint (from `kranz_engine::scrub::scan_text`), `anthropic-api-key` and `leak.txt:1`. Assert leak.txt is absent from the mission branch HEAD and that events.jsonl never contains LEAKED_SECRET.
+   - In the `#[cfg(test)]` module of crates/engine/src/orchestrator.rs, `pool_candidate_line_notes_feature_range_findings`. Model it on the existing dispatch-pool unit tests (search for `pre_run_sha` near line 14810). A candidate worker commits a canary in its worktree. Assert the dispatch decision's detail line for that candidate contains `feature-range secret scan`, the fingerprint and `path:line`, does not contain the canary, and that the milestone still parks as before. Reuse an existing canary literal from that test module or from git_ops tests.
+
+SECRET-FIXTURE RULE (critical): this mission's own merge scans its diff against the base allowlist, and in-mission allowlist edits waive nothing. Reference only existing canary constants or literals (for example `LEAKED_SECRET`), copying existing line shapes. Never add a new secret-shaped literal, and never edit .kranz/secret-allowlist. Before reporting, run `cargo run -q --locked -p kranz -- scan --range <mission base>..HEAD` and confirm 'secret scan passed'.
+
+Run bare, reading exit codes: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test -p kranz-engine --test mission_test`, `cargo test -p kranz-engine --lib`.
+
+Done when:
+- `cargo test -p kranz-engine --test mission_test -- --exact parallel_worktree_scan_refuses_worker_committed_canary` passes: both features are Failed with reasons naming fingerprint, rule and leak.txt:1, and leak.txt is not on the mission branch
+- `cargo test -p kranz-engine --lib pool_candidate_line_notes_feature_range_findings` passes: the candidate line notes findings without the canary, and the pool still parks
+- The existing tests `parallel_secret_scan_refusal_is_recorded_not_swallowed` and the existing dispatch-pool tests still pass
+- merge.rs, exec.rs, events.rs and .kranz/secret-allowlist are unchanged; `kranz scan --range <base>..HEAD` passes
+
+### 2.2 Document the feature-range scan and recheck the knowledge vault
+
+Repository: Kranz. Earlier features on this branch added a fourth secret-scan layer. After every worker run, before the judgement turn, the engine scans the feature's own commit range: sequentially `feature_base_sha..HEAD` (the net diff of the whole feature, stable across respawns); in a parallel worktree `start_sha..HEAD`. It uses the existing rules via `GitRepo::secret_scan_range` in crates/engine/src/git_ops.rs, with the allowlist read from the mission's approval-pinned `base_sha`, so an allowlist edit inside the mission waives nothing.
+   - Sequential: a finding respawns the worker with engine-written guidance naming fingerprint, rule and path:line, within `max_respawns` and without a model judgement turn. On exhaustion the feature fails with the findings in its reason and the milestone blocks with cause `secret-scan`.
+   - Parallel: the feature fails and its branch is never merged.
+   - Dispatch pool: findings are noted on the candidate's line, record-only.
+   - An unreadable range fails the feature.
+   - The merge pre-gate and the `kranz exec --push` range scan are unchanged.
+   - The matched text is never quoted. Read the diff (`git log`/`git diff` against main) to confirm the exact behaviour before writing.
+
+Do this:
+1. In docs/knowledge/validation/gates.md, under '## Secret scanning — three layers': rename it to four layers and add a bullet for the feature-range scan, accurate to the code. Add `crates/engine/src/git_ops.rs` to `verified_against` if it is not already there. Set `last_verified` to the current UTC date, and add a dated 'Rechecked YYYY-MM-DD (UTC) against ...' paragraph at the top of the body, in the existing style, stating what changed: gate commands, the merge pre-gate and push scan are unchanged. Keep the existing prose style (no marketing tone).
+2. Run `cargo run --locked --package kranz -- knowledge-refresh` (it needs full git history, which the local checkout has). For every note it flags because it cites a file this mission changed (git_ops.rs, orchestrator.rs, git_ops_test.rs, mission_test.rs), recheck that note against the change, then update its `last_verified` and add a short 'Rechecked' line in that note's own style. Only edit notes under docs/knowledge/. If it flags a note for a reason unrelated to this mission's files, do not paper over it; report it in knownGaps.
+3. Do not edit docs/protocol.md or any code, and do not quote any secret-shaped text in docs. The allowlist header warns that a quoted example trips the scanner.
+
+Run bare and read the exit codes: `cargo run --locked --package kranz -- knowledge-refresh` (must exit 0) and `cargo run -q --locked -p kranz -- scan --range <mission base>..HEAD` (must pass).
+
+Done when:
+- `cargo run --locked --package kranz -- knowledge-refresh` exits 0 and prints 'knowledge refresh: ok'
+- gates.md's secret-scanning section describes the feature-range scan: timing, range, pinned-base allowlist, respawn then fail-and-block, the parallel and pool behaviour, and unchanged merge and push
+- gates.md has an updated last_verified and a dated Rechecked note
+- Only files under docs/knowledge/ change in this feature; `kranz scan --range <base>..HEAD` passes
