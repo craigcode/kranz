@@ -511,14 +511,14 @@ entropy-gated pass ≥4.0 bits/char; no external deps).
   ([git_ops.rs](../../../crates/engine/src/git_ops.rs)), with the allowlist read
   from the mission's approval-pinned `base_sha` (so an allowlist edit inside
   the mission waives nothing):
-  - **Sequential:** `feature_base_sha..HEAD` — the net diff of the whole
+  - **Sequential:** `feature_base_sha..HEAD`, the net diff of the whole
     feature, stable across respawns. A finding respawns the worker with
     engine-written guidance naming fingerprint, rule and path:line, within
     `max_respawns` and without a model judgement turn. On exhaustion the
     feature fails with the findings in its reason and the milestone blocks
     with cause `secret-scan`.
   - **Parallel:** in the worktree, `start_sha..HEAD`. A finding fails the
-    feature and its branch is never merged — no respawn in this path.
+    feature and its branch is never merged. There is no respawn in this path.
   - **Dispatch pool:** findings are noted on the candidate's line, record-only;
     the pool still parks for human judgement regardless.
   - An unreadable range is never a silent pass: on the sequential and
