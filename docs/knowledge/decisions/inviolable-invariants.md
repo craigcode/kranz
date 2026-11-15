@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-14
+last_verified: 2026-11-15
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-15 (UTC) against a test-only change in `control.rs` and `container_egress.rs`: two unit tests no longer depend on the scratch directory sitting outside a mission directory, so they pass under the contract gate's `TMPDIR`. No behaviour described here changed.
 
 Rechecked 2026-11-14 (UTC) against the grant decision binding fixes: a grant decision can now be bound to the pending request's sequence number and kind, and a mismatch is refused without changing the pending request or widening any grant. `types.rs` gained fields only. No invariant changed.
 
