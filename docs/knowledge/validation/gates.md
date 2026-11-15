@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-14
+last_verified: 2026-11-15
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -61,8 +61,8 @@ verified_against:
   - docs/tickets.md
 ---
 
-Rechecked 2026-11-14 (UTC) against the `docs/tickets.md` change adding a
-section on reshaping a parked draft (abandon + redraft). No gate changed.
+Rechecked 2026-11-15 (UTC) against the `docs/tickets.md` change adding a
+section on reshaping a parked draft (abandon, then redraft). No gate changed.
 
 Rechecked 2026-11-14 (UTC) against the grant decision binding fixes: grant decisions from REST, the dashboard and Slack may name the pending request's sequence number and kind and are refused as superseded on a mismatch; an expired one-call permission card stays in place in the dashboard. Gate behaviour and the denial signal are unchanged.
 
