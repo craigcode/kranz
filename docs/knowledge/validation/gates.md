@@ -64,6 +64,8 @@ verified_against:
 Rechecked 2026-11-15 (UTC) against the `docs/tickets.md` change adding a
 section on reshaping a parked draft (abandon, then redraft). No gate changed.
 
+Rechecked 2026-11-14 (UTC) against a second `docs/tickets.md` change for `kranz ticket import-atlas`: only the section on tickets imported from a Magic Atlas bundle changed (what the reference-only loose end shows when a reference link carries its facts and kinds). No gate, acceptance requirement or consent behavior changed.
+
 Rechecked 2026-11-15 (UTC) against a test-only change in `control.rs` and `container_egress.rs`: two unit tests no longer depend on the scratch directory sitting outside a mission directory, so they pass under the contract gate's `TMPDIR`. No behaviour described here changed.
 
 Rechecked 2026-11-14 (UTC) against the grant decision binding fixes: grant decisions from REST, the dashboard and Slack may name the pending request's sequence number and kind and are refused as superseded on a mismatch; an expired one-call permission card stays in place in the dashboard. Gate behaviour and the denial signal are unchanged.
