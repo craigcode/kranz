@@ -1664,9 +1664,17 @@ fn secret_scan_range_reads_allowlist_from_a_separate_commit() {
         .to_string();
     let tip = commit_b.clone();
 
-    // Allowlist from commit A (outside the range) waives the finding.
+    // Without an allowlist commit, the range base..tip (which includes
+    // commit B's canary) reports exactly one finding.
     assert_eq!(
-        repo.secret_scan_range(Some(&commit_a), &commit_b, &tip)
+        repo.secret_scan_range(None, &base, &tip).unwrap().len(),
+        1,
+        "with no allowlist commit, the canary in the range must be reported"
+    );
+
+    // Allowlist from commit A waives the finding over the SAME range.
+    assert_eq!(
+        repo.secret_scan_range(Some(&commit_a), &base, &tip)
             .unwrap(),
         Vec::new(),
         "a fingerprint waived at the named allowlist commit must be filtered out"
@@ -1688,24 +1696,17 @@ fn secret_scan_range_reads_allowlist_from_a_separate_commit() {
     assert_eq!(path, "notes.txt");
     assert!(line.parse::<usize>().is_ok(), "line must be numeric");
 
-    // Allowlist pinned at the pre-allowlist base: still nothing waived.
+    // Allowlist commit pinned at base: the allowlist is read from the named
+    // commit, not assumed from the range start, so nothing is waived even
+    // though base..tip's diff includes commit A (which adds the waiver) --
+    // an allowlist edit inside the scanned range only counts if it IS the
+    // named allowlist commit.
     assert_eq!(
         repo.secret_scan_range(Some(&base), &base, &tip)
             .unwrap()
             .len(),
         1,
         "the allowlist commit must be read, not assumed from the range start"
-    );
-
-    // An allowlist added only INSIDE the scanned range (base..tip includes
-    // commit A, which adds the waiver) must not waive anything when the
-    // allowlist commit itself is pinned outside the range (at base).
-    assert_eq!(
-        repo.secret_scan_range(Some(&base), &base, &tip)
-            .unwrap()
-            .len(),
-        1,
-        "an allowlist edit inside the range must not count unless it is the named allowlist commit"
     );
 }
 
