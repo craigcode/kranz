@@ -10703,6 +10703,379 @@ async fn parallel_secret_scan_refusal_is_recorded_not_swallowed() {
 }
 
 // ---------------------------------------------------------------------------
+// 13b. Feature-range secret scan (worker-made commits, scanned before
+// judgement — the gap the checkpoint scan above does not cover)
+// ---------------------------------------------------------------------------
+
+/// The canary's content as the worker commits it.
+fn leaked_secret_file_contents() -> String {
+    format!("ANTHROPIC_API_KEY={LEAKED_SECRET}\n")
+}
+
+/// The fingerprint the engine's scan must report for the canary — computed
+/// independently via `scrub::scan_text`, never by re-deriving it from the
+/// orchestrator code under test.
+fn leaked_secret_fingerprint() -> String {
+    kranz_engine::scrub::scan_text(&leaked_secret_file_contents())
+        .into_iter()
+        .find(|f| f.rule_id == "anthropic-api-key")
+        .expect("the canary must trip the anthropic-api-key rule")
+        .fingerprint
+}
+
+/// Worker script: the session commits a canary-bearing file itself (a
+/// worker-shaped commit, not a dirty-tree leftover) and reports pass.
+fn worker_commits_canary() -> MockScript {
+    MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "implemented and tested",
+        "filesTouched": ["leak.txt"],
+        "testsAdded": [],
+        "testEvidence": "all green",
+        "commits": []
+    }))
+    .writes_file("leak.txt", leaked_secret_file_contents())
+    .commits_all("add leak.txt")
+}
+
+/// Worker script: the session commits a clean file itself and reports pass.
+fn worker_commits_clean() -> MockScript {
+    MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "implemented and tested",
+        "filesTouched": ["delivered.txt"],
+        "testsAdded": [],
+        "testEvidence": "all green",
+        "commits": []
+    }))
+    .writes_file("delivered.txt", "nothing secret here\n")
+    .commits_all("add delivered.txt")
+}
+
+/// Sequential path: the worker's own commit (not a dirty-tree leftover)
+/// carries an unwaived secret. The feature-range scan must catch it BEFORE
+/// the judgement turn — no judgement turn is ever spent, and the milestone
+/// blocks instead of reaching validation.
+#[tokio::test(flavor = "multi_thread")]
+async fn feature_range_scan_refuses_worker_committed_canary() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_commits_canary(),
+        // Only the seed turn: budget is 0, so the scan fails the feature
+        // directly — no dirty-tree turn (the worker left a clean tree) and
+        // no judgement turn (the scan short-circuits before it).
+        orch_script(vec![]),
+    ]));
+
+    let cfg = MissionConfig {
+        max_respawns: 0,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect("a feature-range scan refusal must not error the run loop");
+    assert_eq!(status, MissionStatus::Blocked);
+    assert_eq!(
+        engine.state().mission.milestones[0].features[0].status,
+        FeatureStatus::Failed
+    );
+    assert_eq!(
+        engine.state().mission.milestones[0].status,
+        MilestoneStatus::Blocked
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    let fingerprint = leaked_secret_fingerprint();
+    let reason = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::FeatureFailed { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("feature.failed is on the log");
+    assert!(
+        reason.contains(&fingerprint),
+        "reason names the fingerprint: {reason}"
+    );
+    assert!(
+        reason.contains("anthropic-api-key"),
+        "reason names the rule: {reason}"
+    );
+    assert!(
+        reason.contains("leak.txt:1"),
+        "reason names the path:line: {reason}"
+    );
+
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::FeatureCompleted { .. })),
+        "no feature.completed for a refused feature"
+    );
+    let blocked = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::MilestoneBlocked {
+                block_context,
+                reason,
+                ..
+            } => Some((block_context.clone(), reason.clone())),
+            _ => None,
+        })
+        .expect("milestone.blocked is on the log");
+    assert_eq!(
+        blocked.0,
+        Some(BlockContext::engine(BlockCause::SecretScan))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::MilestoneValidating { .. })),
+        "the milestone must never reach validating"
+    );
+}
+
+/// A worker commit that carries no secret sails through the feature-range
+/// scan and the feature completes after a normal judgement turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn feature_range_scan_passes_clean_worker_commit() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_commits_clean(),
+        orch_script(vec![judgement("complete", "")]),
+    ]));
+
+    let cfg = MissionConfig {
+        max_respawns: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect("a clean worker commit must not error the run loop");
+    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(
+        engine.state().mission.milestones[0].features[0].status,
+        FeatureStatus::Complete
+    );
+}
+
+/// A fingerprint allowlisted at the mission's approval base (committed to
+/// `.kranz/secret-allowlist` BEFORE `approve_plan` pins `base_sha`) waives
+/// the canary, so the feature completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn feature_range_scan_honours_base_allowlist() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let allowlist_dir = root.join(".kranz");
+    std::fs::create_dir_all(&allowlist_dir).unwrap();
+    std::fs::write(
+        allowlist_dir.join("secret-allowlist"),
+        format!("{}\n", leaked_secret_fingerprint()),
+    )
+    .unwrap();
+    raw_git(&root, &["add", "-f", ".kranz/secret-allowlist"]);
+    raw_git(&root, &["commit", "-m", "allowlist the canary at approval base"]);
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_commits_canary(),
+        orch_script(vec![judgement("complete", "")]),
+    ]));
+
+    let cfg = MissionConfig {
+        max_respawns: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect("a base-allowlisted canary must not error the run loop");
+    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(
+        engine.state().mission.milestones[0].features[0].status,
+        FeatureStatus::Complete
+    );
+}
+
+/// A worker commit that adds BOTH the canary and an allowlist entry for it,
+/// within the scanned range, must not waive the finding: the allowlist is
+/// always read from the mission's approval-pinned base, never from a commit
+/// inside the feature's own range.
+#[tokio::test(flavor = "multi_thread")]
+async fn feature_range_scan_ignores_allowlist_added_in_range() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        MockScript::single_shot_json(&json!({
+            "result": "pass",
+            "summary": "implemented and tested",
+            "filesTouched": ["leak.txt", ".kranz/secret-allowlist"],
+            "testsAdded": [],
+            "testEvidence": "all green",
+            "commits": []
+        }))
+        .writes_file("leak.txt", leaked_secret_file_contents())
+        .writes_file(
+            ".kranz/secret-allowlist",
+            format!("{}\n", leaked_secret_fingerprint()),
+        )
+        .commits_all("add leak.txt and self-allowlist it"),
+        orch_script(vec![]),
+    ]));
+
+    let cfg = MissionConfig {
+        max_respawns: 0,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect("a feature-range scan refusal must not error the run loop");
+    assert_eq!(status, MissionStatus::Blocked);
+    assert_eq!(
+        engine.state().mission.milestones[0].features[0].status,
+        FeatureStatus::Failed,
+        "the in-range allowlist edit must waive nothing"
+    );
+}
+
+/// After a refusal, a respawned worker that reworks the flagged line in a
+/// NEW commit clears the finding on the net diff — and the respawned
+/// worker's own prompt names the fingerprint and location, never the canary.
+#[tokio::test(flavor = "multi_thread")]
+async fn feature_range_scan_respawn_after_rewording_completes() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_commits_canary(),
+        orch_script(vec![]),
+        worker_commits_clean(),
+        orch_script(vec![judgement("complete", "")]),
+    ]));
+
+    let cfg = MissionConfig {
+        max_respawns: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect("a respawn after rewording must not error the run loop");
+    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(
+        engine.state().mission.milestones[0].features[0].status,
+        FeatureStatus::Complete
+    );
+
+    let fingerprint = leaked_secret_fingerprint();
+    let specs: Vec<_> = backend
+        .started_specs()
+        .into_iter()
+        .filter(|s| {
+            matches!(&s.prompt, PromptMode::SingleShot(task) if task.contains("Implement feature `f-1-1`"))
+        })
+        .collect();
+    assert_eq!(specs.len(), 2, "the worker spawned exactly twice");
+    let second_prompt = match &specs[1].prompt {
+        PromptMode::SingleShot(task) => task.clone(),
+        _ => unreachable!(),
+    };
+    assert!(
+        second_prompt.contains(&fingerprint),
+        "the respawn guidance names the fingerprint: {second_prompt}"
+    );
+    assert!(
+        second_prompt.contains("leak.txt:1"),
+        "the respawn guidance names the location: {second_prompt}"
+    );
+    assert!(
+        !second_prompt.contains(LEAKED_SECRET),
+        "the respawn guidance must never quote the canary"
+    );
+}
+
+/// Across a refusal run, neither the raw events.jsonl text nor any started
+/// session's prompt ever contains the canary's matched text.
+#[tokio::test(flavor = "multi_thread")]
+async fn feature_range_scan_never_quotes_matched_text() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_commits_canary(),
+        orch_script(vec![]),
+    ]));
+
+    let cfg = MissionConfig {
+        max_respawns: 0,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .expect("a feature-range scan refusal must not error the run loop");
+    assert_eq!(status, MissionStatus::Blocked);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let raw_log = std::fs::read_to_string(paths.events_file()).unwrap();
+    assert!(
+        !raw_log.contains(LEAKED_SECRET),
+        "the raw secret must never land in events.jsonl"
+    );
+
+    for spec in backend.started_specs() {
+        if let PromptMode::SingleShot(task) = &spec.prompt {
+            assert!(
+                !task.contains(LEAKED_SECRET),
+                "no started session's prompt may contain the canary"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pack contract (ticket pack-contract-gates-prompts): a configured pack's
 // deterministic gate runs at the final gate and its prompt reaches the
 // target role; invalid packs fail closed; no pack ⇒ byte-identical.

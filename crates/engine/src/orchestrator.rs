@@ -3869,6 +3869,87 @@ impl MissionEngine {
             let milestone_id = self.state.mission.milestones[mi].id.clone();
             self.emit_worker_questions(&milestone_id, &feature.id, &outcome)?;
 
+            // Feature-range secret scan (sequential path): the worker's own
+            // commits are never covered by the checkpoint scan above (which
+            // only scans the engine's dirty-tree checkpoint commit), and the
+            // only other whole-range scan runs at merge or push — long after
+            // this judgement turn. Scan the feature's NET diff from its
+            // stable recorded base (so a later rewording commit clears an
+            // earlier finding, same as merge) against the allowlist pinned
+            // at plan approval (never the mission's own in-range edits to
+            // it). This is a deterministic engine decision, not a model
+            // judgement turn.
+            let base_sha = self.state.mission.base_sha.clone();
+            match self
+                .active_repo()
+                .secret_scan_range(base_sha.as_deref(), &feature_base_sha, "HEAD")
+            {
+                Err(e) => {
+                    self.emit_decision(
+                        &format!(
+                            "feature-range secret scan could not read the feature's diff: {e}"
+                        ),
+                        None,
+                    )?;
+                    self.emit(EventKind::FeatureFailed {
+                        feature_id: feature.id.clone(),
+                        reason: format!(
+                            "feature-range secret scan could not read the feature's diff: {e}"
+                        ),
+                        commits,
+                    })?;
+                    return Ok(());
+                }
+                Ok(findings) if !findings.is_empty() => {
+                    let rendered = scrub::format_findings(&findings);
+                    self.emit_decision(
+                        &format!(
+                            "feature-range secret scan for {}: {} unwaived finding(s)",
+                            feature.id,
+                            findings.len()
+                        ),
+                        Some(rendered.clone()),
+                    )?;
+                    let respawns = self.state.mission.milestones[mi].features[fi].respawns;
+                    let grant_respawns = *self.grant_respawns.get(&feature.id).unwrap_or(&0);
+                    if respawns.saturating_sub(grant_respawns) < self.state.config.max_respawns {
+                        guidance = Some(format!(
+                            "The engine's feature-range secret scan found {} unwaived \
+                             finding(s) in this feature's commits ({feature_base_sha}..HEAD), \
+                             judged against the secret allowlist pinned at plan approval:\n\
+                             {rendered}\n\
+                             Remove or reword each flagged line in a NEW commit. Editing \
+                             .kranz/secret-allowlist inside the mission waives nothing.",
+                            findings.len()
+                        ));
+                        continue;
+                    }
+                    self.emit(EventKind::FeatureFailed {
+                        feature_id: feature.id.clone(),
+                        reason: format!(
+                            "feature-range secret scan: {} unwaived finding(s) against the \
+                             allowlist pinned at approval:\n{rendered}",
+                            findings.len()
+                        ),
+                        commits,
+                    })?;
+                    self.emit(EventKind::MilestoneBlocked {
+                        block_context: Some(BlockContext::engine(BlockCause::SecretScan)),
+                        milestone_id: milestone_id.clone(),
+                        reason: format!(
+                            "feature-range secret scan for {} found {} unwaived finding(s); the \
+                             allowlist pinned at plan approval cannot be extended mid-mission, \
+                             so the flagged lines must be removed or reworded (for example via a \
+                             fix feature after an operator message):\n{rendered}",
+                            feature.id,
+                            findings.len()
+                        ),
+                    })?;
+                    return Ok(());
+                }
+                Ok(_) => {}
+            }
+
             match box_future(|| self.judge_worker_run(&feature.id, &outcome, &commits, &diff_stat))
                 .await?
             {
