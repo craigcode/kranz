@@ -19,6 +19,8 @@ The effects, all visible in that mission's event log:
 - A functional validator described an output tail that belonged to a different assertion.
 - The fix-cycle cap was reached and the mission blocked with the cause still unconfirmed.
 
+The cause was found afterwards by running the same command by hand in the gate's environment with the output kept. Two engine unit tests failed every time because the gate's `TMPDIR` is inside a mission directory. The candidate the mission had settled on, a timing-sensitive test, was not the cause. One retained output tail would have shown this on the first failure.
+
 The contract commands run in `run_contract_commands_for_validation` in `crates/engine/src/orchestrator.rs`, through `run_shell_command_sandboxed` in `crates/engine/src/command_exec.rs`.
 
 ## Scoping answers
