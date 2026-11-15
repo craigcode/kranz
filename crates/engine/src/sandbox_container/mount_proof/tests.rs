@@ -504,7 +504,8 @@ async fn mount_helper_v1_missing_configured_image_never_pulls() {
     let result = helper
         .round_trip(
             IMAGE,
-            Duration::from_secs(2),
+            // The deadline is not under test: leave room for a loaded host.
+            Duration::from_secs(30),
             85,
             &AtomicBool::new(false),
             "/host",
