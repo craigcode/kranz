@@ -15119,8 +15119,8 @@ pub(crate) mod tests {
             return;
         };
         // Same canary shape as the scrub-at-write tests' anchor.
-        const SECRET: &str = "sk-ant-api03-ScrubNofollowTestValue1";
-        let leak_contents = format!("ANTHROPIC_API_KEY={SECRET}\n");
+        const LEAKED_SECRET: &str = "sk-ant-api03-ScrubNofollowTestValue1";
+        let leak_contents = format!("ANTHROPIC_API_KEY={LEAKED_SECRET}\n");
         let claude_mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
             crate::backend_mock::MockScript::single_shot_json(&dispatch_pool_report(
                 "claude candidate",
@@ -15179,11 +15179,11 @@ pub(crate) mod tests {
             "candidate 0 line names path:line: {candidate_0_line}"
         );
         assert!(
-            !candidate_0_line.contains(SECRET),
+            !candidate_0_line.contains(LEAKED_SECRET),
             "candidate 0 line must never quote the canary: {candidate_0_line}"
         );
         assert!(
-            !decision.contains(SECRET),
+            !decision.contains(LEAKED_SECRET),
             "the decision detail must never quote the canary: {decision}"
         );
 
