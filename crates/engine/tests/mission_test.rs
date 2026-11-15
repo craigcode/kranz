@@ -10752,6 +10752,21 @@ fn worker_commits_clean() -> MockScript {
     .commits_all("add delivered.txt")
 }
 
+/// Worker script: the session reworks the previously flagged file in a NEW
+/// commit, clearing the finding on the feature's net diff.
+fn worker_rewords_leak_file() -> MockScript {
+    MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "removed the secret",
+        "filesTouched": ["leak.txt"],
+        "testsAdded": [],
+        "testEvidence": "all green",
+        "commits": []
+    }))
+    .writes_file("leak.txt", "nothing secret here\n")
+    .commits_all("reword leak.txt")
+}
+
 /// Sequential path: the worker's own commit (not a dirty-tree leftover)
 /// carries an unwaived secret. The feature-range scan must catch it BEFORE
 /// the judgement turn — no judgement turn is ever spent, and the milestone
@@ -10830,7 +10845,7 @@ async fn feature_range_scan_refuses_worker_committed_canary() {
                 block_context,
                 reason,
                 ..
-            } => Some((block_context.clone(), reason.clone())),
+            } => Some((*block_context, reason.clone())),
             _ => None,
         })
         .expect("milestone.blocked is on the log");
@@ -10896,7 +10911,10 @@ async fn feature_range_scan_honours_base_allowlist() {
     )
     .unwrap();
     raw_git(&root, &["add", "-f", ".kranz/secret-allowlist"]);
-    raw_git(&root, &["commit", "-m", "allowlist the canary at approval base"]);
+    raw_git(
+        &root,
+        &["commit", "-m", "allowlist the canary at approval base"],
+    );
 
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_commits_canary(),
@@ -10981,8 +10999,10 @@ async fn feature_range_scan_respawn_after_rewording_completes() {
 
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_commits_canary(),
-        orch_script(vec![]),
-        worker_commits_clean(),
+        // The engine's respawn decision is deterministic (no model turn)
+        // when a finding is present and budget remains, so the next script
+        // in queue is the respawned worker itself, not an orchestrator turn.
+        worker_rewords_leak_file(),
         orch_script(vec![judgement("complete", ""), no_lesson()]),
     ]));
 

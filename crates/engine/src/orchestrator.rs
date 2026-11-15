@@ -3880,10 +3880,11 @@ impl MissionEngine {
             // it). This is a deterministic engine decision, not a model
             // judgement turn.
             let base_sha = self.state.mission.base_sha.clone();
-            match self
-                .active_repo()
-                .secret_scan_range(base_sha.as_deref(), &feature_base_sha, "HEAD")
-            {
+            match self.active_repo().secret_scan_range(
+                base_sha.as_deref(),
+                &feature_base_sha,
+                "HEAD",
+            ) {
                 Err(e) => {
                     self.emit_decision(
                         &format!(
