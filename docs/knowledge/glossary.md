@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-14
+last_verified: 2026-11-15
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-15 (UTC) against a test-only change in `control.rs` and `container_egress.rs`: two unit tests no longer depend on the scratch directory sitting outside a mission directory, so they pass under the contract gate's `TMPDIR`. No behaviour described here changed.
 
 Rechecked 2026-11-14 (UTC) against the grant decision binding fixes: a pending grant request carries `requestSeq`, and Slack grant buttons carry the request's sequence number and kind. No term changed.
 
