@@ -276,6 +276,73 @@ What a ticket holds:
     line break or invisible character is shown as one space, and the bullet
     says so. The span is fenced with one backtick more than the longest run
     inside the text.
+  - A link into another application (`cross_application_calls` in
+    `groups.json`) with more than its two programs. After "`<caller id>`
+    calls `<callee id>`" the bullet names the callee's ticket, as in "of
+    ticket `<slug>`" (or "of this group"), then the occurrences when there
+    are more than one, as in "(4 occurrences)".
+    - The ticket is named when the entry's `callee_group` is the group the
+      manifest places the callee in. An entry without `callee_group`, one
+      that contradicts the manifest, and a callee the bundle does not hold
+      name no ticket.
+    - A current Magic Atlas also writes `facts` on each entry; a schema 3
+      bundle written before that has none, and its bullets end with the
+      ticket and the occurrences. With facts the bullet goes on, one part
+      for each kind of link, each with the ids of its facts in facts-file
+      order: "by a call (facts `<fact id>`, `<fact id>`); as a subform
+      program (fact `<fact id>`)". The other parts read "as a selection
+      program" and "by a reference, which is a mention and not a call". The
+      list holds every static program link into another application, not
+      calls alone, so when every fact the bullet keeps is a reference the
+      bullet reads "names" instead of "calls". A kind the importer does not
+      know reads "by a link of a kind this importer does not know", with the
+      kind next to each fact id.
+    - Magic Atlas lists a pair linked only by references here and under
+      `reference_links`, with the same facts. The ticket then has a
+      "reference only" bullet and a "call into another application" bullet
+      for the one link, and the summary line counts it under both. The
+      second bullet says so: "`<bundle>/groups.json` lists this pair under
+      `reference_links` too, and it is one link, not two".
+    - The facts are read as those of a reference link are, with the same
+      safeguards: at most 10 fact ids for an entry with the rest counted, an
+      id or kind that is not a plain token counted and not shown, a fact that
+      names another caller or callee left out and counted, a sum that
+      differs from the entry's `occurrences` reported as "`groups.json` is
+      inconsistent here", and an entry of `facts` that is not a record left
+      out and counted. The import never fails on these fields.
+  - Why programs share a ticket. The ticket of a group of more than one
+    program has a "Why one ticket for N programs" line: each program can
+    reach every other through static program links (a call, a subform
+    program, a selection program or a reference), so they form a cycle, none
+    can be finished before the others, and they are one unit of work.
+  - A "Reached only through a reference" line when `bundle.json` marks a
+    program of the group `reached_only_through_references`. No chain of
+    calls, subform programs and selection programs leads from the bundle's
+    root program to such a program, so every path to it passes through a
+    reference, and the bundle cannot tell whether the program is ever run.
+    The line says to check that before spending work on it. When only some
+    programs of the group are marked, the line says how many and names them
+    by id (at most 10, and only ids that are plain tokens, with the others
+    counted). Each marked program also carries "(reached only through a
+    reference)" in the Programs list, which shows the first 20 programs of
+    a group; when a marked program is past those, the line says that
+    `bundle.json` is where to find every marked program. Only the value
+    `true` marks a program.
+  - A program name that reads as it does in the title. The title holds the
+    name as plain text, and `kranz ticket list`, the dashboard and the REST
+    API show a title as it is stored, so the title is not escaped. A name
+    that Markdown escaping would change (one with a backslash, an underscore,
+    a backtick, an angle bracket and so on) is therefore put in a code span
+    in the Programs list and in a reference link, where it reads as in the
+    title: `Stock\Items` and not `Stock\\Items`. So is a name with a
+    character reference such as `&amp;`, which would otherwise render as
+    another character. The span holds the name on one line and is fenced
+    with one backtick more than the longest run inside the name. A name
+    that escaping leaves alone is written as before, without a span. The
+    two places cut a long name at different lengths: the title at 60
+    characters and the body at 80, so a name longer than 60 characters is
+    shorter in the title. Either cut ends in "…", which stands after the
+    span. Names of data sources are still escaped.
   - A `Links:` line when the bundle's `link_details` is anything but
     `available`. Such a bundle was cut from an export that does not record
     links from expressions, properties and external invocations, and only
@@ -318,7 +385,10 @@ kept on one line, cut to a fixed length and Markdown-escaped, so a crafted
 program name cannot add a frontmatter key, a section heading or an instruction
 block. Stored text in a schema 3 loose end is kept on one line and cut to a
 fixed length too, then put in a code span that no backtick inside it can
-close.
+close. A program name of a schema 3 bundle that escaping would change is put
+in such a span as well, so it reads in the body as it does in the title; the
+title is one plain line that nothing renders as Markdown, and it is never
+escaped.
 Characters that render as nothing (zero-width and bidirectional controls,
 fillers, variation selectors, tag characters) are replaced by a space, so a
 name cannot carry text the reviewer does not see.

@@ -5,6 +5,26 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: tickets `kranz ticket import-atlas` writes from a schema 3 bundle
+  say four things more. A link into another application names the callee's
+  ticket and, when there are more than one, the occurrences; when a current
+  Magic Atlas lists the `facts` behind the link, the bullet also gives the
+  kind of each link (call, subform program, selection program, reference)
+  with the fact ids, at most 10 for an entry with the rest counted, and
+  reads "names" instead of "calls" when every fact is a reference; a pair
+  that is also listed as a reference link is said to be one link. A ticket
+  whose program `bundle.json` marks `reached_only_through_references` says
+  that no chain of calls, subform programs and selection programs leads to
+  it from the root and that whether it is ever run must be checked first; a
+  group where only some programs are marked names them. A ticket for more
+  than one program says why they share it: they reach each other in a
+  cycle. A program name that Markdown escaping would change, or that holds
+  a character reference such as `&amp;`, is shown in a code span in the
+  ticket body, so a backslash is no longer doubled there and the name reads
+  as in the title, which still cuts a long name at 60 characters where the
+  body cuts at 80.
+  Schema 3 tickets with none of these read as before, and so do all schema
+  1 and 2 tickets. See `docs/tickets.md`.
 - Changed: `kranz ticket import-atlas` reads the `reference_kinds` and
   `facts` a current Magic Atlas writes on each reference link of a schema 3
   bundle. The "reference only" loose end then says how the program is named

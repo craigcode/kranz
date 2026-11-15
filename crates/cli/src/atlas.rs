@@ -35,7 +35,9 @@
 //! kept on one line, length-capped and Markdown-escaped, so a crafted
 //! program name cannot add a frontmatter key, a section heading or a fenced
 //! instruction block. Text the application stored, shown in a schema 3 loose
-//! end, is one capped line in a code span no backtick inside it can close.
+//! end, is one capped line in a code span no backtick inside it can close;
+//! so is a program name of a schema 3 bundle that escaping would change,
+//! which then reads in the body as it does in the title.
 //! The target language is never guessed: the operator states it, here with
 //! `--target-note` or in the placeholder line.
 
@@ -268,6 +270,11 @@ struct ManifestProgram {
     name: String,
     #[serde(default)]
     missing_definition: bool,
+    /// True when no chain of calls, subform programs and selection programs
+    /// leads from the root to the program. Only schema 3 records it, and only
+    /// schema 3 tickets show it, so a value of another shape reads as false.
+    #[serde(default, deserialize_with = "lenient")]
+    reached_only_through_references: bool,
     group: String,
     packets: String,
 }
@@ -334,8 +341,9 @@ struct ReferenceLink {
     facts: LinkFacts,
 }
 
-/// The `facts` of a reference link. Anything but a list reads as empty, and
-/// an entry that is not a record is left out and counted.
+/// The `facts` of a reference link or of a link into another application.
+/// Anything but a list reads as empty, and an entry that is not a record is
+/// left out and counted.
 #[derive(Default)]
 struct LinkFacts {
     listed: Vec<LinkFact>,
@@ -363,9 +371,11 @@ impl<'de> Deserialize<'de> for LinkFacts {
     }
 }
 
-/// One `references_program` fact behind a reference link. Every field is
-/// lenient: a value of another shape reads as blank or 0, and the import
-/// never fails on it. The fact's `subject` is not read.
+/// One fact behind a reference link or a link into another application.
+/// Every field is lenient: a value of another shape reads as blank or 0, and
+/// the import never fails on it. The fact's `subject` is not read. `kind` is
+/// given for a link into another application only, and `reference_kind` there
+/// only for a `references_program` fact.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct LinkFact {
@@ -377,6 +387,8 @@ struct LinkFact {
     object: LooseObject,
     #[serde(deserialize_with = "lenient")]
     occurrences: u64,
+    #[serde(deserialize_with = "lenient")]
+    kind: String,
     #[serde(deserialize_with = "lenient")]
     reference_kind: String,
 }
@@ -420,11 +432,21 @@ struct LooseObject {
     text: Option<String>,
 }
 
+/// A static program link into another application. Schemas 1 and 2 give the
+/// two programs only, and only they are shown from such a bundle. A schema 3
+/// bundle adds `callee_group` and `occurrences`, and a current exporter the
+/// `facts` behind the link; a bundle without `facts` reads as one that lists
+/// none.
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct CrossApplicationCall {
     caller: String,
     callee: String,
+    #[serde(deserialize_with = "lenient")]
+    callee_group: String,
+    #[serde(deserialize_with = "lenient")]
+    occurrences: u64,
+    facts: LinkFacts,
 }
 
 #[derive(Default, Deserialize)]
@@ -1479,6 +1501,13 @@ fn render_context(
         index + 1,
         bundle.manifest.groups.len()
     );
+    if detailed {
+        out.push_str(&shared_ticket(members.len()));
+        out.push_str(&reached_by_reference(
+            members,
+            &format!("`{path}/{MANIFEST}`"),
+        ));
+    }
     if !bundle.links_recorded {
         out.push_str(
             "- Links: this bundle was cut from an export that does not record links from \
@@ -1507,7 +1536,7 @@ fn render_context(
             Some(program) => format!(
                 "{} {}",
                 code(id, MAX_ID_CHARS),
-                plain(&program.name, MAX_NAME_CHARS)
+                program_name(&program.name, detailed)
             ),
             None => code(id, MAX_ID_CHARS),
         };
@@ -1614,12 +1643,17 @@ fn render_context(
     out.push_str(&format!("\nPrograms ({}):\n", members.len()));
     for program in members.iter().take(MAX_LISTED_PROGRAMS) {
         out.push_str(&format!(
-            "- {} {}: packet index {}{}\n",
+            "- {} {}: packet index {}{}{}\n",
             code(&program.id, MAX_ID_CHARS),
-            plain(&program.name, MAX_NAME_CHARS),
+            program_name(&program.name, detailed),
             in_bundle(&program.packets),
             if program.missing_definition {
                 " (no definition in the source; what it calls is unknown)"
+            } else {
+                ""
+            },
+            if detailed && program.reached_only_through_references {
+                " (reached only through a reference)"
             } else {
                 ""
             }
@@ -1673,8 +1707,20 @@ fn render_context(
         ));
     }
     for call in &loose_ends.cross_application_calls {
+        let (verb, rest) = if detailed {
+            cross_application_detail(
+                call,
+                &loose_ends.reference_links,
+                group,
+                prefix,
+                programs,
+                &full,
+            )
+        } else {
+            ("calls", String::new())
+        };
         lines.push(format!(
-            "- call into another application: {} calls {}\n",
+            "- call into another application: {} {verb} {}{rest}\n",
             code(&call.caller, MAX_ID_CHARS),
             code(&call.callee, MAX_ID_CHARS)
         ));
@@ -1966,6 +2012,22 @@ fn stored(text: &str, max_chars: usize, full: &str) -> String {
             line.push(c);
         }
     }
+    let mut out = span(&line);
+    if total > max_chars {
+        out.push_str(&format!(
+            "… (the first {max_chars} of {total} characters; {full} holds the rest)"
+        ));
+    }
+    if replaced {
+        out.push_str(" (a tab, line break or invisible character is shown as a space)");
+    }
+    out
+}
+
+/// One line of text as a code span: fenced by one backtick more than the
+/// longest run of backticks inside it, and padded with a space when the text
+/// begins or ends with one, so no text can close its own span.
+fn span(line: &str) -> String {
     let mut longest = 0;
     let mut run = 0;
     for c in line.chars() {
@@ -1978,16 +2040,132 @@ fn stored(text: &str, max_chars: usize, full: &str) -> String {
     } else {
         ""
     };
-    let mut out = format!("{fence}{pad}{line}{pad}{fence}");
-    if total > max_chars {
-        out.push_str(&format!(
-            "… (the first {max_chars} of {total} characters; {full} holds the rest)"
-        ));
+    format!("{fence}{pad}{line}{pad}{fence}")
+}
+
+/// A program name in the ticket body. The title holds the name as plain
+/// text, which every reader of a title shows as it is, so a name that
+/// Markdown escaping would change (`A\B` becoming `A\\B`) would read one way
+/// in the title and another in the body. With `as_titled`, which schema 3
+/// tickets set, such a name is a code span of the same one line instead, so
+/// it reads as the title has it; a name escaping leaves alone stays as it
+/// was. An earlier bundle keeps the escaped text its tickets always had.
+///
+/// `plain` leaves `&` alone, so a name with a character reference (`&amp;`,
+/// `&#35;`) would render as another character than the title shows; such a
+/// name is a span too. The ellipsis of a cut name is not part of the name
+/// and stands after the span, as it does in `stored`.
+fn program_name(name: &str, as_titled: bool) -> String {
+    let escaped = plain(name, MAX_NAME_CHARS);
+    let line = one_line(name, MAX_NAME_CHARS);
+    // A character reference is `&`, a run of letters, digits or `#`, and `;`.
+    let reference = line.split('&').skip(1).any(|rest| {
+        let run = rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '#');
+        run.len() < rest.len() && run.starts_with(';')
+    });
+    if !as_titled || (escaped == line && !reference) {
+        return escaped;
     }
-    if replaced {
-        out.push_str(" (a tab, line break or invisible character is shown as a space)");
+    // `one_line` marks a cut with one character past the limit.
+    match line.strip_suffix('…') {
+        Some(kept) if line.chars().count() > MAX_NAME_CHARS => format!("{}…", span(kept)),
+        _ => span(&line),
     }
-    out
+}
+
+/// The Context line of a schema 3 ticket that holds more than one program:
+/// why they share it. A group is one strongly connected component of the
+/// static program links, so each member reaches every other.
+fn shared_ticket(programs: usize) -> String {
+    if programs < 2 {
+        return String::new();
+    }
+    format!(
+        "- Why one ticket for {programs} programs: each of them can reach every other \
+         through static program links (a call, a subform program, a selection program or \
+         a reference), so they form a cycle and none can be finished before the others. \
+         The bundle makes them one group for that reason, and they are one unit of work.\n"
+    )
+}
+
+/// The Context line of a schema 3 ticket whose group holds a program the
+/// manifest marks `reached_only_through_references`; nothing when it holds
+/// none. When only some programs of the group are marked the line names
+/// them, by the ids that are plain tokens and at most
+/// `MAX_LISTED_LOOSE_ENDS` of them, and counts the others. The Programs list
+/// marks each one it shows; when a marked program is past the
+/// `MAX_LISTED_PROGRAMS` it shows, the line sends the reader to the manifest
+/// instead. `manifest` is the manifest as the line names it.
+fn reached_by_reference(members: &[&ManifestProgram], manifest: &str) -> String {
+    let marked: Vec<&&ManifestProgram> = members
+        .iter()
+        .filter(|program| program.reached_only_through_references)
+        .collect();
+    if marked.is_empty() {
+        return String::new();
+    }
+    let one = marked.len() == 1;
+    let (head, target) = if marked.len() < members.len() {
+        let ids: Vec<String> = marked
+            .iter()
+            .filter_map(|program| token(&program.id, MAX_ID_CHARS))
+            .collect();
+        let shown = ids.len().min(MAX_LISTED_LOOSE_ENDS);
+        let named = match (shown, marked.len() - shown) {
+            (0, _) => String::new(),
+            (_, 0) => format!(": {}", ids[..shown].join(", ")),
+            (_, more) => format!(": {}, and {more} more", ids[..shown].join(", ")),
+        };
+        let all_listed = members
+            .iter()
+            .skip(MAX_LISTED_PROGRAMS)
+            .all(|program| !program.reached_only_through_references);
+        let place = if all_listed {
+            format!(", marked in the Programs list below{named}")
+        } else {
+            format!(
+                "{named}; the Programs list below shows only the first {MAX_LISTED_PROGRAMS} \
+                 programs of the group, so {manifest} is where to find every marked program"
+            )
+        };
+        (
+            format!(
+                " ({} of the {} programs{place})",
+                marked.len(),
+                members.len()
+            ),
+            if one {
+                "that program"
+            } else {
+                "those programs"
+            }
+            .to_string(),
+        )
+    } else if one {
+        (String::new(), "this program".to_string())
+    } else {
+        (
+            String::new(),
+            format!("any of the {} programs of this group", members.len()),
+        )
+    };
+    let (it, is_run, marks) = if one {
+        ("it", "the program is", "marks it")
+    } else {
+        ("them", "the programs are", "marks them")
+    };
+    let others = if marked.len() < members.len() {
+        " The other programs of the group are reached without a reference."
+    } else {
+        ""
+    };
+    format!(
+        "- Reached only through a reference{head}: no chain of calls, subform programs and \
+         selection programs leads from the bundle's root program to {target}, so every path \
+         to {it} passes through a reference. A reference is a mention, not a call, and the \
+         bundle cannot tell whether {is_run} ever run through one. Check that before \
+         spending work on {it}; {manifest} {marks} `reached_only_through_references`.{others}\n"
+    )
 }
 
 /// Whether `one_line` would find nothing to show in the text.
@@ -2035,22 +2213,161 @@ fn invocation_kind(kind: &str) -> String {
 /// or kind that is anything else is counted and not shown: escaped text could
 /// still close the bracket and go on in the importer's words.
 fn reference_detail(link: &ReferenceLink, full: &str) -> (Vec<String>, bool) {
-    const UNKNOWN: usize = 3;
-    const WAYS: [&str; 4] = [
-        "in an expression",
-        "as the selection program of a variable no control is bound to",
-        "in a way the bundle does not classify",
-        "as a reference of a kind this importer does not know",
-    ];
-    // The kind is matched as it would be shown, so a known name with stray
-    // whitespace around it is not disclaimed in its own spelling.
-    let way_of = |kind: &str| match one_line(kind, MAX_NAME_CHARS).as_str() {
-        _ if blank(kind) => 2,
-        "expression_literal" => 0,
-        "variable_selection_program" => 1,
-        "unclassified" => 2,
-        _ => UNKNOWN,
+    const WAYS: LinkWays = LinkWays {
+        phrases: &[
+            "in an expression",
+            "as the selection program of a variable no control is bound to",
+            "in a way the bundle does not classify",
+            "as a reference of a kind this importer does not know",
+        ],
+        // The kind is matched as it would be shown, so a known name with
+        // stray whitespace around it is not disclaimed in its own spelling.
+        way_of: |kind| match one_line(kind, MAX_NAME_CHARS).as_str() {
+            _ if blank(kind) => 2,
+            "expression_literal" => 0,
+            "variable_selection_program" => 1,
+            "unclassified" => 2,
+            _ => 3,
+        },
+        kind_of: |fact| &fact.reference_kind,
     };
+    link_detail(
+        &WAYS,
+        (&link.caller, &link.callee),
+        link.occurrences,
+        &link.reference_kinds,
+        &link.facts,
+        full,
+    )
+}
+
+/// What a schema 3 bullet for a link into another application says beyond
+/// its two programs: the verb between them, then the callee's ticket, the
+/// occurrences when there are more than one, and what the entry's `facts`
+/// give. A bundle written before `facts` was added lists none and gets the
+/// first two only.
+///
+/// The ticket is named when the entry's `callee_group` is the group the
+/// checked manifest places the callee in, so the slug is inert and a record
+/// that contradicts the manifest names no ticket. The facts are read as
+/// those of a reference link are (`link_detail`), told apart by their `kind`:
+/// the list holds every static program link, not calls alone. When every
+/// fact kept is a reference the verb is "names", as in a reference link,
+/// because the bundle records no call between the two; the bullet then says
+/// so when the pair is among `reference_links` too, which the ticket lists
+/// and counts as loose ends of their own.
+fn cross_application_detail(
+    call: &CrossApplicationCall,
+    reference_links: &[ReferenceLink],
+    group: &ManifestGroup,
+    prefix: &str,
+    programs: &HashMap<&str, &ManifestProgram>,
+    full: &str,
+) -> (&'static str, String) {
+    const REFERENCE: &str = "references_program";
+    const WAYS: LinkWays = LinkWays {
+        phrases: &[
+            "by a call",
+            "as a subform program",
+            "as a selection program",
+            "by a reference, which is a mention and not a call",
+            "by a link of a kind this importer does not know",
+        ],
+        way_of: |kind| match one_line(kind, MAX_NAME_CHARS).as_str() {
+            "calls_program" => 0,
+            "runs_subform_program" => 1,
+            "runs_selection_program" => 2,
+            REFERENCE => 3,
+            _ => 4,
+        },
+        kind_of: |fact| &fact.kind,
+    };
+    let owner = match programs.get(call.callee.as_str()) {
+        Some(callee) if callee.group != call.callee_group => String::new(),
+        Some(callee) if callee.group == group.id => " of this group".to_string(),
+        Some(callee) => format!(" of ticket `{prefix}-{}`", callee.group),
+        None => String::new(),
+    };
+    let times = match call.occurrences {
+        0 | 1 => String::new(),
+        n => format!(" ({})", count(n as usize, "occurrence")),
+    };
+    let (detail, _) = link_detail(
+        &WAYS,
+        (&call.caller, &call.callee),
+        call.occurrences,
+        &[],
+        &call.facts,
+        full,
+    );
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", detail.join("; "))
+    };
+    // The verb follows the facts the bullet keeps: a fact of another link
+    // says nothing of this one, and with none kept the bullet reads as that
+    // of a link without facts.
+    let mut kept = call
+        .facts
+        .listed
+        .iter()
+        .filter(|fact| !other_link(fact, &call.caller, &call.callee))
+        .peekable();
+    let mentions =
+        kept.peek().is_some() && kept.all(|fact| one_line(&fact.kind, MAX_NAME_CHARS) == REFERENCE);
+    // The exporter lists a pair linked only by references under
+    // `reference_links` as well, with the same facts.
+    let twice = mentions
+        && reference_links
+            .iter()
+            .any(|link| link.caller == call.caller && link.callee == call.callee);
+    let same = if twice {
+        format!("; {full} lists this pair under `reference_links` too, and it is one link, not two")
+    } else {
+        String::new()
+    };
+    (
+        if mentions { "names" } else { "calls" },
+        format!("{owner}{times}{detail}{same}"),
+    )
+}
+
+/// Whether a fact listed with a link names another caller or callee, and so
+/// is not that link's. A fact that names neither is taken as the link's.
+fn other_link(fact: &LinkFact, caller: &str, callee: &str) -> bool {
+    let other_caller = !blank(&fact.program) && fact.program != caller;
+    let other_callee = fact
+        .object
+        .entity
+        .as_deref()
+        .is_some_and(|entity| !blank(entity) && entity != callee);
+    other_caller || other_callee
+}
+
+/// How the facts of a link are told apart: one phrase for each way the
+/// callee is linked, the way a kind stands for, and the field of a fact that
+/// holds its kind. The last phrase is for a kind the importer does not know.
+struct LinkWays {
+    phrases: &'static [&'static str],
+    way_of: fn(&str) -> usize,
+    kind_of: fn(&LinkFact) -> &str,
+}
+
+/// The parts a link's `facts` give, for `reference_detail` and
+/// `cross_application_detail`, which say what is read and why. `kinds` are
+/// the kinds a link states apart from its facts, read only when it lists no
+/// fact. The second value is whether any way is given.
+fn link_detail(
+    ways_of: &LinkWays,
+    (caller, callee): (&str, &str),
+    occurrences: u64,
+    kinds: &[String],
+    link_facts: &LinkFacts,
+    full: &str,
+) -> (Vec<String>, bool) {
+    let unknown = ways_of.phrases.len() - 1;
+    let way_of = ways_of.way_of;
     struct Way {
         way: usize,
         shown: Vec<String>,
@@ -2068,42 +2385,34 @@ fn reference_detail(link: &ReferenceLink, full: &str) -> (Vec<String>, bool) {
             ways.len() - 1
         }
     };
-    let facts = &link.facts.listed;
+    let facts = &link_facts.listed;
     let mut places = Vec::new();
     let mut foreign = 0;
     let mut uncounted = 0;
     let mut sum: u64 = 0;
     for fact in facts {
-        // A fact that names neither is taken as the link's.
-        let other_caller = !blank(&fact.program) && fact.program != link.caller;
-        let other_callee = fact
-            .object
-            .entity
-            .as_deref()
-            .is_some_and(|entity| !blank(entity) && entity != link.callee);
-        if other_caller || other_callee {
+        if other_link(fact, caller, callee) {
             foreign += 1;
             continue;
         }
         uncounted += usize::from(fact.occurrences == 0);
         sum = sum.saturating_add(fact.occurrences);
-        let way = way_of(&fact.reference_kind);
-        let label = token(&fact.fact, MAX_ID_CHARS).map(|id| {
-            match token(&fact.reference_kind, MAX_NAME_CHARS) {
-                Some(kind) if way == UNKNOWN => format!("{id} of kind {kind}"),
-                _ => id,
-            }
+        let kind = (ways_of.kind_of)(fact);
+        let way = way_of(kind);
+        let label = token(&fact.fact, MAX_ID_CHARS).map(|id| match token(kind, MAX_NAME_CHARS) {
+            Some(kind) if way == unknown => format!("{id} of kind {kind}"),
+            _ => id,
         });
         places.push((slot(way), true, label));
     }
     // Kinds without facts still say how the program is named.
     if facts.is_empty() {
-        for kind in &link.reference_kinds {
+        for kind in kinds {
             let way = way_of(kind);
-            let label = (way == UNKNOWN)
+            let label = (way == unknown)
                 .then(|| token(kind, MAX_NAME_CHARS))
                 .flatten();
-            places.push((slot(way), way == UNKNOWN, label));
+            places.push((slot(way), way == unknown, label));
         }
     }
     let kept = facts.len() - foreign;
@@ -2123,7 +2432,7 @@ fn reference_detail(link: &ReferenceLink, full: &str) -> (Vec<String>, bool) {
     let mut parts: Vec<String> = ways
         .iter()
         .map(|way| {
-            let phrase = WAYS[way.way];
+            let phrase = ways_of.phrases[way.way];
             let more = way.total - way.shown.len();
             match (way.shown.len(), more) {
                 (0, 0) => phrase.to_string(),
@@ -2141,7 +2450,7 @@ fn reference_detail(link: &ReferenceLink, full: &str) -> (Vec<String>, bool) {
             }
         })
         .collect();
-    if kept > 0 && link.occurrences > 0 {
+    if kept > 0 && occurrences > 0 {
         if uncounted > 0 {
             // A sum over facts with no count would say nothing of the link.
             parts.push(format!(
@@ -2150,11 +2459,11 @@ fn reference_detail(link: &ReferenceLink, full: &str) -> (Vec<String>, bool) {
                 count(uncounted, "fact"),
                 if uncounted == 1 { "gives" } else { "give" }
             ));
-        } else if sum != link.occurrences {
+        } else if sum != occurrences {
             parts.push(format!(
                 "{full} is inconsistent here: these facts add up to {}, not {}",
                 count(usize::try_from(sum).unwrap_or(usize::MAX), "occurrence"),
-                link.occurrences
+                occurrences
             ));
         }
     }
@@ -2166,7 +2475,7 @@ fn reference_detail(link: &ReferenceLink, full: &str) -> (Vec<String>, bool) {
             if foreign == 1 { "is" } else { "are" }
         ));
     }
-    match link.facts.unreadable {
+    match link_facts.unreadable {
         0 => {}
         1 => parts.push(format!(
             "1 entry of this link's `facts` in {full} is not a record and is left out"
@@ -2380,6 +2689,13 @@ mod tests {
     fn read_ticket(repo: &Path, slug: &str) -> String {
         std::fs::read_to_string(Ticket::md_path(repo, slug)).unwrap()
     }
+
+    /// The Context line of a schema 3 ticket for a group of two programs.
+    const SHARED_BY_TWO: &str = "\
+        - Why one ticket for 2 programs: each of them can reach every other through static \
+        program links (a call, a subform program, a selection program or a reference), so they \
+        form a cycle and none can be finished before the others. The bundle makes them one \
+        group for that reason, and they are one unit of work.\n";
 
     /// The whole ticket of group `gb` of the schema 2 bundle in
     /// `schema_1_and_2_tickets_are_byte_for_byte_what_they_were`, as the importer wrote
@@ -2861,7 +3177,7 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_3_bundle_with_link_details_differs_only_by_its_schema_number() {
+    fn a_schema_3_bundle_with_link_details_adds_its_number_and_why_programs_share_a_ticket() {
         let mut tickets = Vec::new();
         for schema_3 in [false, true] {
             let repo = tempfile::tempdir().unwrap();
@@ -2883,9 +3199,22 @@ mod tests {
             "{}",
             tickets[1][1]
         );
-        let renumbered = tickets[1]
-            .clone()
-            .map(|ticket| ticket.replace("(bundle schema 3)", "(bundle schema 2)"));
+        // The ticket of the two programs of `gc` also says why they share it.
+        let shared = SHARED_BY_TWO;
+        assert_eq!(
+            tickets[1][2].matches(shared).count(),
+            1,
+            "{}",
+            tickets[1][2]
+        );
+        for ticket in tickets[0].iter().chain(&tickets[1][..2]) {
+            assert!(!ticket.contains("Why one ticket"), "{ticket}");
+        }
+        let renumbered = tickets[1].clone().map(|ticket| {
+            ticket
+                .replace("(bundle schema 3)", "(bundle schema 2)")
+                .replace(shared, "")
+        });
         assert_eq!(tickets[0], renumbered);
     }
 
@@ -3547,7 +3876,9 @@ mod tests {
         ]);
         let text = reference_ticket(old.clone());
         // The ticket, whole, as the importer wrote it before it read
-        // `reference_kinds` and `facts`.
+        // `reference_kinds` and `facts`, apart from the line that says why the
+        // two programs of the group share it.
+        assert_eq!(text.matches(SHARED_BY_TWO).count(), 1, "{text}");
         let expected = "\
             ---\n\
             title: Migrate Program B and 1 more program (gb)\n\
@@ -3627,7 +3958,7 @@ mod tests {
             - OPERATOR: replace this line with commands that can fail for behaviour, each \
             guarded by a passed count (`grep -qE 'result: ok\\. [1-9][0-9]* passed'`) so a \
             zero-match filter cannot report success.\n";
-        assert_eq!(text, expected);
+        assert_eq!(text.replace(SHARED_BY_TWO, ""), expected);
 
         // Empty or null fields are absent ones.
         for empty in [json!([]), json!(null)] {
@@ -3905,6 +4236,671 @@ mod tests {
                 bullet.chars().count()
             );
         }
+    }
+
+    /// One fact of a link into another application, as a current exporter
+    /// writes it.
+    fn cross_fact(id: u64, caller: usize, callee: usize, kind: &str, occurrences: u64) -> Value {
+        let mut fact = link_fact(id, caller, callee, "");
+        let record = fact.as_object_mut().unwrap();
+        record.remove("reference_kind");
+        record.insert("kind".to_string(), json!(kind));
+        record.insert("occurrences".to_string(), json!(occurrences));
+        fact
+    }
+
+    /// A link into another application without `facts`, as a schema 3 bundle
+    /// had it before the field was added.
+    fn cross_call(caller: usize, callee: usize, occurrences: u64) -> Value {
+        json!({
+            "caller": format!("app:program:{caller}"), "callee": format!("app:program:{callee}"),
+            "callee_group": if callee == 1 { "ga" } else { "gb" }, "occurrences": occurrences,
+        })
+    }
+
+    /// As `cross_call`, with the facts behind the link; the count follows them.
+    fn cross_with(caller: usize, callee: usize, facts: Vec<Value>) -> Value {
+        let occurrences = facts
+            .iter()
+            .filter_map(|fact| fact["occurrences"].as_u64())
+            .sum();
+        let mut call = cross_call(caller, callee, occurrences);
+        call["facts"] = json!(facts);
+        call
+    }
+
+    /// The ticket of group `gb` (programs 2 and 3), which depends on group
+    /// `ga` (program 1), with `calls` as its links into another application.
+    /// The importer does not read a program's application, so the synthetic
+    /// ids all carry the same one.
+    fn cross_ticket(calls: Value, schema_3: bool) -> String {
+        let repo = tempfile::tempdir().unwrap();
+        let mut groups = vec![
+            group("ga", 0, &["Program A"], &[]),
+            group("gb", 1, &["Program B", "Program C"], &["ga"]),
+        ];
+        groups[1].loose_ends = json!({ "cross_application_calls": calls });
+        let dir = write_bundle(repo.path(), "bundle", &groups);
+        if schema_3 {
+            to_schema_3(&dir, Some("available"), &[]);
+        }
+        import(repo.path(), &dir).unwrap();
+        let sha = hex(&Sha256::digest(std::fs::read(dir.join(MANIFEST)).unwrap()));
+        let text = read_ticket(repo.path(), "atlas-gb");
+        Ticket::parse("atlas-gb", &text).unwrap();
+        text.replace(&sha, "SHA")
+    }
+
+    const CALL: &str = "calls_program";
+    const SUBFORM: &str = "runs_subform_program";
+    const REFERENCE: &str = "references_program";
+
+    #[test]
+    fn a_call_into_another_application_names_the_ticket_the_occurrences_and_the_facts() {
+        let mut reference = cross_fact(4, 3, 2, REFERENCE, 1);
+        reference["reference_kind"] = json!(EXPRESSION);
+        let mut elsewhere = cross_call(2, 9, 1);
+        elsewhere["callee"] = json!("other:program:9");
+        let mut contradicted = cross_call(3, 3, 1);
+        contradicted["callee_group"] = json!("ga");
+        let calls = json!([
+            cross_call(2, 1, 1),
+            cross_call(3, 1, 4),
+            cross_with(
+                2,
+                3,
+                vec![
+                    cross_fact(1, 2, 3, CALL, 2),
+                    cross_fact(2, 2, 3, SUBFORM, 1),
+                    cross_fact(3, 2, 3, REFERENCE, 1),
+                    cross_fact(5, 2, 3, "runs_selection_program", 1),
+                    cross_fact(6, 2, 3, CALL, 1),
+                ],
+            ),
+            cross_with(3, 2, vec![reference]),
+            elsewhere,
+            contradicted,
+        ]);
+        let text = cross_ticket(calls.clone(), true);
+        for expected in [
+            // Without `facts`: the bullet as it was, then ticket and count.
+            "- call into another application: `app:program:2` calls `app:program:1` of ticket \
+             `atlas-ga`\n",
+            "- call into another application: `app:program:3` calls `app:program:1` of ticket \
+             `atlas-ga` (4 occurrences)\n",
+            // Every kind of link, each with its facts in facts-file order.
+            "- call into another application: `app:program:2` calls `app:program:3` of this \
+             group (6 occurrences): by a call (facts `f-0000000000000001`, \
+             `f-0000000000000006`); as a subform program (fact `f-0000000000000002`); by a \
+             reference, which is a mention and not a call (fact `f-0000000000000003`); as a \
+             selection program (fact `f-0000000000000005`)\n",
+            // Nothing but a reference is no call.
+            "- call into another application: `app:program:3` names `app:program:2` of this \
+             group: by a reference, which is a mention and not a call (fact \
+             `f-0000000000000004`)\n",
+            // A callee the manifest does not hold, and a group it does not
+            // place the callee in, name no ticket.
+            "- call into another application: `app:program:2` calls `other:program:9`\n",
+            "- call into another application: `app:program:3` calls `app:program:3`\n",
+            "calls into another application 6, reference links 0,",
+        ] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
+
+        // An earlier schema gives the two programs and nothing else.
+        let earlier = cross_ticket(calls, false);
+        for expected in [
+            "- call into another application: `app:program:2` calls `app:program:1`\n",
+            "- call into another application: `app:program:3` calls `app:program:1`\n",
+            "- call into another application: `app:program:2` calls `app:program:3`\n",
+            "- call into another application: `app:program:3` calls `app:program:2`\n",
+        ] {
+            assert!(earlier.contains(expected), "{expected}\n{earlier}");
+        }
+        for absent in ["of ticket", "occurrence", "f-00", " names "] {
+            assert!(!earlier.contains(absent), "{absent}\n{earlier}");
+        }
+    }
+
+    #[test]
+    fn a_call_into_another_application_without_facts_reads_the_same_whatever_stands_there() {
+        let old = json!([cross_call(2, 1, 1), cross_call(3, 1, 4)]);
+        let text = cross_ticket(old.clone(), true);
+        for empty in [json!([]), json!(null), json!("f-1"), json!({"fact": "f-1"})] {
+            let mut calls = old.clone();
+            for call in calls.as_array_mut().unwrap() {
+                call["facts"] = empty.clone();
+            }
+            assert_eq!(cross_ticket(calls, true), text, "{empty}");
+        }
+        // Fields of another shape read as absent and never refuse the file.
+        let mut odd = old.clone();
+        odd[0]["callee_group"] = json!(["ga"]);
+        odd[0]["occurrences"] = json!("many");
+        odd[1]["occurrences"] = json!(-4);
+        let odd = cross_ticket(odd, true);
+        for expected in [
+            "- call into another application: `app:program:2` calls `app:program:1`\n",
+            "- call into another application: `app:program:3` calls `app:program:1` of ticket \
+             `atlas-ga`\n",
+        ] {
+            assert!(odd.contains(expected), "{expected}\n{odd}");
+        }
+        // An entry without `callee_group` names no ticket.
+        let mut absent = old.clone();
+        absent[1].as_object_mut().unwrap().remove("callee_group");
+        let absent = cross_ticket(absent, true);
+        for expected in [
+            "- call into another application: `app:program:2` calls `app:program:1` of ticket \
+             `atlas-ga`\n",
+            "- call into another application: `app:program:3` calls `app:program:1` (4 \
+             occurrences)\n",
+        ] {
+            assert!(absent.contains(expected), "{expected}\n{absent}");
+        }
+    }
+
+    #[test]
+    fn the_verb_of_a_link_into_another_application_follows_the_facts_it_keeps() {
+        // A reference of this link and a call of another caller: the call is
+        // left out, so nothing kept is a call.
+        let kept_reference = cross_with(
+            2,
+            1,
+            vec![
+                cross_fact(1, 2, 1, REFERENCE, 1),
+                cross_fact(2, 3, 1, CALL, 1),
+            ],
+        );
+        // Nothing kept at all: the wording of a link without facts.
+        let mut none_kept = cross_with(3, 1, vec![cross_fact(3, 2, 1, REFERENCE, 1)]);
+        none_kept["occurrences"] = json!(1);
+        // A call of this link and a reference of another callee.
+        let kept_call = cross_with(
+            3,
+            2,
+            vec![
+                cross_fact(4, 3, 2, CALL, 1),
+                cross_fact(5, 3, 1, REFERENCE, 1),
+            ],
+        );
+        let text = cross_ticket(json!([kept_reference, none_kept, kept_call]), true);
+        for expected in [
+            "- call into another application: `app:program:2` names `app:program:1` of ticket \
+             `atlas-ga` (2 occurrences): by a reference, which is a mention and not a call \
+             (fact `f-0000000000000001`); `bundle/groups.json` is inconsistent here: these \
+             facts add up to 1 occurrence, not 2; 1 fact listed with this link in \
+             `bundle/groups.json` names another caller or callee and is left out\n",
+            "- call into another application: `app:program:3` calls `app:program:1` of ticket \
+             `atlas-ga`: 1 fact listed with this link in `bundle/groups.json` names another \
+             caller or callee and is left out\n",
+            "- call into another application: `app:program:3` calls `app:program:2` of this \
+             group (2 occurrences): by a call (fact `f-0000000000000004`); ",
+        ] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
+    }
+
+    #[test]
+    fn a_reference_into_another_application_listed_twice_is_said_to_be_one_link() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut groups = vec![
+            group("ga", 0, &["Program A"], &[]),
+            group("gb", 1, &["Program B", "Program C"], &["ga"]),
+        ];
+        // The exporter lists a pair linked only by references in both lists,
+        // with the same facts.
+        let call_and_reference = cross_with(
+            3,
+            1,
+            vec![
+                cross_fact(2, 3, 1, CALL, 1),
+                cross_fact(3, 3, 1, REFERENCE, 1),
+            ],
+        );
+        groups[1].loose_ends = json!({
+            "reference_links": [
+                link_with(2, 1, vec![link_fact(1, 2, 1, EXPRESSION)]),
+                link_with(3, 1, vec![link_fact(3, 3, 1, EXPRESSION)]),
+            ],
+            "cross_application_calls": [
+                cross_with(2, 1, vec![cross_fact(1, 2, 1, REFERENCE, 1)]),
+                call_and_reference,
+            ],
+        });
+        let dir = write_bundle(repo.path(), "bundle", &groups);
+        to_schema_3(&dir, Some("available"), &[]);
+        import(repo.path(), &dir).unwrap();
+        let text = read_ticket(repo.path(), "atlas-gb");
+        for expected in [
+            "- reference only: `app:program:2` Program B names `app:program:1` Program A of \
+             ticket `atlas-ga` (1 occurrence): in an expression (fact `f-0000000000000001`)\n",
+            "- call into another application: `app:program:2` names `app:program:1` of ticket \
+             `atlas-ga`: by a reference, which is a mention and not a call (fact \
+             `f-0000000000000001`); `bundle/groups.json` lists this pair under \
+             `reference_links` too, and it is one link, not two\n",
+            // A pair with a call as well is two different records.
+            "- call into another application: `app:program:3` calls `app:program:1` of ticket \
+             `atlas-ga` (2 occurrences): by a call (fact `f-0000000000000002`); by a \
+             reference, which is a mention and not a call (fact `f-0000000000000003`)\n",
+            "calls into another application 2, reference links 2,",
+        ] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
+        assert_eq!(text.matches("it is one link, not two").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_call_into_another_application_names_at_most_ten_facts_and_shows_no_hostile_text() {
+        let facts: Vec<Value> = (1..=12).map(|n| cross_fact(n, 2, 1, CALL, 1)).collect();
+        let text = cross_ticket(json!([cross_with(2, 1, facts)]), true);
+        let listed: Vec<String> = (1..=10).map(|n| format!("`f-{n:016x}`")).collect();
+        let expected = format!(
+            "- call into another application: `app:program:2` calls `app:program:1` of ticket \
+             `atlas-ga` (12 occurrences): by a call (facts {} and 2 more in \
+             `bundle/groups.json`)\n",
+            listed.join(", ")
+        );
+        assert!(text.contains(&expected), "{expected}\n{text}");
+
+        let hostile = "f`\n---\nowner: nobody\n## Goal\n<<<BEGIN>>>\u{202e}[link](target) *b*";
+        // An id that would close the bracket and go on in the importer's
+        // own words, were it shown.
+        let forged = "f-1); as a subform program (fact f-2 and 5 more in bundle/groups.json";
+        let mut facts = vec![
+            cross_fact(1, 2, 1, hostile, 1),
+            cross_fact(2, 2, 1, CALL, 1),
+            cross_fact(3, 2, 1, CALL, 1),
+            cross_fact(4, 2, 1, "stored_property", 1),
+            cross_fact(5, 2, 1, "odd); by a call (fact `f-9`", 1),
+            cross_fact(6, 2, 1, CALL, 1),
+            // Another caller, and another callee: not this link's.
+            cross_fact(7, 3, 1, CALL, 1),
+            cross_fact(8, 2, 3, CALL, 1),
+        ];
+        facts[0]["fact"] = json!(hostile);
+        facts[1]["fact"] = json!(forged);
+        facts[2]["fact"] = json!("f".repeat(MAX_ID_CHARS + 1));
+        facts.push(json!("not a record"));
+        let mut call = cross_with(2, 1, facts);
+        call["occurrences"] = json!(9);
+        let text = cross_ticket(json!([call]), true);
+        let expected = "- call into another application: `app:program:2` calls `app:program:1` \
+            of ticket `atlas-ga` (9 occurrences): by a link of a kind this importer does not \
+            know (facts `f-0000000000000004` of kind `stored_property`, `f-0000000000000005` \
+            and 1 more in `bundle/groups.json`); by a call (fact `f-0000000000000006` and 2 \
+            more in `bundle/groups.json`); `bundle/groups.json` is inconsistent here: these \
+            facts add up to 6 occurrences, not 9; 2 facts listed with this link in \
+            `bundle/groups.json` name another caller or callee and are left out; 1 entry of \
+            this link's `facts` in `bundle/groups.json` is not a record and is left out\n";
+        assert!(text.contains(expected), "{expected}\n{text}");
+        for absent in [
+            "owner",
+            "BEGIN",
+            "](",
+            "fff",
+            "f-1",
+            "f-2",
+            "f-9",
+            "odd",
+            "5 more",
+            "\u{202e}",
+            "f-0000000000000007",
+            "f-0000000000000008",
+            "as a subform",
+        ] {
+            assert!(!text.contains(absent), "{absent}\n{text}");
+        }
+        assert_eq!(text.matches("## Goal").count(), 1, "{text}");
+
+        // The longest bullet stays bounded: every id as long as a token may be.
+        let facts: Vec<Value> = (0..12)
+            .map(|n| {
+                let mut fact = cross_fact(1, 2, 1, &"k".repeat(MAX_NAME_CHARS), 1);
+                fact["fact"] = json!(format!("{n:02}{}", "f".repeat(MAX_ID_CHARS - 2)));
+                fact
+            })
+            .collect();
+        let text = cross_ticket(json!([cross_with(2, 1, facts)]), true);
+        let bullet = text
+            .lines()
+            .find(|line| line.starts_with("- call into another application: "))
+            .unwrap();
+        assert_eq!(bullet.matches(" of kind `").count(), 10, "{bullet}");
+        assert!(bullet.ends_with(" and 2 more in `bundle/groups.json`)"));
+        let per_fact = MAX_ID_CHARS + MAX_NAME_CHARS + "`` of kind ``, ".len();
+        assert!(bullet.chars().count() < MAX_LISTED_LOOSE_ENDS * per_fact + 400);
+    }
+
+    /// The tickets of a schema 3 bundle of group `ga` (program 1) and group
+    /// `gb` (programs 2, 3 and 4), after `marked` programs are flagged
+    /// `reached_only_through_references` with `value`.
+    fn reached_tickets(marked: &[usize], value: Value, schema_3: bool) -> [String; 2] {
+        reached_tickets_of(3, marked, value, schema_3)
+    }
+
+    /// As `reached_tickets`, with `size` programs in group `gb`, numbered
+    /// from 2.
+    fn reached_tickets_of(
+        size: usize,
+        marked: &[usize],
+        value: Value,
+        schema_3: bool,
+    ) -> [String; 2] {
+        let repo = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..size).map(|n| format!("Program {n}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let groups = vec![
+            group("ga", 0, &["Program A"], &[]),
+            group("gb", 1, &names, &["ga"]),
+        ];
+        let dir = write_bundle(repo.path(), "bundle", &groups);
+        if schema_3 {
+            to_schema_3(&dir, Some("available"), &[]);
+        }
+        edit_manifest(&dir, |manifest| {
+            for (index, program) in manifest["programs"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .enumerate()
+            {
+                program["reached_only_through_references"] = if marked.contains(&(index + 1)) {
+                    value.clone()
+                } else {
+                    json!(false)
+                };
+            }
+        });
+        import(repo.path(), &dir).unwrap();
+        ["atlas-ga", "atlas-gb"].map(|slug| {
+            let text = read_ticket(repo.path(), slug);
+            Ticket::parse(slug, &text).unwrap();
+            text
+        })
+    }
+
+    #[test]
+    fn a_program_reached_only_through_a_reference_says_so_in_its_ticket() {
+        let [single, group] = reached_tickets(&[1, 2, 4], json!(true), true);
+        let expected = "\
+            - Group: `ga`, layer 0, 1 program; group 1 of 2 in callee-first order.\n\
+            - Reached only through a reference: no chain of calls, subform programs and \
+            selection programs leads from the bundle's root program to this program, so every \
+            path to it passes through a reference. A reference is a mention, not a call, and \
+            the bundle cannot tell whether the program is ever run through one. Check that \
+            before spending work on it; `bundle/bundle.json` marks it \
+            `reached_only_through_references`.\n\
+            - Depends on no other group.\n";
+        assert!(single.contains(expected), "{expected}\n{single}");
+        assert!(
+            single.contains(
+                "- `app:program:1` Program A: packet index \
+                 `bundle/packets/app/program-1/index.json` (reached only through a reference)\n"
+            ),
+            "{single}"
+        );
+
+        // Only some programs of a group: the line names which.
+        let expected = "\
+            - Reached only through a reference (2 of the 3 programs, marked in the Programs \
+            list below: `app:program:2`, `app:program:4`): no chain of calls, subform programs \
+            and selection programs leads from the bundle's root program to those programs, so \
+            every path to them passes through a reference. A reference is a mention, not a \
+            call, and the bundle cannot tell whether the programs are ever run through one. \
+            Check that before spending work on them; `bundle/bundle.json` marks them \
+            `reached_only_through_references`. The other programs of the group are reached \
+            without a reference.\n";
+        assert!(group.contains(expected), "{expected}\n{group}");
+        assert_eq!(
+            group
+                .matches(" (reached only through a reference)\n")
+                .count(),
+            2,
+            "{group}"
+        );
+        assert!(
+            group.contains("program-3/index.json`\n")
+                && group.contains(SHARED_BY_TWO.replace("2 programs", "3 programs").as_str()),
+            "{group}"
+        );
+
+        let [_, one] = reached_tickets(&[3], json!(true), true);
+        assert!(
+            one.contains(
+                "- Reached only through a reference (1 of the 3 programs, marked in the \
+                 Programs list below: `app:program:3`): no chain of calls, subform programs and \
+                 selection programs leads from the bundle's root program to that program, so \
+                 every path to it passes"
+            ),
+            "{one}"
+        );
+
+        let [_, all] = reached_tickets(&[2, 3, 4], json!(true), true);
+        assert!(
+            all.contains(
+                "- Reached only through a reference: no chain of calls, subform programs and \
+                 selection programs leads from the bundle's root program to any of the 3 \
+                 programs of this group, so every path to them passes through a reference."
+            ) && !all.contains("The other programs"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn marked_programs_the_ticket_cannot_all_show_are_left_to_the_manifest() {
+        const MARKED: &str = " (reached only through a reference)\n";
+        const TAIL: &str = "): no chain of calls, subform programs and selection programs leads \
+            from the bundle's root program to those programs, so every path to them passes";
+        // Both marked programs are past the programs the list shows.
+        let [_, beyond] = reached_tickets_of(30, &[26, 27], json!(true), true);
+        let expected = format!(
+            "- Reached only through a reference (2 of the 30 programs: `app:program:26`, \
+             `app:program:27`; the Programs list below shows only the first 20 programs of the \
+             group, so `bundle/bundle.json` is where to find every marked program{TAIL}"
+        );
+        assert!(beyond.contains(&expected), "{expected}\n{beyond}");
+        assert_eq!(beyond.matches(MARKED).count(), 0, "{beyond}");
+        assert!(!beyond.contains("marked in the Programs list"), "{beyond}");
+
+        // More marked than the line names, all of them in the list.
+        let many: Vec<usize> = (2..=13).collect();
+        let ids: Vec<String> = (2..=11).map(|n| format!("`app:program:{n}`")).collect();
+        let [_, listed] = reached_tickets_of(30, &many, json!(true), true);
+        let expected = format!(
+            "- Reached only through a reference (12 of the 30 programs, marked in the Programs \
+             list below: {}, and 2 more{TAIL}",
+            ids.join(", ")
+        );
+        assert!(listed.contains(&expected), "{expected}\n{listed}");
+        assert_eq!(listed.matches(MARKED).count(), 12, "{listed}");
+
+        // More than the line names, and one the list does not show.
+        let mut many = many;
+        many.push(30);
+        let [_, both] = reached_tickets_of(30, &many, json!(true), true);
+        let expected = format!(
+            "- Reached only through a reference (13 of the 30 programs: {}, and 3 more; the \
+             Programs list below shows only the first 20 programs of the group, so \
+             `bundle/bundle.json` is where to find every marked program{TAIL}",
+            ids.join(", ")
+        );
+        assert!(both.contains(&expected), "{expected}\n{both}");
+        assert_eq!(both.matches(MARKED).count(), 12, "{both}");
+    }
+
+    #[test]
+    fn only_a_true_flag_of_a_schema_3_bundle_marks_a_program_as_reached_by_reference() {
+        let plain = reached_tickets(&[], json!(true), true);
+        // A value that is not `true` reads as false and never refuses the
+        // manifest; an earlier schema does not record the flag.
+        for (value, schema_3) in [
+            (json!(false), true),
+            (json!(null), true),
+            (json!("true"), true),
+            (json!(1), true),
+            (json!(true), false),
+        ] {
+            let tickets = reached_tickets(&[1, 2, 3, 4], value.clone(), schema_3);
+            for (ticket, unmarked) in tickets.iter().zip(&plain) {
+                assert!(
+                    !ticket.to_lowercase().contains("reached only"),
+                    "{value}\n{ticket}"
+                );
+                if schema_3 {
+                    let sha =
+                        |text: &str| text.split("at import: `").nth(1).unwrap()[..64].to_string();
+                    assert_eq!(
+                        ticket.replace(&sha(ticket), "SHA"),
+                        unmarked.replace(&sha(unmarked), "SHA"),
+                        "{value}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_program_name_reads_in_the_body_as_it_does_in_the_title() {
+        let names = [
+            r"Stock\Items_2 <new>",
+            "Plain name (v2) 100%",
+            "run `this` now",
+            "`edge`",
+            "R&amp;D &copy;1",
+            "P&L Sales & Returns",
+        ];
+        const IDS: [&str; 6] = ["ga", "gb", "gc", "gd", "ge", "gf"];
+        let mut tickets = Vec::new();
+        for schema_3 in [true, false] {
+            let repo = tempfile::tempdir().unwrap();
+            let mut groups: Vec<Group> = IDS
+                .iter()
+                .zip(names)
+                .map(|(id, name)| group(id, 0, &[name], &[]))
+                .collect();
+            groups[1].loose_ends = json!({ "reference_links": [
+                {"caller": "app:program:2", "callee": "app:program:1", "occurrences": 1},
+            ]});
+            let dir = write_bundle(repo.path(), "bundle", &groups);
+            if schema_3 {
+                to_schema_3(&dir, Some("available"), &[]);
+            }
+            import(repo.path(), &dir).unwrap();
+            tickets.push(IDS.map(|id| {
+                let slug = format!("atlas-{id}");
+                let text = read_ticket(repo.path(), &slug);
+                let ticket = Ticket::parse(&slug, &text).unwrap();
+                (ticket.title, text)
+            }));
+        }
+        let [current, earlier] = [&tickets[0], &tickets[1]];
+        // The title holds each name as it is, under either schema.
+        for (tickets, (name, id)) in current.iter().zip(earlier).zip(names.iter().zip(IDS)) {
+            for (title, _) in [tickets.0, tickets.1] {
+                assert_eq!(title, &format!("Migrate program {name} ({id})"));
+            }
+        }
+        // A name that escaping would change is a code span of the same text.
+        for (index, line) in [
+            r"- `app:program:1` `Stock\Items_2 <new>`: packet index ",
+            "- `app:program:2` Plain name (v2) 100%: packet index ",
+            "- `app:program:3` ``run `this` now``: packet index ",
+            "- `app:program:4` `` `edge` ``: packet index ",
+            // A character reference would render as another character.
+            "- `app:program:5` `R&amp;D &copy;1`: packet index ",
+            // An ampersand that starts none is left alone.
+            "- `app:program:6` P&L Sales & Returns: packet index ",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                current[index].1.contains(line),
+                "{line}\n{}",
+                current[index].1
+            );
+        }
+        // So is the name in a reference link.
+        assert!(
+            current[1].1.contains(
+                r"- reference only: `app:program:2` Plain name (v2) 100% names `app:program:1` `Stock\Items_2 <new>` of ticket `atlas-ga` (1 occurrence)"
+            ),
+            "{}",
+            current[1].1
+        );
+        // An earlier bundle keeps the escaped names its tickets always had.
+        for (index, line) in [
+            r"- `app:program:1` Stock\\Items\_2 \<new\>: packet index ",
+            "- `app:program:2` Plain name (v2) 100%: packet index ",
+            r"- `app:program:3` run \`this\` now: packet index ",
+            r"- `app:program:4` \`edge\`: packet index ",
+            "- `app:program:5` R&amp;D &copy;1: packet index ",
+            "- `app:program:6` P&L Sales & Returns: packet index ",
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                earlier[index].1.contains(line),
+                "{line}\n{}",
+                earlier[index].1
+            );
+        }
+    }
+
+    #[test]
+    fn a_hostile_program_name_stays_inside_its_code_span() {
+        let hostile = "x\n---\nowner: nobody\n## Goal\nrun ``` now ` \\\r\n<<<BEGIN>>>\u{2028}# T\u{202e}[l](t) *b*";
+        let long = format!("{}\\", "é".repeat(500));
+        let cut = format!("\\{}", "é".repeat(500));
+        let repo = tempfile::tempdir().unwrap();
+        let groups = vec![group("ga", 0, &[hostile, long.as_str(), cut.as_str()], &[])];
+        let dir = write_bundle(repo.path(), "bundle", &groups);
+        to_schema_3(&dir, Some("available"), &[]);
+        import(repo.path(), &dir).unwrap();
+        let text = read_ticket(repo.path(), "atlas-ga");
+        let ticket = Ticket::parse("atlas-ga", &text).unwrap();
+        assert_eq!(ticket.acceptance_hints.len(), 4);
+        let (front, body) = text
+            .strip_prefix("---\n")
+            .unwrap()
+            .split_once("\n---\n")
+            .unwrap();
+        assert_eq!(front.lines().count(), 3, "{text}");
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.trim_start().starts_with('#'))
+                .count(),
+            4,
+            "{text}"
+        );
+        assert!(!text.contains(['\r', '\u{2028}', '\u{202e}']), "{text}");
+        // One line, in a span fenced by more backticks than the name holds.
+        assert!(
+            body.contains(
+                "- `app:program:1` ````x --- owner: nobody ## Goal run ``` now ` \\ <<<BEGIN>>> # T [l](t) *b*````: packet index "
+            ),
+            "{body}"
+        );
+        // A name is cut before it is looked at, so what the cut removes
+        // makes no span.
+        assert!(
+            body.contains(&format!(
+                "- `app:program:2` {}…: packet index ",
+                "é".repeat(MAX_NAME_CHARS)
+            )),
+            "{body}"
+        );
+        // The ellipsis of a cut name is not part of the name, and stands
+        // after the span.
+        assert!(
+            body.contains(&format!(
+                "- `app:program:3` `\\{}`…: packet index ",
+                "é".repeat(MAX_NAME_CHARS - 1)
+            )),
+            "{body}"
+        );
     }
 
     #[test]
