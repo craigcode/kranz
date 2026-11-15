@@ -1686,8 +1686,7 @@ fn secret_scan_range_reads_allowlist_from_a_separate_commit() {
     assert_eq!(findings[0].rule_id, "anthropic-api-key");
     assert!(
         findings[0].location.contains("notes.txt:"),
-        "location must be path:line, got {:?}",
-        findings[0].location
+        "location must be path:line"
     );
     let (path, line) = findings[0]
         .location
