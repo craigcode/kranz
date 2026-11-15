@@ -5,6 +5,26 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: `kranz ticket import-atlas` reads the `reference_kinds` and
+  `facts` a current Magic Atlas writes on each reference link of a schema 3
+  bundle. The "reference only" loose end then says how the program is named
+  (in an expression, as the selection program of a variable no control is
+  bound to, or both) and carries the ids of the `references_program` facts
+  behind it, at most 10 for a link with the rest counted. A link that has
+  kinds but lists no fact gives the ways without ids. A kind the importer
+  does not know, or `unclassified`, is said to be that and never presented as
+  a known kind. A fact id or kind that is not a plain token is counted and
+  not shown. When every link of a group says something on how, the
+  by-reference line points to the pairs instead of listing the ways; when
+  only some do, it says so. A link that gives its occurrences and whose facts
+  do not add up to them, or whose facts name another caller or callee, is
+  imported and the bullet says so. Schema 3 bundles without the two fields,
+  and schema 1 and 2 bundles, give the same tickets as before. See
+  `docs/tickets.md`.
+- Fixed: the hint printed for a parked draft now names the route that
+  works (add answers to the ticket, `kranz abandon <id>`, then
+  `kranz draft <slug>`) instead of `kranz plan --mission`, which refuses an
+  already-approved mission.
 - Fixed: the dashboard's one-call permission card stays mounted in place
   after its deadline passes (or after the engine closes it as expired),
   instead of unmounting and shifting the remaining panels and buttons
