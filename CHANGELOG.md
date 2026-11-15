@@ -5,6 +5,14 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: the engine scans each feature's own commit range for secrets
+  after every worker run, before the judgement turn, with the allowlist read
+  from the base pinned at plan approval. On the sequential path a finding
+  respawns the worker with the fingerprint, rule and location, and fails the
+  feature once the respawn limit is spent. In a parallel worktree it fails
+  the feature and the branch is not merged. For a dispatch-pool candidate it
+  is noted on the candidate's line. The matched text is never quoted. The
+  merge and `kranz exec --push` scans are unchanged.
 - Changed: tickets `kranz ticket import-atlas` writes from a schema 3 bundle
   say four things more. A link into another application names the callee's
   ticket and, when there are more than one, the occurrences; when a current

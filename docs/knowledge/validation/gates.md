@@ -59,7 +59,16 @@ verified_against:
   - scripts/package-release.py
   - scripts/audit-operator-markers.py
   - docs/tickets.md
+  - crates/engine/src/git_ops.rs
 ---
+
+Rechecked 2026-11-15 (UTC) against the feature-range secret scan: after every
+worker run, before the judgement turn, the engine now scans the feature's own
+commit range (sequentially `feature_base_sha..HEAD`; in a parallel worktree
+`start_sha..HEAD`) via `GitRepo::secret_scan_range`
+([git_ops.rs](../../../crates/engine/src/git_ops.rs)), with the allowlist read
+from the mission's approval-pinned `base_sha`. Gate commands, the merge
+pre-gate and the `kranz exec --push` range scan are unchanged.
 
 Rechecked 2026-11-15 (UTC) against the `docs/tickets.md` change adding a
 section on reshaping a parked draft (abandon, then redraft). No gate changed.
@@ -481,7 +490,7 @@ until the required reviews run again. Existing validator containment remains
 mandatory. See [config composition](../../config-composition.md#reviewer-independence-reviewerindependence)
 and [the gate](../../../crates/engine/src/reviewer_independence.rs).
 
-## Secret scanning — three layers
+## Secret scanning — four layers
 
 All backed by [scrub.rs](../../../crates/engine/src/scrub.rs) (curated
 `OnceLock` regexes for PEM/vendor tokens/headers/connection-strings + one
@@ -497,6 +506,24 @@ entropy-gated pass ≥4.0 bits/char; no external deps).
   a redaction is never mistaken for tampering. Worker messages also pass
   through `scrub_and_truncate`
   ([runner.rs](../../../crates/engine/src/runner.rs)).
+- **Feature-range scan:** after every worker run, before the judgement turn,
+  the engine scans the feature's own commit range via `GitRepo::secret_scan_range`
+  ([git_ops.rs](../../../crates/engine/src/git_ops.rs)), with the allowlist read
+  from the mission's approval-pinned `base_sha` (so an allowlist edit inside
+  the mission waives nothing):
+  - **Sequential:** `feature_base_sha..HEAD`, the net diff of the whole
+    feature, stable across respawns. A finding respawns the worker with
+    engine-written guidance naming fingerprint, rule and path:line, within
+    `max_respawns` and without a model judgement turn. On exhaustion the
+    feature fails with the findings in its reason and the milestone blocks
+    with cause `secret-scan`.
+  - **Parallel:** in the worktree, `start_sha..HEAD`. A finding fails the
+    feature and its branch is never merged. There is no respawn in this path.
+  - **Dispatch pool:** findings are noted on the candidate's line, record-only;
+    the pool still parks for human judgement regardless.
+  - An unreadable range is never a silent pass: on the sequential and
+    parallel paths it fails the feature; for a dispatch-pool candidate it is
+    noted on the candidate's line (record-only).
 - **Merge pre-gate:** step 2 above.
 - **`kranz scan`** ([commands.rs](../../../crates/cli/src/commands.rs) `cmd_scan`):
   `kranz scan --range main..HEAD` (or `--staged`, or default `HEAD`); prints
