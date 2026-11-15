@@ -200,7 +200,8 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let version = probe_version(&stub, Duration::from_secs(3)).unwrap();
+        // The deadline is not under test: leave room for a loaded host.
+        let version = probe_version(&stub, Duration::from_secs(30)).unwrap();
 
         assert!(version.ends_with("healthy-version-1.2.3"), "{version}");
     }

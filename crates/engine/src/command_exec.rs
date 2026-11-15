@@ -3679,7 +3679,9 @@ esac
         let (code, output) = run_shell_command_sandboxed_with_code(
             &scratch,
             "true",
-            Duration::from_millis(500),
+            // Long enough for the stub to record its launch on a loaded host;
+            // its `sleep 30` still forces the timeout.
+            Duration::from_secs(5),
             &env,
             &sandbox,
         )
