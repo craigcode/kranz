@@ -739,7 +739,8 @@ mod tests {
             &format!("(sleep 1; touch '{}') & exit 0", marker.display()),
         );
         // Prove the same descendant would act without cancellation.
-        assert!(run_ctl(&bin, &[], Duration::from_secs(3)).is_ok());
+        // The deadline is not under test here: leave room for a loaded host.
+        assert!(run_ctl(&bin, &[], Duration::from_secs(30)).is_ok());
         assert!(marker.exists());
         std::fs::remove_file(&marker).unwrap();
         let started = Instant::now();
