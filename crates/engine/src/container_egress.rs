@@ -1739,6 +1739,13 @@ mod tests {
 
         let mut spec = session_spec(root.path(), 8443);
         let paths = MissionPaths::new(root.path(), "m-egress-env-clear");
+        // Give the sandbox the fixture's own mission directory. The control
+        // executable check treats the checkout above the nearest `.kranz`
+        // ancestor of `mission_dir` as worker-writable. With the helper's
+        // default (the tempdir itself) a TMPDIR inside a real mission
+        // directory, as the contract gate's is, makes that the operator's
+        // checkout, and `bin` falls inside it.
+        spec.sandbox.as_mut().unwrap().inputs.mission_dir = paths.mission_dir();
         // Fails at version floor (24.0.0 < 25.0.5) right after invoking fake_docker once.
         let err = ContainerEgressBoundary::start(&mut spec, &paths)
             .await
