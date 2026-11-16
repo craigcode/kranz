@@ -363,7 +363,7 @@ impl MissionEngine {
                 let mut issues = Vec::new();
                 for (id, program, args) in probes {
                     match crate::command_exec::run_bounded_argv(
-                        &probe_cwd, &program, &args, TIMEOUT, &env,
+                        &probe_cwd, &program, &args, TIMEOUT, &env, None,
                     )
                     .await
                     {

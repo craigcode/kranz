@@ -434,6 +434,7 @@ fn shell_argv(command: &str) -> (std::path::PathBuf, Vec<String>) {
 /// gets no escaping at all, unlike the one-quoted-argument encoding
 /// std/tokio `Command::args` would otherwise apply (which turns inner `"`
 /// into `\"`, breaking commands like `node -e "..."`).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn cmd_raw_tail(command: &str) -> String {
     format!("/S /C \"{command}\"")
 }
@@ -441,6 +442,7 @@ pub(crate) fn cmd_raw_tail(command: &str) -> String {
 /// The full raw command line `<cmd_program> /S /C "<command>"`, quoting the
 /// program only when `appcontainer_windows::quote_arg` would (empty or
 /// containing whitespace) — matched here so both quoting rules agree.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn cmd_raw_command_line(cmd_program: &str, command: &str) -> String {
     let needs_quotes = cmd_program.is_empty() || cmd_program.chars().any(|c| c == ' ' || c == '\t');
     let program = if needs_quotes {

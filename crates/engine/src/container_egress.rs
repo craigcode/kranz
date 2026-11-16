@@ -1212,6 +1212,7 @@ mod tests {
                 ],
                 COMMAND_TIMEOUT,
                 &env,
+                None,
             )
             .await;
             let target_id = output.trim();
@@ -1231,6 +1232,7 @@ mod tests {
                     &["logs".into(), target_id.into()],
                     Duration::from_secs(5),
                     &env,
+                    None,
                 )
                 .await;
                 if code == Some(0) && logs.lines().any(|line| line == "SOCKET-TARGET-READY") {
@@ -1252,6 +1254,7 @@ mod tests {
                 ],
                 COMMAND_TIMEOUT,
                 &env,
+                None,
             )
             .await;
             if code != Some(0) || address.parse::<std::net::Ipv4Addr>().is_err() {
