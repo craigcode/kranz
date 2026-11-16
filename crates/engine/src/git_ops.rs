@@ -192,6 +192,9 @@ fn create_empty_global_config() -> std::result::Result<PathBuf, String> {
     builder
         .create(&dir)
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    // This crate's unit tests have no shared setup to register it from.
+    #[cfg(test)]
+    crate::test_dirs::register(&dir);
     let path = dir.join("gitconfig");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
