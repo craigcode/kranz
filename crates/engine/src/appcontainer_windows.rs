@@ -2847,17 +2847,17 @@ pub(crate) fn prepare_launch(
     let rustup_toolchain = resolve_installed_rustup_toolchain(&inputs.session_cwd, env);
     let (profile_name, sid) = create_profile(inputs.enforce == crate::types::SandboxEnforce::Fs)?;
     let mut lease = new_lease(profile_name, rustup_toolchain);
-    let prepared = match prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env, None)
-    {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            // Setup already created a disposable profile and may have applied
-            // some ACLs. The spawn is failing either way, but teardown still
-            // must be attempted explicitly rather than disappearing into Drop.
-            lease.cleanup()?;
-            return Err(error);
-        }
-    };
+    let prepared =
+        match prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env, None) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Setup already created a disposable profile and may have applied
+                // some ACLs. The spawn is failing either way, but teardown still
+                // must be attempted explicitly rather than disappearing into Drop.
+                lease.cleanup()?;
+                return Err(error);
+            }
+        };
     Ok(PreparedLaunch {
         program: prepared.program,
         args: prepared.args,
