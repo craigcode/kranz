@@ -16448,10 +16448,15 @@ pub(crate) mod tests {
             kind: crate::contract_shell::ShellKind::Sh,
             program: std::path::PathBuf::from("sh"),
         };
-        let rendered =
-            MissionEngine::run_contract_commands_for_validation(&contract, root.path(), &env, &sandbox, &shell)
-                .await
-                .expect("one command assertion renders a line");
+        let rendered = MissionEngine::run_contract_commands_for_validation(
+            &contract,
+            root.path(),
+            &env,
+            &sandbox,
+            &shell,
+        )
+        .await
+        .expect("one command assertion renders a line");
         assert!(
             rendered.contains("(shell: sh)"),
             "expected a shell label on the validation-round line: {rendered}"
