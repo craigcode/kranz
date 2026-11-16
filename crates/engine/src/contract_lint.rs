@@ -77,6 +77,10 @@ pub struct ContractLintReport {
     /// Whether the tree was clean (no uncommitted changes) at the moment the
     /// lint ran — when false, results may not reflect the pristine base.
     pub tree_clean_at_base: bool,
+    /// The [`crate::contract_shell::HostShell::label`] the lint's commands
+    /// ran under — `"sh"` when the lint never ran any command (skipped, or
+    /// no command assertions at all).
+    pub shell_label: String,
 }
 
 impl ContractLintReport {
@@ -121,6 +125,7 @@ impl ContractLintReport {
         ContractLintReport {
             results,
             tree_clean_at_base: true,
+            shell_label: "sh".to_string(),
         }
     }
 
@@ -235,14 +240,16 @@ pub(crate) fn containment_usable(
     scratch: &Path,
     base_sha: Option<&str>,
     sandbox: &crate::command_exec::GateSandbox,
+    shell: &crate::contract_shell::HostShell,
 ) -> bool {
     let env = lint_env(scratch, base_sha, &[]);
-    let (code, _) = crate::command_exec::run_shell_command_sandboxed_blocking(
+    let (code, _) = crate::command_exec::run_contract_command_sandboxed_blocking(
         cwd,
         "exit 0",
         Duration::from_secs(30),
         &env,
         sandbox,
+        shell,
     );
     code == Some(0)
 }

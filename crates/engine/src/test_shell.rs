@@ -88,3 +88,19 @@ fn sleep_fixture() {
     std::thread::sleep(std::time::Duration::from_millis(millis));
     println!("KRANZ_TEST_SLEEP_COMPLETED={millis}");
 }
+
+/// A planted-shell detection fixture for `command_exec`'s
+/// `windows_contract_shell_planted_sh_is_never_executed` test: a copy of this
+/// test executable is placed where a buggy `sh` resolution could pick it up
+/// (the command's cwd, and a cwd subdirectory placed first on PATH). If the
+/// resolved contract shell ever selected the planted copy and ran it with
+/// this selector, it would write the marker named by
+/// `KRANZ_TEST_PLANTED_SH_MARKER` — proof the planted binary executed.
+#[cfg(windows)]
+#[test]
+#[ignore = "planted-sh detection fixture, invoked by command_exec tests"]
+fn planted_sh_marker_fixture() {
+    if let Ok(marker) = std::env::var("KRANZ_TEST_PLANTED_SH_MARKER") {
+        std::fs::write(marker, b"planted-sh-executed").unwrap();
+    }
+}

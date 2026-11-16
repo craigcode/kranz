@@ -760,6 +760,70 @@ impl GateSandbox {
             }
         }
     }
+
+    /// [`Self::wrap_shell`], made aware of a resolved [`crate::contract_shell::HostShell`]
+    /// (contract-lane callers only — validation round, final gate, approval
+    /// contract lint). Only `Disabled` and `AppContainer` branch on the
+    /// shell: `Seatbelt`/`Bubblewrap`/`Container` ignore it and stay
+    /// byte-identical to [`Self::wrap_shell`] (`/bin/sh -c` as always).
+    ///
+    /// - `Disabled` + `Sh`: `program = shell.program`, `args = ["-c",
+    ///   command]` — on Unix that is exactly `sh -c <command>`,
+    ///   byte-identical to today. The resolved Windows `sh.exe` is a real
+    ///   argv-parsing program (standard C runtime quoting), so it goes
+    ///   through the normal `.args()` encoding rather than the raw cmd tail.
+    /// - `Disabled` + `Cmd`: the existing raw-cmd-tail path.
+    /// - `AppContainer` + `Cmd`: the existing raw-cmd-tail path through
+    ///   `prepare_launch_in_context`.
+    /// - `AppContainer` + `Sh`: the absolute `sh` with `["-c", command]`
+    ///   through `prepare_launch_in_context`'s normal encoded path (no
+    ///   `raw_command_tail`); no production caller selects this yet (the
+    ///   Windows AppContainer contract lane stays `Cmd` —
+    ///   [`crate::contract_shell::resolve_contract_shell`]).
+    pub(crate) fn wrap_contract_shell(
+        &self,
+        command: &str,
+        env: &HashMap<String, String>,
+        shell: &crate::contract_shell::HostShell,
+    ) -> crate::error::Result<WrappedCommand> {
+        use crate::contract_shell::ShellKind;
+        match (self, shell.kind) {
+            (GateSandbox::Disabled, ShellKind::Sh) => Ok(WrappedCommand {
+                program: shell.program.clone(),
+                args: vec!["-c".to_string(), command.to_string()],
+                timeout_teardown: None,
+                raw_tail: None,
+                #[cfg(windows)]
+                _appcontainer_context: None,
+            }),
+            #[cfg(windows)]
+            (GateSandbox::AppContainer { inputs, context }, ShellKind::Sh) => {
+                let prepared = crate::appcontainer_windows::prepare_launch_in_context(
+                    context,
+                    inputs,
+                    &shell.program,
+                    &["-c".to_string(), command.to_string()],
+                    env,
+                    None,
+                )?;
+                Ok(WrappedCommand {
+                    program: prepared.program,
+                    args: prepared.args,
+                    timeout_teardown: None,
+                    raw_tail: None,
+                    _appcontainer_context: Some(context.clone()),
+                })
+            }
+            #[cfg(not(windows))]
+            (GateSandbox::AppContainer { .. }, ShellKind::Sh) => {
+                let _ = (command, env);
+                Err(crate::error::EngineError::Backend(
+                    "AppContainer gate wrapper is unavailable on this host".to_string(),
+                ))
+            }
+            _ => self.wrap_shell(command, env),
+        }
+    }
 }
 
 /// The outcome of resolving a gate sandbox: the posture plus an optional
@@ -1402,6 +1466,117 @@ pub(crate) fn run_shell_command_sandboxed_blocking(
             };
             runtime.block_on(run_shell_command_sandboxed_with_code(
                 cwd, command, timeout, env, sandbox,
+            ))
+        });
+        worker.join().unwrap_or_else(|_| {
+            (
+                None,
+                "approval gate runner panicked before producing a verdict".to_string(),
+            )
+        })
+    })
+}
+
+/// [`run_shell_command_sandboxed`], routed through the resolved contract
+/// [`crate::contract_shell::HostShell`] instead of [`shell_argv`]'s fixed
+/// `cmd`/`sh` choice. Contract-lane callers only (validation round, final
+/// gate, approval contract lint) — merge gates and every other caller keep
+/// using [`run_shell_command_sandboxed`].
+pub(crate) async fn run_contract_command_sandboxed(
+    cwd: &std::path::Path,
+    command: &str,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+    shell: &crate::contract_shell::HostShell,
+) -> (bool, String) {
+    let (code, output) = run_contract_command_sandboxed_with_code(
+        cwd,
+        command,
+        COMMAND_TIMEOUT,
+        env,
+        sandbox,
+        shell,
+    )
+    .await;
+    (code == Some(0), output)
+}
+
+/// [`run_contract_command_sandboxed`] with an explicit timeout and the real
+/// exit code, mirroring [`run_shell_command_sandboxed_with_code`].
+pub(crate) async fn run_contract_command_sandboxed_with_code(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+    shell: &crate::contract_shell::HostShell,
+) -> (Option<i32>, String) {
+    let env = gate_env_for_sandbox(env, sandbox);
+    let wrapped = match sandbox.wrap_contract_shell(command, &env, shell) {
+        Ok(wrapped) => wrapped,
+        Err(error) => {
+            return (
+                None,
+                format!("gate sandbox wrap failed closed (the command did not run): {error}"),
+            )
+        }
+    };
+    let client_env = match sandbox {
+        GateSandbox::Container { spec, .. } => spec.runtime.client_env(),
+        _ => env,
+    };
+    let (code, output) = run_bounded_argv(
+        cwd,
+        &wrapped.program,
+        &wrapped.args,
+        timeout,
+        &client_env,
+        wrapped.raw_tail.as_deref(),
+    )
+    .await;
+    if code.is_none() {
+        if let Some((program, args)) = wrapped.timeout_teardown {
+            let _ = run_bounded_argv(
+                cwd,
+                &program,
+                &args,
+                Duration::from_secs(30),
+                &client_env,
+                None,
+            )
+            .await;
+        }
+    }
+    (code, output)
+}
+
+/// Synchronous bridge for contract-lane gate execution from approval-time
+/// code that runs inside an ambient Tokio runtime, mirroring
+/// [`run_shell_command_sandboxed_blocking`].
+pub(crate) fn run_contract_command_sandboxed_blocking(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+    shell: &crate::contract_shell::HostShell,
+) -> (Option<i32>, String) {
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return (
+                        None,
+                        format!("failed to create approval gate runtime: {error}"),
+                    )
+                }
+            };
+            runtime.block_on(run_contract_command_sandboxed_with_code(
+                cwd, command, timeout, env, sandbox, shell,
             ))
         });
         worker.join().unwrap_or_else(|_| {
@@ -2165,6 +2340,190 @@ mod tests {
         assert_eq!(wrapped.program, std::path::PathBuf::from("sh"));
         assert_eq!(wrapped.args, vec!["-c".to_string(), "echo hi".to_string()]);
         assert_eq!(wrapped.raw_tail, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_argv_unix_contract_runner_disabled_wrap_matches_sh_dash_c() {
+        let shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("sh"),
+        };
+        let wrapped = GateSandbox::Disabled
+            .wrap_contract_shell("echo hi", &HashMap::new(), &shell)
+            .unwrap();
+        assert_eq!(wrapped.program, std::path::PathBuf::from("sh"));
+        assert_eq!(wrapped.args, vec!["-c".to_string(), "echo hi".to_string()]);
+        assert_eq!(wrapped.raw_tail, None);
+
+        // And end-to-end through the real runner, byte-identical to the
+        // pre-existing shell_argv-based path.
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let (ok, output) = run_contract_command_sandboxed(
+            dir.path(),
+            "echo hi",
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert!(ok, "{output}");
+        assert!(output.contains("hi"), "{output}");
+    }
+
+    /// Resolve the uncontained Windows contract shell, asserting a real
+    /// Git-for-Windows `sh.exe` was found: Windows CI always carries Git, so
+    /// a missing `sh` here is a real defect, never a reason to skip.
+    #[cfg(windows)]
+    fn resolved_uncontained_contract_sh(
+        forbidden_roots: &[std::path::PathBuf],
+    ) -> crate::contract_shell::HostShell {
+        let shell = crate::contract_shell::resolve_contract_shell(
+            crate::contract_shell::ShellLane::Contract,
+            false,
+            forbidden_roots,
+        );
+        assert_eq!(
+            shell.kind,
+            crate::contract_shell::ShellKind::Sh,
+            "Windows CI always has Git; a Git-for-Windows sh.exe must resolve \
+             (got label: {})",
+            shell.label()
+        );
+        assert!(
+            shell.program.is_absolute(),
+            "the resolved sh must be an absolute path: {}",
+            shell.program.display()
+        );
+        shell
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_sh_keeps_inner_double_quotes() {
+        let shell = resolved_uncontained_contract_sh(&[]);
+        assert!(
+            shell.label().starts_with("sh ("),
+            "the label must name the resolved absolute sh path: {}",
+            shell.label()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let env = sanitized_gate_env();
+        assert!(env.contains_key("PATH"), "contract env must carry PATH");
+        let (code, output) = run_contract_command_sandboxed_with_code(
+            dir.path(),
+            r#"node -e "process.stdout.write('KRANZ_QUOTES_OK')""#,
+            Duration::from_secs(30),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(0),
+            "node must exit 0 under the resolved sh: {output}"
+        );
+        assert!(
+            output.contains("KRANZ_QUOTES_OK"),
+            "expected the marker to survive the resolved sh's quoting: {output}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_sh_sees_pinned_base_sha() {
+        let shell = resolved_uncontained_contract_sh(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = sanitized_gate_env();
+        env.insert("KRANZ_BASE_SHA".to_string(), "deadbeefcafe".to_string());
+
+        let (sh_code, sh_output) = run_contract_command_sandboxed_with_code(
+            dir.path(),
+            r#"test "$KRANZ_BASE_SHA" = deadbeefcafe"#,
+            Duration::from_secs(30),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(
+            sh_code,
+            Some(0),
+            "the resolved sh must see the pinned KRANZ_BASE_SHA: {sh_output}"
+        );
+
+        let cmd_shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Cmd,
+            program: std::path::PathBuf::from("cmd"),
+        };
+        let (cmd_code, cmd_output) = run_contract_command_sandboxed_with_code(
+            dir.path(),
+            r#"test "$KRANZ_BASE_SHA" = deadbeefcafe"#,
+            Duration::from_secs(30),
+            &env,
+            &GateSandbox::Disabled,
+            &cmd_shell,
+        )
+        .await;
+        assert_ne!(
+            cmd_code,
+            Some(0),
+            "cmd.exe must NOT parse POSIX `test` syntax the same way: {cmd_output}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_planted_sh_is_never_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("kranz-planted-sh-marker.txt");
+        let test_exe = std::env::current_exe().unwrap();
+
+        // Plant a fake sh.exe directly in the command's cwd…
+        std::fs::copy(&test_exe, dir.path().join("sh.exe")).unwrap();
+        // …and in a cwd subdirectory placed first on the child's PATH.
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::copy(&test_exe, bin_dir.join("sh.exe")).unwrap();
+
+        let shell = resolved_uncontained_contract_sh(&[]);
+        assert!(
+            !shell.program.starts_with(dir.path()),
+            "the resolved shell must never be the planted copy: {}",
+            shell.program.display()
+        );
+
+        let mut env = sanitized_gate_env();
+        let existing_path = env.get("PATH").cloned().unwrap_or_default();
+        env.insert(
+            "PATH".to_string(),
+            format!("{};{existing_path}", bin_dir.display()),
+        );
+        env.insert(
+            "KRANZ_TEST_PLANTED_SH_MARKER".to_string(),
+            marker.display().to_string(),
+        );
+
+        let (code, output) = run_contract_command_sandboxed_with_code(
+            dir.path(),
+            "exit 0",
+            Duration::from_secs(30),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(0),
+            "the resolved (real) sh must still run the command: {output}"
+        );
+        assert!(
+            !marker.exists(),
+            "the planted sh.exe (cwd or cwd-first PATH) must never execute"
+        );
     }
 
     #[cfg(windows)]

@@ -5743,6 +5743,46 @@ impl MissionEngine {
         Ok(resolution.sandbox)
     }
 
+    /// Resolve the [`crate::contract_shell::HostShell`] a Contract-lane
+    /// command should run under, given an already-resolved gate `sandbox`
+    /// (`contained` keys on whether it is [`crate::command_exec::GateSandbox::AppContainer`]).
+    /// Off Windows this is always the bare `sh`, byte-identical to the
+    /// pre-wrap behavior. `forbidden_roots` covers the repo root, the active
+    /// root, the mission dir, the contract scratch, and — where the
+    /// sandbox's inputs exist — its write allowlist, so a Windows discovery
+    /// can never resolve to a binary planted inside anything the mission
+    /// controls.
+    fn contract_shell(
+        &self,
+        root: &std::path::Path,
+        sandbox: &crate::command_exec::GateSandbox,
+    ) -> crate::contract_shell::HostShell {
+        let contained = matches!(sandbox, crate::command_exec::GateSandbox::AppContainer { .. });
+        let mut forbidden_roots = vec![
+            self.paths.repo_root.clone(),
+            root.to_path_buf(),
+            self.paths.mission_dir(),
+            self.paths.runs_dir().join("contract-home"),
+            std::env::temp_dir(),
+        ];
+        let inputs = match sandbox {
+            crate::command_exec::GateSandbox::Bubblewrap { inputs } => Some(inputs.as_ref()),
+            crate::command_exec::GateSandbox::AppContainer { inputs, .. } => {
+                Some(inputs.as_ref())
+            }
+            crate::command_exec::GateSandbox::Container { inputs, .. } => Some(inputs.as_ref()),
+            _ => None,
+        };
+        if let Some(inputs) = inputs {
+            forbidden_roots.extend(crate::sandbox::write_allowlist(inputs));
+        }
+        crate::contract_shell::resolve_contract_shell(
+            crate::contract_shell::ShellLane::Contract,
+            contained,
+            &forbidden_roots,
+        )
+    }
+
     /// Run the contract's command assertions engine-side and render the
     /// captured results for the functional validator's task (validator
     /// repair 3/5): the validator judges verbatim PASS/FAIL evidence instead
@@ -5764,6 +5804,7 @@ impl MissionEngine {
         root: &std::path::Path,
         env: &HashMap<String, String>,
         sandbox: &crate::command_exec::GateSandbox,
+        shell: &crate::contract_shell::HostShell,
     ) -> Option<String> {
         let command_assertions: Vec<(String, Option<String>)> = contract
             .iter()
@@ -5777,13 +5818,18 @@ impl MissionEngine {
         for (id, command) in command_assertions {
             match command.as_deref() {
                 Some(command) => {
-                    let (ok, output) =
-                        run_shell_command_sandboxed(root, command, env, sandbox).await;
+                    let (ok, output) = crate::command_exec::run_contract_command_sandboxed(
+                        root, command, env, sandbox, shell,
+                    )
+                    .await;
                     let verdict = if ok { "PASS" } else { "FAIL" };
                     // The verdict line is the engine's. The output is whatever
                     // the mission's own code printed, so it goes in a fence.
                     let tail = crate::presentation::fence_command_output(&scrub::scrub(&output));
-                    rendered.push_str(&format!("- [{id}] `{command}` → {verdict}\n{tail}"));
+                    rendered.push_str(&format!(
+                        "- [{id}] `{command}` → {verdict} (shell: {})\n{tail}",
+                        shell.label()
+                    ));
                 }
                 None => rendered.push_str(&format!(
                     "- [{id}] (check=command but no command — cannot run)\n"
@@ -5880,9 +5926,19 @@ impl MissionEngine {
             let root = self.active_root().to_path_buf();
             let env = self.contract_command_env(base_sha.as_deref())?;
             let mut gate_sandbox = self.gate_sandbox(&root)?;
-            let rendered =
-                Self::run_contract_commands_for_validation(&contract, &root, &env, &gate_sandbox)
-                    .await;
+            let shell = self.contract_shell(&root, &gate_sandbox);
+            self.emit_decision(
+                "contract commands run under the resolved contract shell",
+                Some(format!("shell: {}", shell.label())),
+            )?;
+            let rendered = Self::run_contract_commands_for_validation(
+                &contract,
+                &root,
+                &env,
+                &gate_sandbox,
+                &shell,
+            )
+            .await;
             // Pty-script assertions (ticket pty-functional-validation): the
             // M5 functional-QA lane extended to terminal-interactive targets.
             // Driven engine-side in THIS evidence pass — same root, same

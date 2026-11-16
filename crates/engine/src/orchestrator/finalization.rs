@@ -215,6 +215,11 @@ impl MissionEngine {
         // assertion below shares the gate tree + contract scratch shape.
         let gate_root = self.active_root().to_path_buf();
         let mut gate_sandbox = self.gate_sandbox(&gate_root)?;
+        let contract_shell = self.contract_shell(&gate_root, &gate_sandbox);
+        self.emit_decision(
+            "contract commands run under the resolved contract shell",
+            Some(format!("shell: {}", contract_shell.label())),
+        )?;
 
         // command assertions — engine-run (design.md: the hard gate).
         for assertion in contract
@@ -232,13 +237,22 @@ impl MissionEngine {
                 });
                 continue;
             };
-            let (ok, output) =
-                run_shell_command_sandboxed(&gate_root, command, &env, &gate_sandbox).await;
+            let (ok, output) = crate::command_exec::run_contract_command_sandboxed(
+                &gate_root,
+                command,
+                &env,
+                &gate_sandbox,
+                &contract_shell,
+            )
+            .await;
             if !ok {
                 findings.push(Finding {
                     subject: assertion.id.clone(),
                     severity: "critical".to_string(),
-                    evidence: scrub::scrub(&format!("command failed: {command}\n{output}")),
+                    evidence: scrub::scrub(&format!(
+                        "command failed (shell: {}): {command}\n{output}",
+                        contract_shell.label()
+                    )),
                     suggested_fix: String::new(),
                     class: "command-assertion".to_string(),
                     rule: None,
