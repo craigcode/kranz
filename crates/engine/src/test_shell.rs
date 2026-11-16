@@ -56,25 +56,70 @@ pub(crate) fn write_line(text: &str, path: &str) -> String {
     }
 }
 
-/// Block for at least `millis`, without relying on a `sleep` binary.
-pub(crate) fn sleep_millis(cwd: &std::path::Path, millis: u64) -> String {
-    if cfg!(windows) {
-        // Use this test binary as the timer: ping can return early and
-        // PowerShell exceeded the fixture's timeout in Windows CI.
-        // A relative executable name also avoids cmd's nested quote handling
-        // when the temporary directory or original binary path has spaces.
-        std::fs::copy(
-            std::env::current_exe().unwrap(),
-            cwd.join("kranz-sleep-fixture.exe"),
-        )
-        .unwrap();
-        format!(
-            "set KRANZ_TEST_SLEEP_MILLIS={millis}&& .\\kranz-sleep-fixture.exe --ignored --exact test_shell::sleep_fixture --nocapture"
-        )
-    } else {
-        let seconds = millis as f64 / 1000.0;
-        format!("sleep {seconds}")
+/// Contract-lane fixtures: the validation-contract commands (validation
+/// rounds, final-gate command assertions, the approval contract lint) that
+/// [`crate::contract_shell::select_shell`] resolves to POSIX `sh` — on Unix
+/// always, on Windows whenever the gate posture is uncontained (the common
+/// case; kranz requires Git, so its `sh.exe` is always available there).
+/// Unlike the top-level helpers in this module, these are NOT cmd-aware:
+/// they must use only `sh` builtins (`test`, `[`, `echo`, `printf`, `exit`,
+/// `:`, `cd`, redirections), because the stock-box Windows path strips
+/// Git's `usr/bin` from PATH and leaves no `sleep`, `true`, or `false`
+/// binary — only the absolute `sh` the engine discovered itself.
+pub(crate) mod contract {
+    /// Succeed iff `path` exists as a file, relative to the command's cwd.
+    pub(crate) fn file_exists(path: &str) -> String {
+        format!("test -f {path}")
     }
+
+    /// Succeed iff `path` exists, and then run `then` (itself a contract-lane
+    /// snippet).
+    pub(crate) fn if_file_exists(path: &str, then: &str) -> String {
+        format!("test -f {path} && {then}")
+    }
+
+    /// Write `text` to `path` as a single line.
+    pub(crate) fn write_line(text: &str, path: &str) -> String {
+        format!("echo {text} > {path}")
+    }
+
+    /// Block for at least `millis`, without relying on a `sleep` binary.
+    pub(crate) fn sleep_millis(cwd: &std::path::Path, millis: u64) -> String {
+        if cfg!(windows) {
+            // Same copied-test-binary timer as the Repo lane's
+            // `sleep_millis`, but invoked with `sh`'s env-var-prefix syntax
+            // (`VAR=value prog`) and a `./` relative path instead of cmd's
+            // `set VAR=value&&` and `.\` — there is no `sleep` binary on the
+            // stock-box sh path.
+            std::fs::copy(
+                std::env::current_exe().unwrap(),
+                cwd.join("kranz-sleep-fixture.exe"),
+            )
+            .unwrap();
+            format!(
+                "KRANZ_TEST_SLEEP_MILLIS={millis} ./kranz-sleep-fixture.exe --ignored --exact test_shell::sleep_fixture --nocapture"
+            )
+        } else {
+            let seconds = millis as f64 / 1000.0;
+            format!("sleep {seconds}")
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn contract_shell_lane_fixtures_unchanged_on_unix() {
+    assert_eq!(contract::file_exists(".marker"), "test -f .marker");
+    assert_eq!(
+        contract::if_file_exists(".marker", "echo mig > .out"),
+        "test -f .marker && echo mig > .out"
+    );
+    assert_eq!(
+        contract::write_line("hello", "out.txt"),
+        "echo hello > out.txt"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(contract::sleep_millis(dir.path(), 1500), "sleep 1.5");
 }
 
 #[cfg(windows)]

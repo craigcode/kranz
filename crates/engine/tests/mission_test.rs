@@ -78,6 +78,21 @@ fn if_file_exists_cmd(path: &str, then: &str) -> String {
     }
 }
 
+/// Contract-lane variant of `file_exists_cmd`: validation-contract command
+/// assertions (final-gate, approval lint) run under `sh` everywhere —
+/// uncontained Windows resolves a Git-for-Windows `sh.exe`, same as Unix —
+/// so these need only the POSIX spelling, never the cmd one. Integration
+/// tests cannot see `kranz_engine::test_shell`'s crate-private helpers, so
+/// this is a local copy rather than a re-export.
+fn file_exists_contract(path: &str) -> String {
+    format!("test -f {path}")
+}
+
+/// Contract-lane variant of `write_line_cmd`, for the same reason.
+fn write_line_contract(text: &str, path: &str) -> String {
+    format!("echo {text} > {path}")
+}
+
 /// Generous bound proving the engine loop cannot hang in tests.
 const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -2161,7 +2176,7 @@ async fn workspace_bootstrap_readiness_gate_runs_before_workers() {
     let contract = vec![assertion(
         "a-1",
         "the workspace marker exists",
-        Some(&file_exists_cmd(".boot-marker")),
+        Some(&file_exists_contract(".boot-marker")),
     )];
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
@@ -3109,7 +3124,7 @@ async fn golden_data_hooks_run_in_provision_order_before_workers() {
     let contract = vec![assertion(
         "a-1",
         "the skew check ran",
-        Some(&file_exists_cmd(".data-skew-marker")),
+        Some(&file_exists_contract(".data-skew-marker")),
     )];
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
@@ -7688,7 +7703,7 @@ async fn approval_lint_uses_disposable_base_and_preserves_primary_checkout() {
         vec![assertion(
             "",
             "hostile approval assertion",
-            Some(&write_line_cmd("tampered", "README.md")),
+            Some(&write_line_contract("tampered", "README.md")),
         )],
     );
     engine.approve_plan(plan).unwrap();
@@ -7750,7 +7765,7 @@ async fn approval_lint_is_contained_when_enforce_is_off() {
         vec![assertion(
             "",
             "hostile approval assertion",
-            Some(&write_line_cmd(
+            Some(&write_line_contract(
                 "escaped",
                 &format!("'{}'", target.display()),
             )),

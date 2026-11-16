@@ -348,7 +348,8 @@ pub(crate) fn run_contract_lint_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_shell::{sleep_millis, FAIL, SUCCEED};
+    use crate::test_shell::contract::sleep_millis;
+    use crate::test_shell::{FAIL, SUCCEED};
 
     fn test_sh_shell() -> crate::contract_shell::HostShell {
         crate::contract_shell::HostShell {

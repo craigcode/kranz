@@ -61,22 +61,12 @@ fn git_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Native-shell assertion for the final-gate command environment. Contract
-/// commands run through `sh` on Unix and `cmd` on Windows, so the variable
-/// syntax must match the executor while asserting the same value everywhere.
-/// Compare in the shell instead of redirecting to a capture file: cmd's
-/// redirection parsing is sensitive to quoting and previously sent the test
-/// into the failure-conversion dialogue on Windows, where its success-only
-/// mock script correctly had no reply queued.
+/// Native-shell assertion for the final-gate command environment. Final-gate
+/// command assertions are Contract-lane: they run through `sh` on Unix and
+/// (uncontained, the default posture here) also `sh` on Windows via the
+/// discovered Git-for-Windows `sh.exe` — so one POSIX spelling covers both.
 fn gate_base_sha_assertion_command(expected: &str) -> String {
-    #[cfg(unix)]
-    {
-        format!("test \"$KRANZ_BASE_SHA\" = '{expected}'")
-    }
-    #[cfg(windows)]
-    {
-        format!("if \"%KRANZ_BASE_SHA%\"==\"{expected}\" (exit /b 0) else (exit /b 1)")
-    }
+    format!("test \"$KRANZ_BASE_SHA\" = '{expected}'")
 }
 
 /// Fresh repo on `main` with identity + one seed commit; returns the seed sha.
