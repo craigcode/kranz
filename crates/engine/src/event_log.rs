@@ -398,8 +398,27 @@ fn open_create_new_at(dir: &Dir, name: &str) -> std::io::Result<File> {
         .write(true)
         .create_new(true)
         .follow(FollowSymlinks::No);
+    // windows: a name whose file was just deleted stays in a delete-pending
+    // state until the last handle to it closes, and a create in that window
+    // fails with "access is denied", not "already exists". A rival stealing
+    // a stale lock opens exactly that window. Wait it out, bounded, so the
+    // caller sees the settled answer; a real denial still surfaces.
+    #[cfg(windows)]
+    for _ in 0..DELETE_PENDING_RETRIES {
+        match dir.open_with(name, &options) {
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                std::thread::sleep(DELETE_PENDING_BACKOFF);
+            }
+            other => return other.map(|file| file.into_std()),
+        }
+    }
     dir.open_with(name, &options).map(|file| file.into_std())
 }
+
+#[cfg(windows)]
+const DELETE_PENDING_RETRIES: u32 = 50;
+#[cfg(windows)]
+const DELETE_PENDING_BACKOFF: Duration = Duration::from_millis(10);
 
 fn open_write_at(dir: &Dir, name: &str, create: bool) -> std::io::Result<File> {
     use cap_fs_ext::OpenOptionsFollowExt as _;
