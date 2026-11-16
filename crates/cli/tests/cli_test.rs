@@ -180,6 +180,7 @@ fn kranz_init_parses_detection_and_registration_answers() {
 /// `knowledge_refresh_report_serializes_verdicts_for_json_output` in the engine.
 #[test]
 fn knowledge_refresh_cli_returns_one_for_unverified_note() {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     let repo = tempfile::tempdir().unwrap();
     let vault = repo.path().join("docs/knowledge");
     fs::create_dir_all(&vault).unwrap();
@@ -201,6 +202,7 @@ fn knowledge_refresh_cli_returns_one_for_unverified_note() {
 
 #[test]
 fn knowledge_refresh_cli_returns_zero_for_verified_note() {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     let repo = tempfile::tempdir().unwrap();
     if !git(repo.path(), &["init", "-b", "main"]).status.success() {
         assert!(git(repo.path(), &["init"]).status.success());
@@ -2683,6 +2685,7 @@ mod parked_draft_reshape {
 
     fn isolate_git_env() {
         ENV_ISOLATION.call_once(|| {
+            kranz_engine::test_dirs::remove_git_config_at_exit();
             let missing = std::env::temp_dir().join(format!(
                 "kranz-parked-draft-reshape-cli-test-no-config-{}",
                 std::process::id()
@@ -2831,8 +2834,14 @@ Add rate limiting.
         // main before invoking the binary (mirrors cmd_draft's own restore).
         raw_git(&root, &["checkout", "main"]);
 
+        // The child leaves its empty git config in its temp directory; give
+        // it one this test removes.
+        let child_tmp = tempfile::tempdir().expect("create child tempdir");
         let output = Command::new(env!("CARGO_BIN_EXE_kranz"))
             .args(["--repo", root.to_str().unwrap(), "abandon", &mission_id])
+            .env("TMPDIR", child_tmp.path())
+            .env("TEMP", child_tmp.path())
+            .env("TMP", child_tmp.path())
             .output()
             .expect("spawn kranz abandon");
         assert!(

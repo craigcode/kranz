@@ -5,9 +5,17 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+/// `operator` sits in the calling test's temp directory. The child gets a
+/// temp directory beside it, so what the child leaves there (its empty git
+/// config) is removed with the test's own directory.
 fn serve(repo: &Path, operator: &Path) -> tokio::process::Command {
+    let child_tmp = operator.with_file_name("child-tmp");
+    std::fs::create_dir_all(&child_tmp).unwrap();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_kranz"));
     command
+        .env("TMPDIR", &child_tmp)
+        .env("TEMP", &child_tmp)
+        .env("TMP", &child_tmp)
         .arg("--repo")
         .arg(repo)
         .args(["serve", "--host", "127.0.0.1", "--read-auth"])
