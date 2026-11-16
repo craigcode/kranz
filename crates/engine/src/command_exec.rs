@@ -394,6 +394,12 @@ async fn run_shell_command_with_timeout_env(
 ) -> (Option<i32>, String) {
     let (program, args) = shell_argv(command);
     let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        let _ = args;
+        apply_raw_tail(&mut cmd, &cmd_raw_tail(command));
+    }
+    #[cfg(not(windows))]
     cmd.args(args);
     if clear_env {
         cmd.env_clear();
@@ -422,6 +428,38 @@ fn shell_argv(command: &str) -> (std::path::PathBuf, Vec<String>) {
     }
 }
 
+/// The exact cmd.exe command-tail text for an uncontained Windows launch:
+/// `/S /C "<command verbatim>"`. With `/S`, cmd strips exactly the outermost
+/// pair of quotes and leaves everything inside untouched — the command text
+/// gets no escaping at all, unlike the one-quoted-argument encoding
+/// std/tokio `Command::args` would otherwise apply (which turns inner `"`
+/// into `\"`, breaking commands like `node -e "..."`).
+pub(crate) fn cmd_raw_tail(command: &str) -> String {
+    format!("/S /C \"{command}\"")
+}
+
+/// The full raw command line `<cmd_program> /S /C "<command>"`, quoting the
+/// program only when `appcontainer_windows::quote_arg` would (empty or
+/// containing whitespace) — matched here so both quoting rules agree.
+pub(crate) fn cmd_raw_command_line(cmd_program: &str, command: &str) -> String {
+    let needs_quotes = cmd_program.is_empty() || cmd_program.chars().any(|c| c == ' ' || c == '\t');
+    let program = if needs_quotes {
+        format!("\"{cmd_program}\"")
+    } else {
+        cmd_program.to_string()
+    };
+    format!("{program} {}", cmd_raw_tail(command))
+}
+
+/// Hand `tail` to the child's command line completely unencoded — the
+/// Windows counterpart to `.args(..)` for the `/S /C "<command>"` tail,
+/// which must reach cmd.exe byte-for-byte (no quote escaping at all).
+#[cfg(windows)]
+fn apply_raw_tail(cmd: &mut tokio::process::Command, tail: &str) {
+    use std::os::windows::process::CommandExt;
+    cmd.as_std_mut().raw_arg(tail);
+}
+
 /// Bounded run of an arbitrary program argv with the same pipe-draining /
 /// process-tree-kill discipline as contract shell commands — the sandbox
 /// preflight probe (`sandbox-exec -f <profile> /bin/sh -c <command>`) runs
@@ -435,9 +473,20 @@ pub(crate) async fn run_bounded_argv(
     args: &[String],
     timeout: Duration,
     env: &HashMap<String, String>,
+    raw_tail: Option<&str>,
 ) -> (Option<i32>, String) {
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args);
+    #[cfg(windows)]
+    if let Some(tail) = raw_tail {
+        apply_raw_tail(&mut cmd, tail);
+    } else {
+        cmd.args(args);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = raw_tail;
+        cmd.args(args);
+    }
     cmd.env_clear();
     run_command_bounded(configure_bounded_child(cmd, cwd, env), timeout).await
 }
@@ -513,6 +562,12 @@ pub(crate) struct WrappedCommand {
     /// failure (the runtime already reaped the container, an unsupported
     /// `rm -f`) is ignored, and `--rm` still reaps every normal exit.
     pub timeout_teardown: Option<(std::path::PathBuf, Vec<String>)>,
+    /// The cmd.exe raw command-tail (`/S /C "<command>"`) for the uncontained
+    /// Windows [`GateSandbox::Disabled`] arm, handed to the child unencoded
+    /// instead of `args`. Always `None` off Windows and for every other arm
+    /// (AppContainer/Seatbelt/Bubblewrap/Container keep running through
+    /// `args` exactly as before).
+    pub raw_tail: Option<String>,
     /// Retains ownership of the resolved posture's disposable profile and
     /// no-follow DACL handles through the wrapper process. Callers still must
     /// await/reap the command before explicitly cleaning the posture. Absent
@@ -548,6 +603,7 @@ impl GateSandbox {
                     ],
                 )?,
                 timeout_teardown: None,
+                raw_tail: None,
                 #[cfg(windows)]
                 _appcontainer_context: None,
             }),
@@ -598,11 +654,21 @@ impl GateSandbox {
     ) -> crate::error::Result<WrappedCommand> {
         match self {
             GateSandbox::Disabled => {
-                let (program, args) = shell_argv(command);
+                #[cfg(windows)]
+                let (program, args, raw_tail) = {
+                    let (program, _args) = shell_argv(command);
+                    (program, Vec::new(), Some(cmd_raw_tail(command)))
+                };
+                #[cfg(not(windows))]
+                let (program, args, raw_tail) = {
+                    let (program, args) = shell_argv(command);
+                    (program, args, None)
+                };
                 Ok(WrappedCommand {
                     program,
                     args,
                     timeout_teardown: None,
+                    raw_tail,
                     #[cfg(windows)]
                     _appcontainer_context: None,
                 })
@@ -617,6 +683,7 @@ impl GateSandbox {
                     program,
                     args,
                     timeout_teardown: None,
+                    raw_tail: None,
                     #[cfg(windows)]
                     _appcontainer_context: None,
                 })
@@ -631,6 +698,7 @@ impl GateSandbox {
                     program: std::path::PathBuf::from("bwrap"),
                     args,
                     timeout_teardown: None,
+                    raw_tail: None,
                     #[cfg(windows)]
                     _appcontainer_context: None,
                 })
@@ -650,6 +718,7 @@ impl GateSandbox {
                         program: prepared.program,
                         args: prepared.args,
                         timeout_teardown: None,
+                        raw_tail: None,
                         _appcontainer_context: Some(context.clone()),
                     })
                 }
@@ -676,6 +745,7 @@ impl GateSandbox {
                         std::path::PathBuf::from(spec.runtime.binary()),
                         vec!["rm".to_string(), "-f".to_string(), name],
                     )),
+                    raw_tail: None,
                     #[cfg(windows)]
                     _appcontainer_context: None,
                 })
@@ -1238,13 +1308,27 @@ pub(crate) async fn run_shell_command_sandboxed_with_code(
         GateSandbox::Container { spec, .. } => spec.runtime.client_env(),
         _ => env,
     };
-    let (code, output) =
-        run_bounded_argv(cwd, &wrapped.program, &wrapped.args, timeout, &client_env).await;
+    let (code, output) = run_bounded_argv(
+        cwd,
+        &wrapped.program,
+        &wrapped.args,
+        timeout,
+        &client_env,
+        wrapped.raw_tail.as_deref(),
+    )
+    .await;
     if code.is_none() {
         if let Some((program, args)) = wrapped.timeout_teardown {
             // Reuse the exact client context that started this container.
-            let _ =
-                run_bounded_argv(cwd, &program, &args, Duration::from_secs(30), &client_env).await;
+            let _ = run_bounded_argv(
+                cwd,
+                &program,
+                &args,
+                Duration::from_secs(30),
+                &client_env,
+                None,
+            )
+            .await;
         }
     }
     (code, output)
@@ -2024,6 +2108,78 @@ mod tests {
     use crate::runner;
 
     #[test]
+    fn cmd_raw_tail_keeps_inner_quotes_verbatim_with_no_escaping() {
+        let command = r#"prog -e "a 'b' c""#;
+        let tail = cmd_raw_tail(command);
+        assert_eq!(tail, r#"/S /C "prog -e "a 'b' c"""#);
+        // No backslash-before-quote the input didn't already have.
+        assert!(!tail.contains('\\'));
+    }
+
+    #[test]
+    fn cmd_raw_tail_preserves_a_quoted_program_path_verbatim() {
+        let command = r#""C:\Program Files\x.exe" -e "y""#;
+        let tail = cmd_raw_tail(command);
+        assert_eq!(tail, format!("/S /C \"{command}\""));
+        assert!(tail.contains(command));
+    }
+
+    #[test]
+    fn cmd_raw_tail_command_line_quotes_a_spaced_program_and_leaves_cmd_bare() {
+        let spaced = cmd_raw_command_line(r"C:\Program Files\cmd.exe", "echo hi");
+        assert_eq!(
+            spaced,
+            format!("\"C:\\Program Files\\cmd.exe\" {}", cmd_raw_tail("echo hi"))
+        );
+
+        let bare = cmd_raw_command_line("cmd", "echo hi");
+        assert_eq!(bare, format!("cmd {}", cmd_raw_tail("echo hi")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_argv_unix_matches_sh_dash_c() {
+        assert_eq!(
+            shell_argv("echo hi"),
+            (
+                std::path::PathBuf::from("sh"),
+                vec!["-c".to_string(), "echo hi".to_string()]
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_argv_unix_disabled_wrap_shell_yields_sh_dash_c_and_no_raw_tail() {
+        let wrapped = GateSandbox::Disabled
+            .wrap_shell("echo hi", &HashMap::new())
+            .unwrap();
+        assert_eq!(wrapped.program, std::path::PathBuf::from("sh"));
+        assert_eq!(wrapped.args, vec!["-c".to_string(), "echo hi".to_string()]);
+        assert_eq!(wrapped.raw_tail, None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_cmd_keeps_inner_double_quotes() {
+        let env: HashMap<String, String> = std::collections::HashMap::new();
+        let dir = tempfile::tempdir().unwrap();
+        let (code, output) = run_shell_command_with_timeout_env(
+            dir.path(),
+            r#"node -e "process.stdout.write('KRANZ_QUOTES_OK')""#,
+            Duration::from_secs(30),
+            &env,
+            true,
+        )
+        .await;
+        assert_eq!(code, Some(0), "node must exit 0: {output}");
+        assert!(
+            output.contains("KRANZ_QUOTES_OK"),
+            "expected the marker to survive cmd.exe's quoting: {output}"
+        );
+    }
+
+    #[test]
     fn control_wrapper_keeps_scratch_mounts_and_positional_snapshot_cwd() {
         let root = tempfile::tempdir().unwrap();
         let scratch = root.path().join("scratch");
@@ -2670,6 +2826,7 @@ esac
                 &["-c".to_string(), script],
                 Duration::from_millis(500),
                 &env,
+                None,
             ),
         )
         .await
@@ -2714,6 +2871,7 @@ esac
             &["-c".to_string(), big.to_string()],
             Duration::from_secs(10),
             &env,
+            None,
         )
         .await;
 
@@ -2735,6 +2893,7 @@ esac
             &["-c".to_string(), "exit 3".to_string()],
             Duration::from_secs(10),
             &env,
+            None,
         )
         .await;
         assert_eq!(code, Some(3), "{output}");
@@ -4617,6 +4776,7 @@ esac
                 &["info".into()],
                 Duration::from_secs(5),
                 &runtime.client_env(),
+                None,
             )
             .await
             .0 == Some(0)
