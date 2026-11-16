@@ -1981,13 +1981,9 @@ mod tests {
 
     #[cfg(windows)]
     fn lock_info_for(pid: u32, identity: Option<String>) -> LockInfo {
-        LockInfo {
-            holder: pid.to_string(),
-            pid: Some(pid as i32),
-            acquired_secs: None,
-            token: identity,
-            generation: None,
-        }
+        // Built through the parser, in the on-disk line order: pid, acquire
+        // time, identity.
+        parse_lock_info(&format!("{pid}\n0\n{}\n", identity.unwrap_or_default()))
     }
 
     /// A killed engine's lock must read Dead on windows without a force
