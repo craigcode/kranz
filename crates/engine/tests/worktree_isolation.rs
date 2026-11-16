@@ -47,6 +47,16 @@ fn file_exists_cmd(path: &str) -> String {
     }
 }
 
+/// Contract-lane variant of `file_exists_cmd`: validation-contract command
+/// assertions (final-gate) run under `sh` everywhere — uncontained Windows
+/// resolves a Git-for-Windows `sh.exe`, same as Unix — so these need only the
+/// POSIX spelling, never the cmd one. Integration tests cannot see
+/// `kranz_engine::test_shell`'s crate-private helpers, so this is a local
+/// copy rather than a re-export.
+fn file_exists_contract(path: &str) -> String {
+    format!("test -f {path}")
+}
+
 fn write_layer(dir: &tempfile::TempDir, name: &str, contents: &str) -> PathBuf {
     let path = dir.path().join(name);
     std::fs::write(&path, contents).expect("write layer");
@@ -576,7 +586,7 @@ async fn workspace_gate_runs_bootstrap_in_the_integration_worktree() {
         id: "a-1".into(),
         statement: "the workspace marker exists".into(),
         check: AssertionCheck::Command,
-        command: Some(file_exists_cmd(".boot-marker")),
+        command: Some(file_exists_contract(".boot-marker")),
         negative_control: None,
         pty_script: None,
     }];
