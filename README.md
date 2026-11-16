@@ -103,9 +103,24 @@ automatically.
 **Prebuilt binaries.** [Download v0.5.0 from GitHub Releases](https://github.com/craigcode/kranz/releases/tag/v0.5.0)
 for Linux x86_64, macOS Apple Silicon or Intel, and Windows ARM64 or x86_64.
 Extract the archive and put `kranz` (`kranz.exe` on Windows) on your `PATH`.
+On Windows, open a new shell afterwards: a running PowerShell or Git Bash
+keeps the `PATH` it started with.
 The release includes checksums, build provenance attestations, an SBOM, and
 license notices. `kranz licenses` prints the bundled project, Rust dependency,
 and dashboard notices.
+
+**Windows host preparation.** Validators and contract commands run inside an
+AppContainer sandbox, which needs a one-time host step. From an elevated
+PowerShell:
+
+```powershell
+kranz sandbox-prepare --target C:\
+```
+
+It adds two read-only metadata entries to the drive root and to the parent of
+your user profile, and resets the null device's permissions. Run it again
+after each reboot, because Windows resets the null device at boot. `kranz
+ready` and `kranz exec` report missing preparation before a mission starts.
 
 **From source.** To build the current public repository:
 

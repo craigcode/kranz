@@ -759,9 +759,9 @@ enum ClaimPidLiveness {
 /// user — it cannot be our same-user dispatcher, yet its presence also means
 /// the pid was recycled, so let the age backstop decide); any other errno →
 /// Unknown. Non-positive pids → Unknown (never probe a process GROUP, and
-/// `kill(0, 0)` would match our own). Non-unix: no probe is wired up — the
-/// same posture as [`crate::event_log::lock_holder_is_alive`] — so every pid
-/// is Unknown and recovery keeps the conservative age-only rule there.
+/// `kill(0, 0)` would match our own). Non-unix: no probe is wired up for
+/// claims (the event-log lock has its own windows probe), so every pid is
+/// Unknown and recovery keeps the conservative age-only rule there.
 fn probe_claim_pid(pid: i32) -> ClaimPidLiveness {
     if pid <= 0 {
         return ClaimPidLiveness::Unknown;

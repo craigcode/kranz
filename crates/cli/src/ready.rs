@@ -18,6 +18,11 @@ pub struct ReadyReport {
     pub score: u8,
     pub level: ReadyLevel,
     pub highest_leverage_fix: String,
+    /// Host prerequisites the first sandboxed session would refuse on. Kept
+    /// outside the score (omitted from JSON when empty): a repo signal
+    /// cannot offset a host that cannot run a mission at all.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub host_blockers: Vec<String>,
     pub dimensions: Vec<ReadyDimension>,
     /// AMM-compatible projection (derived view over the native dimensions;
     /// crates/cli/src/amm.rs owns the mapping table).
@@ -86,14 +91,17 @@ pub fn assess(repo: &Path) -> ReadyReport {
     } else {
         ReadyLevel::ColdStart
     };
-    let highest_leverage_fix = dimensions
-        .iter()
-        .filter(|d| !d.remedy.is_empty())
-        .max_by_key(|d| d.weight.saturating_sub(d.score))
-        .map(|d| d.remedy.clone())
-        .unwrap_or_else(|| {
-            "No obvious fix: this repo exposes the main signals kranz needs.".into()
-        });
+    let host_blockers = host_blockers(repo);
+    let highest_leverage_fix = host_blockers.first().cloned().unwrap_or_else(|| {
+        dimensions
+            .iter()
+            .filter(|d| !d.remedy.is_empty())
+            .max_by_key(|d| d.weight.saturating_sub(d.score))
+            .map(|d| d.remedy.clone())
+            .unwrap_or_else(|| {
+                "No obvious fix: this repo exposes the main signals kranz needs.".into()
+            })
+    });
     // The two-axis view: AMM projection over the native dimensions, and the
     // contract/consent axis from mission event logs (absent without history).
     let contract_health = kranz_engine::contract_health::compute_contract_health(repo)
@@ -104,6 +112,7 @@ pub fn assess(repo: &Path) -> ReadyReport {
         score,
         level,
         highest_leverage_fix,
+        host_blockers,
         dimensions,
         amm,
         contract_health,
@@ -121,6 +130,9 @@ pub fn render(report: &ReadyReport) -> String {
         "highest-leverage fix: {}\n\n",
         report.highest_leverage_fix
     ));
+    for blocker in &report.host_blockers {
+        out.push_str(&format!("host blocker: {blocker}\n\n"));
+    }
     out.push_str("scorecard:\n");
     for dim in &report.dimensions {
         out.push_str(&format!(
@@ -702,6 +714,26 @@ fn contract_prerequisites(commands: &[ValidationCommand]) -> ReadyDimension {
             "install the missing validation-command programs or document the setup",
         )
     }
+}
+
+/// Windows only: the read-only AppContainer host checks a validator or gate
+/// launch makes, run here so missing one-time (or per-boot) preparation is
+/// reported before a mission pays for planning and a worker first.
+fn host_blockers(repo: &Path) -> Vec<String> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let programs: Vec<std::path::PathBuf> = kranz_engine::config::load(repo)
+        .ok()
+        .and_then(|cfg| {
+            kranz_engine::backend_claude::discover_claude_binary(cfg.claude_binary.as_deref()).ok()
+        })
+        .into_iter()
+        .collect();
+    kranz_engine::sandbox_windows::appcontainer_host_preflight(&programs)
+        .err()
+        .into_iter()
+        .collect()
 }
 
 fn backend_lanes(repo: &Path) -> ReadyDimension {

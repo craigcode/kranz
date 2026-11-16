@@ -57,6 +57,26 @@ configuration matching is reported separately from the recorded outcome;
 mutable toolchain, cache and service state remains unqualified. These advisory
 observations never become a current gate pass or authorize reuse.
 
+## JSON shape and compatibility
+
+`kranz review-packet <mission-id> --json` is meant to be read by other tools.
+
+- `schemaVersion` is `1`. Within a version, fields are only added. A removed,
+  renamed or re-typed field raises the number, so check it before parsing.
+- `missionStatus` is the mission's status as folded from the log through
+  `throughSeq`.
+- `nativeChecks` lists every recorded native gate result as data: `seq`,
+  `gate`, `surface` (`approval` or `final-gate`), `kind`, `verdict` (`pass`
+  or `fail`), `artefactRef`, `artefactDetail` and `artefactAvailable`. Read
+  this list for gate outcomes. The same results also appear in `history` as
+  prose for people; those titles are not a stable interface.
+- A native check is a recorded result, not a current pass. `evaluations`
+  carries the source-bound external evaluations and is empty for a mission
+  that used none.
+
+Without `--json` the command prints the same packet as Markdown, which is the
+simpler input for a pull request description.
+
 ## Human view and validator boundary
 
 `GET /api/missions/:id/review-packet` returns `{packet, markdown}`. It requires

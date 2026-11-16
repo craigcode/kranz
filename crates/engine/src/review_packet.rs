@@ -23,7 +23,11 @@ use std::path::Path;
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewPacket {
+    /// Version of this JSON shape, see [`SCHEMA_VERSION`].
+    pub schema_version: u32,
     pub mission_id: String,
+    /// The mission's status as folded from the log through `through_seq`.
+    pub mission_status: MissionStatus,
     pub observed_at: DateTime<Utc>,
     pub through_seq: u64,
     pub approved_plan: Option<Plan>,
@@ -34,8 +38,30 @@ pub struct ReviewPacket {
     pub evaluations: Vec<Evaluation>,
     pub baseline_candidates: Vec<crate::contract_controls::pair::Review>,
     pub contract_readbacks: Vec<crate::contract_controls::readback::Review>,
+    /// Native gate outcomes as data. Each also appears in `history` as
+    /// prose; consumers should read this list, not parse those titles.
+    pub native_checks: Vec<NativeCheck>,
     pub history: Vec<Entry>,
     pub unknowns: Vec<String>,
+}
+
+/// Version of the [`ReviewPacket`] JSON shape. Fields are only added within
+/// a version; a removed, renamed or re-typed field raises it.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// One recorded `gate.result`: a recorded outcome, not proof of a current
+/// pass (no source binding is retained for native gates).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeCheck {
+    pub seq: u64,
+    pub gate: String,
+    pub surface: crate::gate::GateSurface,
+    pub kind: crate::gate::GateKind,
+    pub verdict: crate::gate::GateVerdict,
+    pub artefact_ref: String,
+    pub artefact_detail: Option<String>,
+    pub artefact_available: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -185,7 +211,9 @@ pub fn project(
         _ => None,
     });
     let mut packet = ReviewPacket {
+        schema_version: SCHEMA_VERSION,
         mission_id: state.mission.id.clone(),
+        mission_status: state.mission.status,
         observed_at: now,
         through_seq: state.last_seq,
         approved_plan: approved.map(|(_, p)| p.clone()),
@@ -196,6 +224,7 @@ pub fn project(
         evaluations: vec![],
         baseline_candidates: vec![],
         contract_readbacks: vec![],
+        native_checks: vec![],
         history: vec![],
         unknowns: vec![],
     };
@@ -474,17 +503,27 @@ pub fn project(
     pending_decisions(&mut packet, state, events, now);
     for event in events {
         let entry = match &event.kind {
-            EventKind::GateResult { gate, surface, verdict, artefact_ref, artefact_detail, .. } => {
+            EventKind::GateResult { gate, surface, kind, verdict, artefact_ref, artefact_detail, .. } => {
                 if packet.baseline_candidates.iter().any(|pair| pair.seq == event.seq)
                     || packet.contract_readbacks.iter().any(|rb| rb.seq == event.seq)
                 {
                     continue;
                 }
-                let availability = match crate::gate_results::resolve_artefact(mission_dir, artefact_ref) {
-                    crate::gate_results::ArtefactResolution::Resolved { .. } => "artifact present (legacy reference, no digest verification)",
-                    crate::gate_results::ArtefactResolution::Inline => "inline evidence in this event",
-                    crate::gate_results::ArtefactResolution::Unresolved { .. } => "artifact unavailable",
+                let (availability, artefact_available) = match crate::gate_results::resolve_artefact(mission_dir, artefact_ref) {
+                    crate::gate_results::ArtefactResolution::Resolved { .. } => ("artifact present (legacy reference, no digest verification)", true),
+                    crate::gate_results::ArtefactResolution::Inline => ("inline evidence in this event", true),
+                    crate::gate_results::ArtefactResolution::Unresolved { .. } => ("artifact unavailable", false),
                 };
+                packet.native_checks.push(NativeCheck {
+                    seq: event.seq,
+                    gate: gate.clone(),
+                    surface: *surface,
+                    kind: *kind,
+                    verdict: *verdict,
+                    artefact_ref: artefact_ref.clone(),
+                    artefact_detail: artefact_detail.clone(),
+                    artefact_available,
+                });
                 Some((format!("Native check {gate} ({surface:?}) — recorded {verdict:?}"),
                     format!("{artefact_ref}\n{availability}\n{}\nCurrent candidate binding unavailable for this record.", artefact_detail.as_deref().unwrap_or(""))))
             },

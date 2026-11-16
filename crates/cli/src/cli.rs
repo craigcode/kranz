@@ -129,9 +129,11 @@ pub enum Command {
     /// Prepare the Windows host for AppContainer enforcement.
     ///
     /// Adds only the two persistent, non-inheriting metadata ACEs required by
-    /// Windows tools on each drive root and reapplies the documented null-device
-    /// descriptor that resets at boot. Run from an elevated PowerShell;
-    /// ordinary Kranz launches verify both prerequisites read-only.
+    /// Windows tools on each drive root, adds the same two to the parent of
+    /// the user profile (derived from USERPROFILE, usually C:\Users), and
+    /// reapplies the documented null-device descriptor that resets at boot.
+    /// Run from an elevated PowerShell; ordinary Kranz launches verify the
+    /// prerequisites read-only.
     SandboxPrepare {
         /// Literal local drive root to prepare (repeat for multiple drives).
         #[arg(long = "target", value_name = "DRIVE-ROOT", required = true)]
@@ -365,10 +367,14 @@ pub enum Command {
     /// with the whole file, auto-approves the returned plan (no human), and
     /// runs the mission to a terminal state. Events stream to stderr; the only
     /// line on stdout is `kranz exec <id> <STATUS> cost=$X.XX branch=<b>`.
+    /// A run that stops on a backend or host error prints the same line with
+    /// status ERROR. Nothing is printed when exec refuses before a mission
+    /// exists.
     ///
     /// Exit codes: 0 complete, 1 failed, 2 blocked, 3 underspecified (the
     /// orchestrator wanted clarification a headless run cannot provide — make
-    /// the plan file self-sufficient and re-run). stdin is never read.
+    /// the plan file self-sufficient and re-run), 4 `--push` refused or
+    /// failed. stdin is never read.
     Exec {
         /// The mission plan file (ticket-shaped markdown)
         #[arg(short = 'f', long = "file", value_name = "MISSION.md")]

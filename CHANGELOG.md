@@ -5,6 +5,25 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: on Windows, a mission lock left by an engine that was killed is
+  now recognised as stale and taken over, as on Unix. `kranz abandon` and a
+  resumed `kranz run` no longer need `--force-lock` for it. The holder is
+  probed by pid and by its process creation time, so a recycled pid is not
+  mistaken for the engine.
+- Fixed: `kranz exec` checks the Windows AppContainer host preparation
+  before it creates a mission, and `kranz ready` lists a missing one as a
+  host blocker. Before, the first validator found it, after planning and a
+  worker had been paid for. The message now names `kranz sandbox-prepare`,
+  not a script that an installed binary does not carry.
+- Fixed: `kranz exec` prints its stdout line with status `ERROR` when the
+  run stops on a backend or host error. Before, stdout was empty.
+- Added: `kranz review-packet --json` carries `schemaVersion`,
+  `missionStatus` and `nativeChecks`, the native gate results as data. See
+  `docs/review-packets.md`.
+- Changed: `docs/what-is-kranz.md` matches the current product (backends,
+  the two validators, who merges, exit codes, the three ways to start work).
+  The README documents the Windows host preparation. The 0.2.0 release plan
+  at the repository root is removed.
 - Added: the engine scans each feature's own commit range for secrets
   after every worker run, before the judgement turn, with the allowlist read
   from the base pinned at plan approval. On the sequential path a finding

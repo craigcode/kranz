@@ -893,11 +893,10 @@ fn is_repo_busy_detects_a_live_lock() {
     );
 }
 
-/// Dead-pid detection is a unix capability today (`libc::kill(pid, 0)`). On
-/// Windows `is_repo_busy` is conservative — any lock counts as busy — until a
-/// Windows liveness probe lands (tracked as an M4 follow-up), matching the
-/// event-log stale-lock posture where Windows needs `--force-lock`.
-#[cfg(unix)]
+/// Dead-pid detection needs a process probe: `libc::kill(pid, 0)` on unix,
+/// `OpenProcess` on windows. Anywhere else `is_repo_busy` is conservative —
+/// any lock counts as busy.
+#[cfg(any(unix, windows))]
 #[test]
 fn is_repo_busy_ignores_a_dead_lock() {
     let repo = tempfile::tempdir().unwrap();
@@ -908,7 +907,7 @@ fn is_repo_busy_ignores_a_dead_lock() {
     assert_eq!(
         queue::is_repo_busy(root),
         None,
-        "a lock held by a dead pid must not count as busy (unix)"
+        "a lock held by a dead pid must not count as busy"
     );
 }
 
@@ -917,7 +916,7 @@ fn is_repo_busy_ignores_a_dead_lock() {
 /// divergent local parser once parsed the ENTIRE file as one integer, so any
 /// multi-line lock read as "unparseable ⇒ busy" — after a SIGKILL'd engine
 /// (dead pid, multi-line lock) `kranz work` reported the repo busy forever.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn is_repo_busy_ignores_a_dead_multiline_lock() {
     let repo = tempfile::tempdir().unwrap();
