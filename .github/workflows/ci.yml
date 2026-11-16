@@ -205,7 +205,11 @@ jobs:
             appcontainer_windows::tests::suspended_child_is_reaped_when_setup_exits_before_job_assignment \
             appcontainer_windows::tests::recursive_grants_reserve_only_the_isolated_worktree_authority_namespace \
             agent_env::tests::sanitized_child_env_windows_redirects_profile_and_temp_to_scratch \
-            sandbox_container::tests::container_authority_directory_mask_covers_absent_and_future_tokens; do
+            sandbox_container::tests::container_authority_directory_mask_covers_absent_and_future_tokens \
+            command_exec::tests::windows_contract_shell_sh_keeps_inner_double_quotes \
+            command_exec::tests::windows_contract_shell_cmd_keeps_inner_double_quotes \
+            command_exec::tests::windows_contract_shell_sh_sees_pinned_base_sha \
+            command_exec::tests::windows_contract_shell_planted_sh_is_never_executed; do
             log="$RUNNER_TEMP/kranz-windows-${name//::/-}.log"
             set +e
             cargo test -p kranz-engine --lib "$name" -- --exact --nocapture >"$log" 2>&1
@@ -283,6 +287,19 @@ jobs:
 
           gate_log="$RUNNER_TEMP/kranz-windows-gate-resolution.log"
           run_exact_test "$gate_log" cargo test -p kranz-engine --lib command_exec::tests::windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed -- --exact
+
+          contract_cmd_log="$RUNNER_TEMP/kranz-windows-contract-shell-appcontainer-cmd.log"
+          run_exact_test "$contract_cmd_log" cargo test -p kranz-engine --lib command_exec::tests::windows_contract_shell_appcontainer_cmd_keeps_inner_double_quotes -- --exact --nocapture
+
+          # The CI receipt the contained Contract lane's cmd default is
+          # pinned on (crates/engine/src/contract_shell.rs select_shell): it
+          # asserts the production contained path stays cmd, and only
+          # attempts Git's sh under the same posture, recording — never
+          # requiring — whether that attempt succeeds.
+          sh_receipt_log="$RUNNER_TEMP/kranz-windows-contract-shell-appcontainer-sh-receipt.log"
+          run_exact_test "$sh_receipt_log" cargo test -p kranz-engine --lib command_exec::tests::windows_contract_shell_appcontainer_sh_receipt -- --exact --nocapture
+          grep -q 'KRANZ_WINDOWS_SH_CONTAINED=' "$sh_receipt_log"
+          grep 'KRANZ_WINDOWS_SH_CONTAINED=' "$sh_receipt_log"
       # M7 Linux live receipt: this is a real bwrap spawn, not argv inspection.
       # It proves a sibling write and host-network connection are denied,
       # retains seven interleaved warm Node timings, and verifies the tracked
