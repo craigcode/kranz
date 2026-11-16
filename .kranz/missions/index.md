@@ -57,3 +57,4 @@ Approved plans, newest last.
 - 2026-11-14 · [m-373b57](m-373b57/plan.md) — Bind every grant decision sent from the dashboard and from Slack to the exact request the operator saw (its grant kind a… [truncated]
 - 2026-11-14 · [m-7886d9](m-7886d9/plan.md) — Make the hint printed for a parked draft name a route that accepts it: add answers to the ticket, then `kranz abandon <i… [truncated]
 - 2026-11-15 · [m-c22294](m-c22294/plan.md) — Run the engine's existing secret scan over each feature's own commit range when the worker's run ends, using the allowli… [truncated] · [report](m-c22294/report.md)
+- 2026-11-16 · [m-2a80fd](m-2a80fd/plan.md) — On Windows, run validation-contract commands under an absolute, worker-unwritable Git-for-Windows POSIX sh when it is av… [truncated]
