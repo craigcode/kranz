@@ -81,6 +81,7 @@ fn gate_base_sha_assertion_command(expected: &str) -> String {
 
 /// Fresh repo on `main` with identity + one seed commit; returns the seed sha.
 fn seeded_repo() -> Option<(tempfile::TempDir, GitRepo, String)> {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     if !git_available() {
         kranz_engine::test_capability::skip(
             kranz_engine::test_capability::capability::GIT,
@@ -410,6 +411,7 @@ fn checkout_cfg() -> MissionConfig {
 
 /// Fresh git repo, seeded, on `main`, root canonicalized.
 fn mission_init_repo() -> Option<(tempfile::TempDir, PathBuf)> {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     if !git_available() {
         kranz_engine::test_capability::skip(
             kranz_engine::test_capability::capability::GIT,
@@ -727,6 +729,7 @@ async fn workspace_provider_provisions_the_integration_worktree() {
 /// runtime; CI ubuntu-latest has Docker.
 #[tokio::test(flavor = "multi_thread")]
 async fn container_workspace_events_land_for_a_full_mission_run() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     if !kranz_engine::sandbox_container::host_supports_container_contract() {
         kranz_engine::test_capability::skip(
             kranz_engine::test_capability::capability::CONTAINER,
@@ -870,6 +873,7 @@ async fn container_workspace_events_land_for_a_full_mission_run() {
 /// (skips without a runtime; CI ubuntu-latest has docker).
 #[tokio::test(flavor = "multi_thread")]
 async fn container_workspace_terminal_teardown_hibernates_and_destroys() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     if !kranz_engine::sandbox_container::host_supports_container_contract() {
         kranz_engine::test_capability::skip(
             kranz_engine::test_capability::capability::CONTAINER,

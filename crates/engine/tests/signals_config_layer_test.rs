@@ -26,6 +26,8 @@ fn global_dir() -> std::path::PathBuf {
     static DIR: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
     let dir = DIR.get_or_init(|| {
         let dir = tempfile::tempdir().unwrap();
+        // A static is never dropped, so the `TempDir` alone would stay behind.
+        kranz_engine::test_dirs::remove_dir_at_exit(dir.path());
         std::env::set_var("KRANZ_HOME", dir.path());
         // Force paths::global_kranz_dir()'s OnceLock to resolve now, while
         // KRANZ_HOME is set, before any test races it from another thread.

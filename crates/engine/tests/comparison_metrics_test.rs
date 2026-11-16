@@ -25,6 +25,7 @@ static ENV_ISOLATION: Once = Once::new();
 
 fn isolate_git_env() {
     ENV_ISOLATION.call_once(|| {
+        kranz_engine::test_dirs::remove_git_config_at_exit();
         let missing = std::env::temp_dir().join(format!(
             "kranz-comparison-metrics-test-no-config-{}",
             std::process::id()

@@ -14,6 +14,7 @@ fn manifest(mode: &str, root: &Path, port: u16) -> String {
     format!("[pack]\nname = 'synthetic-checker'\nschema = 5\n[[evaluator]]\nname = 'synthetic-checker'\nimage = '{IMAGE}'\nexecutable = '/usr/local/bin/python3'\nargs = ['-I','-S','/checker/checker.py','{mode}','{}','{}','{}','{}','{port}']\nfiles = ['checker.py']\nstages = ['plan-approval']\nevidence = ['source']\nkind = 'mechanical'\nenforcement = 'blocking'\n", root.join("serve.token").display(), root.join("candidate.txt").display(), root.join(".kranz/missions/mission-1/runs/worker.jsonl").display(), root.join(".kranz/missions/mission-1/review-packet.json").display())
 }
 fn git(root: &Path, args: &[&str]) -> String {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     let output = std::process::Command::new("git")
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())

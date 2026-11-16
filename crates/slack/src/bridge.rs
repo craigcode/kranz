@@ -5106,6 +5106,7 @@ mod tests {
     /// `crates/engine/tests/merged_test.rs::isolate_git_env`).
     fn isolate_git_env() {
         GIT_ENV_ISOLATION.call_once(|| {
+            kranz_engine::test_dirs::remove_git_config_at_exit();
             let missing = std::env::temp_dir().join(format!(
                 "kranz-slack-bridge-test-no-config-{}",
                 std::process::id()

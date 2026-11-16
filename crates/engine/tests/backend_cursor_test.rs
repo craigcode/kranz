@@ -39,6 +39,7 @@ fn write_mock(dir: &Path, name: &str, body: &str) -> PathBuf {
 /// tests never read the operator's real `~/.cursor` (scratch-home seeding
 /// has its own unit tests in `backend_cursor.rs`).
 fn spec(dir: &Path, session_id: &str, writable: bool) -> SessionSpec {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let mut env = HashMap::new();
     env.insert("HOME".to_string(), dir.display().to_string());
     SessionSpec {
@@ -528,6 +529,7 @@ async fn run_home_capture(
 /// NO `.cursor` writes (install hygiene at the spawn seam).
 #[tokio::test]
 async fn hook_status_signal_cursor_run_installs_the_lane_into_the_session_home() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let cfg = MissionConfig {
         worker: kranz_engine::types::RoleConfig {
@@ -594,6 +596,7 @@ async fn hook_status_signal_cursor_run_installs_the_lane_into_the_session_home()
 /// hooks.json, a byte-identical pre-lane session.
 #[tokio::test]
 async fn hook_status_signal_cursor_run_without_opt_in_installs_nothing() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let cfg = MissionConfig::default();
 
@@ -622,6 +625,7 @@ async fn hook_status_signal_cursor_run_without_opt_in_installs_nothing() {
 /// for.)
 #[tokio::test]
 async fn hook_status_signal_enabled_lane_ignores_non_hook_capable_backends() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let cfg = MissionConfig {
         hook_status: Some(kranz_engine::types::HookStatusConfig {
@@ -656,6 +660,7 @@ async fn hook_status_signal_enabled_lane_ignores_non_hook_capable_backends() {
 /// makes the NEXT acquire clean) — the kill-mid-session resumable-log case.
 #[tokio::test]
 async fn backend_cursor_cli_death_mid_run_leaves_a_resumable_event_log() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let paths = MissionPaths::new(dir.path(), "m-cursor-test");
     let mut log = EventLog::acquire(
