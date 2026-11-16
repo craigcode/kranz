@@ -1082,6 +1082,7 @@ mod tests {
             command: command.to_string(),
             outcome,
             output_tail: String::new(),
+            shell_label: "sh".to_string(),
         }
     }
 
@@ -1263,7 +1264,6 @@ mod tests {
                 AssertionLintOutcome::FailedOnBase,
             )],
             tree_clean_at_base: true,
-            shell_label: "sh".to_string(),
         };
         let reports = contract_gate_reports(&contract, Some(&lint), &workspace_root());
         assert_eq!(reports.len(), 4, "{reports:?}");
@@ -1422,7 +1422,6 @@ mod tests {
                 lint_result("a2", "true", AssertionLintOutcome::PassedOnBase),
             ],
             tree_clean_at_base: true,
-            shell_label: "sh".to_string(),
         };
         let reports = contract_gate_reports(&contract, Some(&lint), &workspace_root());
         let names: Vec<&str> = reports.iter().map(|r| r.name.as_str()).collect();

@@ -68,6 +68,9 @@ pub struct AssertionLint {
     pub command: String,
     pub outcome: AssertionLintOutcome,
     pub output_tail: String,
+    /// The [`crate::contract_shell::HostShell::label`] this command ran
+    /// under.
+    pub shell_label: String,
 }
 
 /// Full lint report for a contract's command assertions.
@@ -77,10 +80,6 @@ pub struct ContractLintReport {
     /// Whether the tree was clean (no uncommitted changes) at the moment the
     /// lint ran — when false, results may not reflect the pristine base.
     pub tree_clean_at_base: bool,
-    /// The [`crate::contract_shell::HostShell::label`] the lint's commands
-    /// ran under — `"sh"` when the lint never ran any command (skipped, or
-    /// no command assertions at all).
-    pub shell_label: String,
 }
 
 impl ContractLintReport {
@@ -119,13 +118,13 @@ impl ContractLintReport {
                     command: a.command.clone()?,
                     outcome: AssertionLintOutcome::NotLinted,
                     output_tail: String::new(),
+                    shell_label: "sh".to_string(),
                 })
             })
             .collect();
         ContractLintReport {
             results,
             tree_clean_at_base: true,
-            shell_label: "sh".to_string(),
         }
     }
 
@@ -317,6 +316,7 @@ pub(crate) fn run_contract_lint_with_limits(
                 command: command.to_string(),
                 outcome: AssertionLintOutcome::NotLinted,
                 output_tail: String::new(),
+                shell_label: shell.label(),
             });
             continue;
         }
@@ -335,13 +335,13 @@ pub(crate) fn run_contract_lint_with_limits(
             command: command.to_string(),
             outcome,
             output_tail,
+            shell_label: shell.label(),
         });
     }
 
     ContractLintReport {
         results,
         tree_clean_at_base,
-        shell_label: shell.label(),
     }
 }
 
@@ -405,9 +405,9 @@ mod tests {
                 command: "true".to_string(),
                 outcome: AssertionLintOutcome::PassedOnBase,
                 output_tail: String::new(),
+                shell_label: "sh".to_string(),
             }],
             tree_clean_at_base: false,
-            shell_label: "sh".to_string(),
         };
         let summary = dirty.summary();
         assert!(

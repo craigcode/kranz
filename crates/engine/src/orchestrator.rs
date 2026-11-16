@@ -1516,7 +1516,6 @@ impl MissionEngine {
             contract_lint::ContractLintReport {
                 results: Vec::new(),
                 tree_clean_at_base: true,
-                shell_label: "sh".to_string(),
             }
         };
 
@@ -2422,7 +2421,6 @@ impl MissionEngine {
         let no_lint = contract_lint::ContractLintReport {
             results: Vec::new(),
             tree_clean_at_base: true,
-            shell_label: "sh".to_string(),
         };
         let two_path = cost::estimate_two_path(estimate, &self.state.config, &calibration.params);
         let fit_anchor = crate::plan_fit::corpus_fit_anchor(&self.paths.repo_root);
@@ -16430,6 +16428,33 @@ pub(crate) mod tests {
                 EventKind::MilestoneCompleted { milestone_id, .. } if milestone_id == "ms-1"
             )),
             "the skip still completes the milestone"
+        );
+    }
+
+    #[tokio::test]
+    async fn contract_shell_recorded_in_validation_round_line() {
+        let contract = vec![Assertion {
+            id: "a1".to_string(),
+            statement: "exits zero".to_string(),
+            check: AssertionCheck::Command,
+            command: Some("exit 0".to_string()),
+            negative_control: None,
+            pty_script: None,
+        }];
+        let root = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let sandbox = crate::command_exec::GateSandbox::Disabled;
+        let shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("sh"),
+        };
+        let rendered =
+            MissionEngine::run_contract_commands_for_validation(&contract, root.path(), &env, &sandbox, &shell)
+                .await
+                .expect("one command assertion renders a line");
+        assert!(
+            rendered.contains("(shell: sh)"),
+            "expected a shell label on the validation-round line: {rendered}"
         );
     }
 }

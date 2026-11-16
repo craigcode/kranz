@@ -236,11 +236,16 @@ pub fn render_plan_markdown(
             );
         }
         let _ = writeln!(md, "{}\n", contract_lint.summary());
-        let _ = writeln!(
-            md,
-            "Lint commands ran under shell: `{}`\n",
-            contract_lint.shell_label
-        );
+        let mut shells: Vec<&str> = contract_lint
+            .results
+            .iter()
+            .map(|r| r.shell_label.as_str())
+            .collect();
+        shells.sort_unstable();
+        shells.dedup();
+        if !shells.is_empty() {
+            let _ = writeln!(md, "Lint commands ran under shell: {}\n", shells.join(", "));
+        }
         // Named contract-validation gates (contract-validation-gates): the
         // defect classes behind the lint, each verdict carrying its class
         // name. Same advisory posture as the lint.
