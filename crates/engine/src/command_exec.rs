@@ -2170,7 +2170,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_contract_shell_cmd_keeps_inner_double_quotes() {
-        let env = crate::runner::contract_env(None);
+        let env = sanitized_gate_env();
         assert!(env.contains_key("PATH"), "contract env must carry PATH");
         let dir = tempfile::tempdir().unwrap();
         let (code, output) = run_shell_command_with_timeout_env(
@@ -2216,7 +2216,12 @@ mod tests {
         )
         .expect("Windows process gate enforcement resolves");
         let mut sandbox = resolution.sandbox;
-        let env = crate::runner::contract_env(None);
+        assert!(
+            matches!(sandbox, GateSandbox::AppContainer { .. }),
+            "expected the resolved sandbox to be AppContainer, not a weaker posture"
+        );
+        let env = sanitized_gate_env();
+        assert!(env.contains_key("PATH"), "contract env must carry PATH");
         let (code, output) = run_shell_command_sandboxed_with_code(
             repo.path(),
             r#"node -e "process.stdout.write('KRANZ_QUOTES_OK')""#,
