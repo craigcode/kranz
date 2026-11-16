@@ -1,12 +1,15 @@
 # What is kranz — a quickstart overview
 
-kranz is a local mission-control harness for Claude Code. You describe an
-outcome in plain language; kranz turns it into a **mission** — a planned,
-human-approved, validated, fully-audited run of headless `claude` sessions
+kranz is a local mission-control harness for headless coding agents. You
+describe an outcome in plain language; kranz turns it into a **mission** — a
+planned, human-approved, validated, fully-audited run of agent sessions
 against your repo — that you can start from a terminal, a browser, Slack, or
-a pair of glasses, and then walk away from.
+a pair of glasses, and then walk away from. Claude Code is the default
+runtime. Other backends can fill individual roles, with role and sandbox
+restrictions: see the [README](../README.md) and
+[agent-backends.md](agent-backends.md).
 
-The honest one-liner: **kranz turns "run claude on this task" into a durable,
+The honest one-liner: **kranz turns "run an agent on this task" into a durable,
 auditable, human-gated state machine.** The CLI does the thinking; kranz owns
 when it's allowed to think, what it's allowed to touch, who checks its work,
 and what happened, forever, in a log you can replay.
@@ -27,11 +30,12 @@ vibe.
 - **Gate on human approval.** A plan does nothing until you approve it. That
   approval is the one privileged moment: it pins the git base SHA, commits the
   plan into the mission's event log, and starts (or queues) the run.
-- **Execute with separated powers.** A worker agent implements one milestone
-  at a time on a mission branch; a separate validator agent — a fresh session
-  that never saw the worker's reasoning — re-runs the validation commands and
-  checks the diff against the pinned base. The thing that did the work never
-  grades itself.
+- **Execute with separated powers.** A fresh worker session implements one
+  feature at a time on a mission branch. At each milestone two validators
+  that never saw the worker's reasoning judge the result: the functional
+  validator judges the results of the contract commands, which the engine
+  runs itself, and the scrutiny validator reviews the milestone diff against
+  the pinned base. The thing that did the work never grades itself.
 - **Survive anything.** Crash the process, kill the laptop, hit a usage limit:
   every event was already appended to the mission's log, so `kranz run`
   resumes exactly where it stopped. Locks are stolen only from provably dead
@@ -77,6 +81,13 @@ Watch and manage it from a browser (and Slack/glasses, if configured):
 kranz serve      # dashboard + REST/SSE on http://127.0.0.1:4560
 ```
 
+`kranz plan` then `kranz run` is the interactive path: one mission, planned
+in conversation. The backlog path is for work captured ahead of time: write a
+ticket, `kranz draft <slug>` to get a plan to review, `kranz ticket queue
+<slug>` to queue the plan once you approve it, and `kranz work` to drain the
+queue
+([tickets.md](tickets.md)). `kranz exec` is the headless path for CI.
+
 Other entry points, when you need them:
 
 ```sh
@@ -87,13 +98,20 @@ kranz otel --endpoint <url> # export missions as OpenTelemetry traces
 kranz config                # inspect/edit config, including mid-mission
 ```
 
-Exit codes are part of the protocol: `0` complete, `1` failed, `2` blocked
-(needs a human), `3` underspecified (needs more planning).
+Exit codes are part of the protocol:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | complete |
+| `1` | failed, or the command itself errored |
+| `2` | blocked (needs a human) |
+| `3` | underspecified (needs more planning) |
+| `4` | `kranz exec --push` was refused before the mission started, or the push failed after it completed ([deploy.md](deploy.md)) |
 
 ## How it does it
 
 Under the hood, kranz is three things: an **event-sourced state machine**, a
-**process supervisor for headless `claude` CLI sessions**, and a **git
+**process supervisor for headless agent CLI sessions**, and a **git
 choreographer**. Every surface — dashboard, Slack, glasses — is a thin client
 over those.
 
@@ -112,11 +130,12 @@ Writes are guarded by a single-writer file lock (`events.jsonl.lock` holding
 pid + identity token + timestamp). Liveness is probed, not assumed: a lock
 whose holder is provably dead is stolen automatically.
 
-### Missions are spawned `claude` processes with roles
+### Missions are spawned agent processes with roles
 
 When a mission needs an agent turn, the engine builds a `SessionSpec` and the
-backend (`crates/engine/src/backend_claude.rs`) spawns the installed `claude`
-binary headless:
+role's backend spawns its CLI headless. For the default backend
+(`crates/engine/src/backend_claude.rs`) that is the installed `claude`
+binary:
 
 ```
 claude -p --output-format stream-json --verbose \
@@ -133,17 +152,21 @@ test runners and builds die with the agent instead of orphaning. Conversation
 continuity across turns is just `--resume <session-id>`; kranz never stores
 conversation state itself, only the session id in the event log.
 
-Three roles use this same mechanism with different system prompts and tool
+Four roles use this same mechanism with different system prompts and tool
 policies:
 
 - **Orchestrator** — the planning brain. `kranz plan` converses with it;
   requesting a plan forces it to emit a structured plan (milestones,
   contracts, validation commands) against a JSON schema.
-- **Worker** — executes one milestone at a time in the repo, with the plan's
-  contract in its prompt and a schema-validated report required at the end.
-- **Validator** — a separate fresh session that checks the worker's claims:
-  runs the validation commands and diffs against the pinned base SHA. This is
-  the scrutiny layer; skipping it (`skipScrutiny`) requires an explicit
+- **Worker** — implements one feature, in a fresh session per feature, with
+  its spec and criteria in its prompt and a schema-validated report required
+  at the end.
+- **Functional validator** — a fresh session per validation round that
+  judges the engine-captured results of the contract commands and the
+  configured test, build and lint scripts.
+- **Scrutiny validator** — a fresh session per validation round that reviews
+  the milestone diff against the pinned base SHA for work that runs but is
+  wrong. Skipping it (`skipScrutiny`) requires an explicit
   `--allow-unvalidated`.
 
 ### Plans are contracts, and approval is the gate
@@ -163,12 +186,16 @@ dispatcher crashes recoverable.
 
 ### The run loop
 
-`run()` in `crates/engine/src/orchestrator.rs` drives: check out the mission
-branch → for each milestone, spawn a worker → parse its schema'd report →
-spawn a validator → on validator pass, record the milestone and continue; on
-fail, feed the findings back for a retry. On completion the mission branch
-merges back to main; conflicts get a synthesized-resolution pass. A final
-lesson-capture turn distills what tripped the mission into `.kranz/lessons/`,
+`run()` in `crates/engine/src/orchestrator.rs` drives: work on the mission
+branch (in its own worktree by default, so your checkout is untouched) → for
+each feature of a milestone, spawn a worker and parse its schema'd report →
+at the end of the milestone, run the contract commands and spawn both
+validators → on a pass, record the milestone and continue; on findings, the
+orchestrator turns them into fix features, up to a fix-cycle cap, after which
+the milestone blocks for you. The finished mission branch is the deliverable.
+kranz does not merge it or push it by default: the Merge action is yours to
+trigger, and it runs the tracked merge gates from the base branch first
+([merge-gates.md](merge-gates.md)). A final lesson-capture turn distills what tripped the mission into `.kranz/lessons/`,
 seeded into future missions' prompts.
 
 ### Everything else is a client

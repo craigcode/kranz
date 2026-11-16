@@ -498,6 +498,56 @@ fn review_packet_removed_checkout_keeps_committed_diff_without_claiming_freshnes
 }
 
 #[test]
+fn review_packet_json_carries_version_status_and_structured_native_checks() {
+    let mut f = Fixture::new();
+    let event = f
+        .log
+        .append(EventKind::GateResult {
+            gate: "passes-on-base".into(),
+            surface: kranz_engine::gate::GateSurface::Approval,
+            kind: kranz_engine::gate::GateKind::Deterministic,
+            index: 2,
+            verdict: kranz_engine::gate::GateVerdict::Fail,
+            artefact_ref: "contract gate passes-on-base".into(),
+            artefact_detail: Some("[behavior] already exits zero on the base tree".into()),
+            score: None,
+            threshold: None,
+            rule_ids: Vec::new(),
+        })
+        .unwrap();
+    let packet = f.packet();
+    let json = serde_json::to_value(&packet).unwrap();
+    assert_eq!(json["schemaVersion"], review_packet::SCHEMA_VERSION);
+    assert_eq!(
+        json["missionStatus"],
+        serde_json::to_value(reducer_status(&f)).unwrap()
+    );
+    assert_eq!(
+        json["nativeChecks"],
+        json!([{
+            "seq": event.seq,
+            "gate": "passes-on-base",
+            "surface": "approval",
+            "kind": "deterministic",
+            "verdict": "fail",
+            "artefactRef": "contract gate passes-on-base",
+            "artefactDetail": "[behavior] already exits zero on the base tree",
+            "artefactAvailable": true,
+        }])
+    );
+    // The prose entry stays for readers of the existing shape.
+    assert!(packet
+        .history
+        .iter()
+        .any(|entry| entry.seq == event.seq && entry.title.starts_with("Native check")));
+}
+
+fn reducer_status(f: &Fixture) -> kranz_engine::types::MissionStatus {
+    let events = EventLog::read_events(&f.paths.events_file()).unwrap();
+    reducer::fold(&events).unwrap().mission.status
+}
+
+#[test]
 fn review_packet_native_block_names_the_exact_latest_decision_event() {
     let mut f = Fixture::new();
     let event = f

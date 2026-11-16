@@ -135,6 +135,29 @@ pub fn prepare_appcontainer_host(_root: &Path) -> std::result::Result<bool, Stri
     Err("AppContainer host preparation is available only on Windows".to_string())
 }
 
+/// Read-only check that this host has the preparation a contained launch
+/// refuses without: the per-boot null-device descriptor and the persistent
+/// drive-root entries, for the system drive plus the drive of each absolute
+/// path in `programs`. Never mutates and needs no elevation. `Ok` on every
+/// other platform, where there is nothing to prepare.
+#[cfg(windows)]
+pub fn appcontainer_host_preflight(
+    programs: &[std::path::PathBuf],
+) -> std::result::Result<(), String> {
+    let mut programs = programs.to_vec();
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        programs.push(std::path::PathBuf::from(system_root));
+    }
+    crate::appcontainer_windows::host_preflight(&programs).map_err(|error| error.to_string())
+}
+
+#[cfg(not(windows))]
+pub fn appcontainer_host_preflight(
+    _programs: &[std::path::PathBuf],
+) -> std::result::Result<(), String> {
+    Ok(())
+}
+
 /// Apply the persistent metadata-only ACEs to the profile parent (`C:\Users`),
 /// derived from `USERPROFILE` rather than supplied by the operator. Returns
 /// the prepared path and whether anything changed. Windows tools `lstat` every

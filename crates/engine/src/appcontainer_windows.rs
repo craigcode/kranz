@@ -1020,7 +1020,7 @@ fn verify_null_device_prepared() -> Result<()> {
     }
 
     Err(EngineError::Backend(
-        "AppContainer host preparation is missing the required \\Device\\Null package ACEs; run scripts/prepare-windows-appcontainer.ps1 once from elevated PowerShell after each reboot"
+        "AppContainer host preparation is missing the required \\Device\\Null package ACEs; run `kranz sandbox-prepare --target <drive root>` (for example C:\\) from elevated PowerShell after each reboot"
             .to_string(),
     ))
 }
@@ -1067,6 +1067,25 @@ pub(crate) fn prepare_appcontainer_null_device() -> Result<()> {
         ))
     })?;
     verify_null_device_prepared()
+}
+
+/// The read-only host checks every contained launch makes, runnable before
+/// any session exists: the per-boot null-device descriptor, then the drive
+/// roots of `programs` (entries with no local drive root are skipped; the
+/// launch resolves and checks its own exact roots again). Lets `kranz ready`
+/// and `kranz exec` report missing preparation before a mission spends.
+pub(crate) fn host_preflight(programs: &[PathBuf]) -> Result<()> {
+    verify_null_device_prepared()?;
+    let mut roots = programs
+        .iter()
+        .filter_map(|program| local_volume_root(program))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    for root in &roots {
+        verify_volume_root_prepared(root)?;
+    }
+    Ok(())
 }
 
 /// Common Windows tools inspect the local drive root before user code starts.
@@ -1129,7 +1148,7 @@ fn verify_volume_root_prepared(root: &Path) -> Result<()> {
         missing.push(ALL_RESTRICTED_APPLICATION_PACKAGES_SID);
     }
     Err(EngineError::Backend(format!(
-        "AppContainer host preparation is missing the exact non-inheriting 0x{ROOT_METADATA_ACCESS_MASK:08x} metadata ACE for {} on {}; run scripts/prepare-windows-appcontainer.ps1 -Target '{}' once from elevated PowerShell",
+        "AppContainer host preparation is missing the exact non-inheriting 0x{ROOT_METADATA_ACCESS_MASK:08x} metadata ACE for {} on {}; run `kranz sandbox-prepare --target {}` once from elevated PowerShell",
         missing.join(" and "),
         root.display(),
         root.display()

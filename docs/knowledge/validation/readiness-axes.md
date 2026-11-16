@@ -2,13 +2,15 @@
 title: The two readiness axes — AMM projection and contract/consent health
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-09-29
+last_verified: 2026-11-16
 verified_against:
   - crates/cli/src/ready.rs
   - crates/cli/src/amm.rs
   - crates/engine/src/contract_health.rs
   - .kranz/tickets/amm-readiness-projection.md
 ---
+
+Rechecked 2026-11-16 (UTC) against the `ready.rs` change: a missing Windows sandbox host preparation is reported as `hostBlockers`, outside the 100-point score and the AMM projection, and becomes the highest-leverage fix when present. The dimensions, weights and mapping are unchanged.
 
 Rechecked 2026-09-29 (UTC) against the readiness ticket cleanup and unchanged amm.rs/contract_health.rs; mapping and event-derived measurements are unchanged.
 

@@ -863,7 +863,7 @@ fn read_tail_events_empty_file_reads_as_no_events() {
 /// A lock whose recorded holder is provably dead is stale: EVERY tier steals
 /// it, force flags not required. (Legacy one-line pid-only lock format —
 /// compat is exercised at the same time.)
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn dead_holder_lock_is_stolen_at_every_tier() {
     let tmp = tempfile::tempdir().unwrap();
@@ -871,7 +871,8 @@ fn dead_holder_lock_is_stolen_at_every_tier() {
     std::fs::create_dir_all(paths.mission_dir()).unwrap();
 
     for force in [LockForce::No, LockForce::IfNotLive, LockForce::EvenIfLive] {
-        // i32::MAX exceeds every real pid space: kill(_, 0) -> ESRCH -> dead.
+        // i32::MAX exceeds every real pid space: kill(_, 0) -> ESRCH on unix,
+        // OpenProcess -> ERROR_INVALID_PARAMETER on windows -> dead.
         std::fs::write(paths.lock_file(), i32::MAX.to_string()).unwrap();
         let log = EventLog::acquire(&paths, "m-lock", Duration::from_millis(50), force)
             .unwrap_or_else(|e| panic!("dead holder must be stolen at tier {force:?}: {e}"));
@@ -1235,7 +1236,7 @@ fn mission_lock_is_live_delegates_to_the_canonical_probe() {
 /// io errors instead of LockHeld). `flock` contends across separate fds
 /// within one process, so racing threads exercise the same guard as racing
 /// processes.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn racing_acquires_on_a_dead_lock_admit_exactly_one_winner() {
     let tmp = tempfile::tempdir().unwrap();

@@ -185,9 +185,32 @@ pub async fn cmd_exec(repo: PathBuf, file: PathBuf, options: ExecOptions) -> Res
         return Ok(1);
     }
 
+    // Windows: a missing AppContainer host preparation is otherwise found at
+    // the first validator spawn, after planning and a worker are paid for.
+    if let Err(msg) = sandbox_host_preflight(&cfg) {
+        eprintln!("kranz exec: refusing to start before creating the mission: {msg}");
+        return Ok(1);
+    }
+
     let backend = build_backend(&cfg)?;
 
     cmd_exec_with_backend(repo, cfg, backend, ticket, file, options).await
+}
+
+/// The read-only host checks a contained validator or gate launch makes (see
+/// [`kranz_engine::sandbox_windows::appcontainer_host_preflight`]). A no-op
+/// off Windows. A backend that cannot be discovered is not this check's
+/// refusal to make: `build_backend` reports it next.
+fn sandbox_host_preflight(cfg: &MissionConfig) -> std::result::Result<(), String> {
+    if !cfg!(windows) {
+        return Ok(());
+    }
+    let programs: Vec<PathBuf> =
+        kranz_engine::backend_claude::discover_claude_binary(cfg.claude_binary.as_deref())
+            .ok()
+            .into_iter()
+            .collect();
+    kranz_engine::sandbox_windows::appcontainer_host_preflight(&programs)
 }
 
 /// The body of [`cmd_exec`], parameterized on the backend so tests can drive
@@ -428,7 +451,18 @@ async fn run_and_reconcile(
     stop.store(true, Ordering::Relaxed);
     let _ = printer.await;
 
-    let status = run_result.map_err(|e| augment_limit_hint(e.into()))?;
+    let status = match run_result {
+        Ok(status) => status,
+        Err(e) => {
+            // The one stdout line is promised on every outcome: a caller that
+            // reads only stdout must still learn the mission id and branch.
+            println!(
+                "{}",
+                summary_line(&mission_id, RUN_ERROR_LABEL, cost, &branch, false)
+            );
+            return Err(augment_limit_hint(e.into()));
+        }
+    };
     let code = exit_code_for(status);
 
     // Reconcile the linked ticket's .status sidecar to match the mission's
@@ -481,13 +515,29 @@ async fn run_and_reconcile(
 
     // The only line on stdout: machine-readable, one line, always emitted.
     println!(
-        "kranz exec {mission_id} {} cost=${cost:.2} branch={branch} pushed={pushed}",
-        output::mission_status_label(status)
+        "{}",
+        summary_line(
+            &mission_id,
+            output::mission_status_label(status),
+            cost,
+            &branch,
+            pushed
+        )
     );
     if push_failed {
         return Ok(EXIT_PUSH_FAILED);
     }
     Ok(code)
+}
+
+/// Status word on the stdout line when the run itself returned an error (a
+/// backend or host failure), as opposed to a mission that reached a status.
+const RUN_ERROR_LABEL: &str = "ERROR";
+
+/// The one machine-readable stdout line of a run that got as far as a
+/// mission branch.
+fn summary_line(mission_id: &str, label: &str, cost: f64, branch: &str, pushed: bool) -> String {
+    format!("kranz exec {mission_id} {label} cost=${cost:.2} branch={branch} pushed={pushed}")
 }
 
 /// The `--push` delivery: refuse unless the mission's whole range
@@ -517,6 +567,20 @@ fn push_scanned(
 mod tests {
     use super::*;
     use kranz_engine::types::MissionConfig;
+
+    #[test]
+    fn summary_line_reports_a_run_error_in_the_promised_shape() {
+        assert_eq!(
+            summary_line(
+                "m-abc123",
+                RUN_ERROR_LABEL,
+                0.891,
+                "kranz/mission-m-abc123",
+                false
+            ),
+            "kranz exec m-abc123 ERROR cost=$0.89 branch=kranz/mission-m-abc123 pushed=false"
+        );
+    }
 
     /// Audit M16: `--push` refuses before contacting the remote when the
     /// mission's range carries a secret, or when there is no pinned base to

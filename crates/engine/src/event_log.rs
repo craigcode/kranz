@@ -264,12 +264,12 @@ fn log_identity(path: &Path) -> Option<(&Path, &str)> {
 ///
 /// A holder that is provably DEAD is always stolen (a stale lock from a
 /// crashed engine), regardless of tier. The tiers only govern holders that
-/// are alive or of indeterminate liveness. Automatic Dead detection is
-/// unix-only (`kill(pid, 0)` returning `ESRCH`, plus the own-pid
-/// token-reuse screen on any platform): on non-unix targets only the
-/// own-pid token-reuse screen can ever yield Dead, so recovering the lock
-/// from a foreign crashed holder there always requires an explicit force
-/// tier (`--force-lock` / `--dangerously-steal-live-lock`).
+/// are alive or of indeterminate liveness. Automatic Dead detection needs a
+/// process probe: `kill(pid, 0)` returning `ESRCH` on unix, a failed or
+/// exited `OpenProcess` on windows, plus the token-reuse screen. On any other
+/// target only the own-pid token-reuse screen can ever yield Dead, so
+/// recovering the lock from a foreign crashed holder there always requires
+/// an explicit force tier (`--force-lock` / `--dangerously-steal-live-lock`).
 ///
 /// | holder liveness | `No`       | `IfNotLive` | `EvenIfLive` |
 /// |-----------------|------------|-------------|--------------|
@@ -398,8 +398,27 @@ fn open_create_new_at(dir: &Dir, name: &str) -> std::io::Result<File> {
         .write(true)
         .create_new(true)
         .follow(FollowSymlinks::No);
+    // windows: a name whose file was just deleted stays in a delete-pending
+    // state until the last handle to it closes, and a create in that window
+    // fails with "access is denied", not "already exists". A rival stealing
+    // a stale lock opens exactly that window. Wait it out, bounded, so the
+    // caller sees the settled answer; a real denial still surfaces.
+    #[cfg(windows)]
+    for _ in 0..DELETE_PENDING_RETRIES {
+        match dir.open_with(name, &options) {
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                std::thread::sleep(DELETE_PENDING_BACKOFF);
+            }
+            other => return other.map(|file| file.into_std()),
+        }
+    }
     dir.open_with(name, &options).map(|file| file.into_std())
 }
+
+#[cfg(windows)]
+const DELETE_PENDING_RETRIES: u32 = 50;
+#[cfg(windows)]
+const DELETE_PENDING_BACKOFF: Duration = Duration::from_millis(10);
 
 fn open_write_at(dir: &Dir, name: &str, create: bool) -> std::io::Result<File> {
     use cap_fs_ext::OpenOptionsFollowExt as _;
@@ -1151,7 +1170,11 @@ impl Drop for EventLog {
 /// re-attempted and re-probed from scratch — it may have been released, or
 /// stolen and rewritten, while we waited.
 ///
-/// non-unix: no guard, and that is acceptable — liveness is never probed
+/// windows: the same sequence is serialized under a named mutex derived from
+/// the lock path (see [`windows_process::StealGuard`]), because the Dead
+/// auto-steal path is reachable there too.
+///
+/// elsewhere: no guard, and that is acceptable — liveness is never probed
 /// there (every verdict is Unknown, see [`probe_liveness`]), so the Dead
 /// auto-steal path cannot trigger; steals happen only under explicit operator
 /// force flags, which are deliberate one-off actions rather than the
@@ -1164,6 +1187,8 @@ fn steal_lock(
 ) -> Result<(File, u64)> {
     #[cfg(unix)]
     let _guard = StealGuard::acquire(mission_dir, lock_name)?;
+    #[cfg(windows)]
+    let _guard = windows_process::StealGuard::acquire(lock_path)?;
 
     loop {
         // The lock may have been RELEASED while we waited for the guard:
@@ -1222,7 +1247,7 @@ fn authorize_steal(lock_path: &Path, info: &LockInfo, force: LockForce) -> Resul
                 info.holder
             )))
         }
-        // Indeterminate liveness (unparseable pid, non-unix platform):
+        // Indeterminate liveness (unparseable pid, unprobeable platform):
         // --force-lock keeps its historical meaning and steals.
         (LockLiveness::Unknown, LockForce::IfNotLive | LockForce::EvenIfLive) => {
             tracing::warn!(
@@ -1426,7 +1451,7 @@ enum LockLiveness {
     Dead,
     /// The holder pid maps to a running process.
     Alive,
-    /// Cannot tell (unparseable pid, non-unix platform, unexpected probe
+    /// Cannot tell (unparseable pid, unprobeable platform, unexpected probe
     /// errno): honor the lock unless forced.
     Unknown,
 }
@@ -1504,8 +1529,9 @@ fn parse_lock_info(contents: &str) -> LockInfo {
 /// Probe the liveness of a lock file's recorded holder.
 ///
 /// unix: `kill(pid, 0)` == 0 → Alive; EPERM → Alive (exists, not ours);
-/// ESRCH → Dead; any other errno → Unknown. Unparseable or non-positive pid →
-/// Unknown. Our OWN pid → Alive (we hold it). Non-unix → Unknown. An Alive
+/// ESRCH → Dead; any other errno → Unknown. windows: see
+/// [`windows_process::state`]. Unparseable or non-positive pid → Unknown. Our
+/// OWN pid → Alive (we hold it). Any other platform → Unknown. An Alive
 /// verdict is then screened for pid reuse (see [`alive_or_reused`]).
 fn probe_liveness(info: &LockInfo) -> LockLiveness {
     let Some(pid) = info.pid else {
@@ -1529,10 +1555,18 @@ fn probe_liveness(info: &LockInfo) -> LockLiveness {
             _ => LockLiveness::Unknown,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // No non-unix equivalent of `kill(pid, 0)` is wired up here, and
-        // `process_identity_token`'s non-unix stub always returns `None`, so
+        match windows_process::state(pid as u32) {
+            windows_process::State::Running => alive_or_reused(pid, info),
+            windows_process::State::Gone => LockLiveness::Dead,
+            windows_process::State::Unknown => non_unix_liveness_fallback(),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // No equivalent of `kill(pid, 0)` is wired up here, and
+        // `process_identity_token`'s stub always returns `None`, so
         // `alive_or_reused` can never reach `Dead` for a foreign pid on this
         // platform. Liveness is therefore unprovable for a foreign holder:
         // report Unknown rather than guessing, and never Dead.
@@ -1545,13 +1579,140 @@ fn probe_liveness(info: &LockInfo) -> LockLiveness {
     }
 }
 
-/// The verdict `probe_liveness` reports for a foreign pid on non-unix
-/// targets, where liveness cannot be proven. Factored out (and compiled on
-/// every platform) so a cross-platform test can pin that it is `Unknown` and
-/// never `Dead` — uncertainty must never demote to Dead.
+/// The verdict `probe_liveness` reports for a foreign pid whose liveness
+/// cannot be proven: every probe on a platform with none wired up, and an
+/// inconclusive probe on windows. Factored out (and compiled on every
+/// platform) so a cross-platform test can pin that it is `Unknown` and never
+/// `Dead` — uncertainty must never demote to Dead.
 #[cfg_attr(unix, allow(dead_code))]
 fn non_unix_liveness_fallback() -> LockLiveness {
     LockLiveness::Unknown
+}
+
+/// Windows process probes for lock liveness and pid-reuse detection. Without
+/// these every foreign holder was Unknown, so a lock left by a killed engine
+/// refused `kranz abandon` until the operator forced it.
+#[cfg(windows)]
+mod windows_process {
+    use crate::error::{EngineError, Result};
+    use sha2::{Digest as _, Sha256};
+    use std::path::Path;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE,
+        WAIT_ABANDONED, WAIT_OBJECT_0,
+    };
+    use windows::Win32::System::Threading::{
+        CreateMutexW, GetExitCodeProcess, GetProcessTimes, OpenProcess, ReleaseMutex,
+        WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    /// How long a steal waits for a rival's probe→remove→create sequence.
+    const STEAL_MUTEX_TIMEOUT_MS: u32 = 30_000;
+
+    /// RAII serialization of the lock-steal sequence (windows): a named
+    /// mutex keyed by the lock path, the counterpart of the unix `flock`
+    /// guard. Unserialized, two acquires can both judge one stale holder
+    /// Dead and the slower one's remove deletes the faster one's new lock.
+    ///
+    /// The name hashes the path as kranz spells it (lowercased, since the
+    /// filesystem ignores case). Callers reach a mission through one
+    /// canonical repo root, so both sides derive the same name. A mutex
+    /// abandoned by a holder that died mid-steal is taken over: the caller
+    /// re-probes from scratch either way.
+    pub(super) struct StealGuard(Process);
+
+    impl StealGuard {
+        pub(super) fn acquire(lock_path: &Path) -> Result<StealGuard> {
+            let key = lock_path.to_string_lossy().to_lowercase();
+            let digest = Sha256::digest(key.as_bytes());
+            let mut name = String::from("Local\\Kranz.EventLog.Steal.v1.");
+            for byte in &digest[..16] {
+                name.push_str(&format!("{byte:02x}"));
+            }
+            let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) }
+                .map(Process)
+                .map_err(|error| {
+                    EngineError::InvalidState(format!(
+                        "failed to create/open the event-log steal mutex: {error}"
+                    ))
+                })?;
+            match unsafe { WaitForSingleObject(handle.0, STEAL_MUTEX_TIMEOUT_MS) } {
+                WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(StealGuard(handle)),
+                status => Err(EngineError::InvalidState(format!(
+                    "waiting {STEAL_MUTEX_TIMEOUT_MS}ms for the event-log steal mutex returned {status:?}"
+                ))),
+            }
+        }
+    }
+
+    impl Drop for StealGuard {
+        fn drop(&mut self) {
+            if let Err(error) = unsafe { ReleaseMutex(self.0 .0) } {
+                tracing::error!(%error, "failed to release the event-log steal mutex");
+            }
+        }
+    }
+
+    /// `GetExitCodeProcess` reports this while the process has not exited.
+    const STILL_ACTIVE: u32 = 259;
+
+    pub(super) enum State {
+        Running,
+        Gone,
+        Unknown,
+    }
+
+    /// An owned kernel handle, closed on drop.
+    struct Process(HANDLE);
+
+    impl Drop for Process {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// `OpenProcess` fails with ERROR_INVALID_PARAMETER when no process has
+    /// this pid → Gone. ERROR_ACCESS_DENIED means it exists but is not ours
+    /// to query → Running (the EPERM rule). A handle to a process that has
+    /// already exited still opens while anything else holds one, so the exit
+    /// code decides: anything but STILL_ACTIVE → Gone. A live process that
+    /// exits with 259 reads as Running, the safe direction. Every other
+    /// failure → Unknown.
+    pub(super) fn state(pid: u32) -> State {
+        let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+            Ok(handle) => Process(handle),
+            Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+                return State::Gone
+            }
+            Err(error) if error.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                return State::Running
+            }
+            Err(_) => return State::Unknown,
+        };
+        let mut exit_code = 0u32;
+        match unsafe { GetExitCodeProcess(handle.0, &mut exit_code) } {
+            Ok(()) if exit_code == STILL_ACTIVE => State::Running,
+            Ok(()) => State::Gone,
+            Err(_) => State::Unknown,
+        }
+    }
+
+    /// The kernel's stored creation time for `pid`, in 100ns FILETIME ticks.
+    /// Fixed for the life of the process and never recomputed from the wall
+    /// clock, so two readings of one live process are identical.
+    pub(super) fn creation_ticks(pid: u32) -> Option<u64> {
+        let handle =
+            Process(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?);
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) }
+            .ok()?;
+        Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+    }
 }
 
 /// Screen an Alive pid for reuse by comparing process identity tokens: the
@@ -1771,9 +1932,17 @@ pub(crate) fn process_identity_token(pid: i32) -> Option<String> {
     identity
 }
 
-/// Everywhere else (windows, exotic unix): no identity token, so pid reuse
-/// cannot be proven and an alive holder stays Alive.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// windows: `"win:<creation_ticks>"`, the process creation FILETIME the
+/// kernel stores (see [`windows_process::creation_ticks`]).
+#[cfg(windows)]
+pub(crate) fn process_identity_token(pid: i32) -> Option<String> {
+    let pid = u32::try_from(pid).ok().filter(|pid| *pid > 0)?;
+    windows_process::creation_ticks(pid).map(|ticks| format!("win:{ticks}"))
+}
+
+/// Everywhere else (exotic unix): no identity token, so pid reuse cannot be
+/// proven and an alive holder stays Alive.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) fn process_identity_token(_pid: i32) -> Option<String> {
     None
 }
@@ -1818,15 +1987,69 @@ mod tests {
         );
     }
 
-    // `probe_liveness`'s non-unix arm (the actual code path this pins) only
-    // compiles under `#[cfg(not(unix))]`, and our CI runs macOS/Linux, so it
-    // cannot be exercised directly here. `non_unix_liveness_fallback` is
-    // factored out and compiled on ALL platforms so this cross-platform test
-    // can still pin its invariant: uncertainty must never demote to Dead.
+    // `probe_liveness`'s unprovable arm (the actual code path this pins)
+    // does not compile on unix, so it cannot be exercised directly on every
+    // host. `non_unix_liveness_fallback` is factored out and compiled on ALL
+    // platforms so this cross-platform test can still pin its invariant:
+    // uncertainty must never demote to Dead.
     #[test]
     fn non_unix_liveness_fallback_is_never_dead() {
         assert_eq!(non_unix_liveness_fallback(), LockLiveness::Unknown);
         assert_ne!(non_unix_liveness_fallback(), LockLiveness::Dead);
+    }
+
+    #[cfg(windows)]
+    fn lock_info_for(pid: u32, identity: Option<String>) -> LockInfo {
+        // Built through the parser, in the on-disk line order: pid, acquire
+        // time, identity.
+        parse_lock_info(&format!("{pid}\n0\n{}\n", identity.unwrap_or_default()))
+    }
+
+    /// A killed engine's lock must read Dead on windows without a force
+    /// flag. The `Child` is kept, so its handle keeps the exited process
+    /// object (and its pid) alive: this pins the exit-code arm, which cannot
+    /// be confused by pid reuse.
+    #[cfg(windows)]
+    #[test]
+    fn windows_exited_lock_holder_is_dead() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(
+            probe_liveness(&lock_info_for(pid, None)),
+            LockLiveness::Dead
+        );
+    }
+
+    /// A running holder is Alive when its recorded identity token still
+    /// matches, and Dead when the token belongs to an earlier process that
+    /// had the same pid.
+    #[cfg(windows)]
+    #[test]
+    fn windows_running_lock_holder_is_alive_until_its_token_differs() {
+        // Spawned directly with null stdio: killing it leaves no orphan
+        // holding the test runner's output pipe.
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let identity = process_identity_token(pid as i32);
+        let alive = probe_liveness(&lock_info_for(pid, identity.clone()));
+        let legacy = probe_liveness(&lock_info_for(pid, None));
+        let reused = probe_liveness(&lock_info_for(pid, Some("win:1".into())));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(identity.is_some_and(|t| t.starts_with("win:")));
+        assert_eq!(alive, LockLiveness::Alive);
+        assert_eq!(legacy, LockLiveness::Alive);
+        assert_eq!(reused, LockLiveness::Dead);
     }
 
     /// A valid one-event log body for a not-yet-acquired mission.
