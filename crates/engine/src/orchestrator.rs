@@ -1464,6 +1464,7 @@ impl MissionEngine {
                 ) {
                     Ok(resolution) => {
                         let mut sandbox = resolution.sandbox;
+                        let shell = self.contract_shell(&lint_root, &sandbox);
                         let usable = sandbox.enforce() != SandboxEnforce::Off
                             && (operator_enforced
                                 || contract_lint::containment_usable(
@@ -1471,6 +1472,7 @@ impl MissionEngine {
                                     &scratch,
                                     Some(&base_sha),
                                     &sandbox,
+                                    &shell,
                                 ));
                         let report = if usable {
                             contract_lint::run_contract_lint(
@@ -1481,6 +1483,7 @@ impl MissionEngine {
                                 true,
                                 &[],
                                 &sandbox,
+                                &shell,
                             )
                         } else {
                             skipped()
@@ -1513,6 +1516,7 @@ impl MissionEngine {
             contract_lint::ContractLintReport {
                 results: Vec::new(),
                 tree_clean_at_base: true,
+                shell_label: "sh".to_string(),
             }
         };
 
@@ -2418,6 +2422,7 @@ impl MissionEngine {
         let no_lint = contract_lint::ContractLintReport {
             results: Vec::new(),
             tree_clean_at_base: true,
+            shell_label: "sh".to_string(),
         };
         let two_path = cost::estimate_two_path(estimate, &self.state.config, &calibration.params);
         let fit_anchor = crate::plan_fit::corpus_fit_anchor(&self.paths.repo_root);
@@ -5757,7 +5762,10 @@ impl MissionEngine {
         root: &std::path::Path,
         sandbox: &crate::command_exec::GateSandbox,
     ) -> crate::contract_shell::HostShell {
-        let contained = matches!(sandbox, crate::command_exec::GateSandbox::AppContainer { .. });
+        let contained = matches!(
+            sandbox,
+            crate::command_exec::GateSandbox::AppContainer { .. }
+        );
         let mut forbidden_roots = vec![
             self.paths.repo_root.clone(),
             root.to_path_buf(),
@@ -5767,9 +5775,7 @@ impl MissionEngine {
         ];
         let inputs = match sandbox {
             crate::command_exec::GateSandbox::Bubblewrap { inputs } => Some(inputs.as_ref()),
-            crate::command_exec::GateSandbox::AppContainer { inputs, .. } => {
-                Some(inputs.as_ref())
-            }
+            crate::command_exec::GateSandbox::AppContainer { inputs, .. } => Some(inputs.as_ref()),
             crate::command_exec::GateSandbox::Container { inputs, .. } => Some(inputs.as_ref()),
             _ => None,
         };

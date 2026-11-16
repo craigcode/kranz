@@ -258,6 +258,7 @@ pub(crate) fn containment_usable(
 /// untouched base tree, using the module's default per-command timeout and
 /// overall budget. `passthrough` is the mission config's
 /// `contractEnvPassthrough` (see [`lint_env`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_contract_lint(
     cwd: &Path,
     scratch: &Path,
@@ -266,6 +267,7 @@ pub(crate) fn run_contract_lint(
     tree_clean_at_base: bool,
     passthrough: &[String],
     sandbox: &crate::command_exec::GateSandbox,
+    shell: &crate::contract_shell::HostShell,
 ) -> ContractLintReport {
     run_contract_lint_with_limits(
         cwd,
@@ -277,6 +279,7 @@ pub(crate) fn run_contract_lint(
         OVERALL_BUDGET,
         passthrough,
         sandbox,
+        shell,
     )
 }
 
@@ -294,6 +297,7 @@ pub(crate) fn run_contract_lint_with_limits(
     overall: Duration,
     passthrough: &[String],
     sandbox: &crate::command_exec::GateSandbox,
+    shell: &crate::contract_shell::HostShell,
 ) -> ContractLintReport {
     let env = lint_env(scratch, base_sha, passthrough);
     let overall_start = Instant::now();
@@ -317,12 +321,13 @@ pub(crate) fn run_contract_lint_with_limits(
             continue;
         }
 
-        let (code, output_tail) = crate::command_exec::run_shell_command_sandboxed_blocking(
+        let (code, output_tail) = crate::command_exec::run_contract_command_sandboxed_blocking(
             cwd,
             command,
             per_command,
             &env,
             sandbox,
+            shell,
         );
         let outcome = classify(code.is_some(), code == Some(0));
         results.push(AssertionLint {
@@ -336,6 +341,7 @@ pub(crate) fn run_contract_lint_with_limits(
     ContractLintReport {
         results,
         tree_clean_at_base,
+        shell_label: shell.label(),
     }
 }
 
@@ -343,6 +349,13 @@ pub(crate) fn run_contract_lint_with_limits(
 mod tests {
     use super::*;
     use crate::test_shell::{sleep_millis, FAIL, SUCCEED};
+
+    fn test_sh_shell() -> crate::contract_shell::HostShell {
+        crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("sh"),
+        }
+    }
 
     fn run_lint(cwd: &Path, base_sha: Option<&str>, contract: &[Assertion]) -> ContractLintReport {
         let scratch = tempfile::tempdir().unwrap();
@@ -354,6 +367,7 @@ mod tests {
             true,
             &[],
             &crate::command_exec::GateSandbox::Disabled,
+            &test_sh_shell(),
         )
     }
 
@@ -392,6 +406,7 @@ mod tests {
                 output_tail: String::new(),
             }],
             tree_clean_at_base: false,
+            shell_label: "sh".to_string(),
         };
         let summary = dirty.summary();
         assert!(
@@ -531,6 +546,7 @@ mod tests {
             Duration::from_secs(600),
             &[],
             &crate::command_exec::GateSandbox::Disabled,
+            &test_sh_shell(),
         );
         let elapsed = start.elapsed();
 
@@ -568,6 +584,7 @@ mod tests {
             Duration::from_millis(50),
             &[],
             &crate::command_exec::GateSandbox::Disabled,
+            &test_sh_shell(),
         );
 
         assert_eq!(report.results.len(), 3);
