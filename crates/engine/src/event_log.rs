@@ -1980,12 +1980,12 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn lock_info_for(pid: u32, token: Option<String>) -> LockInfo {
+    fn lock_info_for(pid: u32, identity: Option<String>) -> LockInfo {
         LockInfo {
             holder: pid.to_string(),
             pid: Some(pid as i32),
             acquired_secs: None,
-            token,
+            token: identity,
             generation: None,
         }
     }
@@ -2025,13 +2025,13 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        let token = process_identity_token(pid as i32);
-        let alive = probe_liveness(&lock_info_for(pid, token.clone()));
+        let identity = process_identity_token(pid as i32);
+        let alive = probe_liveness(&lock_info_for(pid, identity.clone()));
         let legacy = probe_liveness(&lock_info_for(pid, None));
         let reused = probe_liveness(&lock_info_for(pid, Some("win:1".into())));
         let _ = child.kill();
         let _ = child.wait();
-        assert!(token.is_some_and(|t| t.starts_with("win:")));
+        assert!(identity.is_some_and(|t| t.starts_with("win:")));
         assert_eq!(alive, LockLiveness::Alive);
         assert_eq!(legacy, LockLiveness::Alive);
         assert_eq!(reused, LockLiveness::Dead);

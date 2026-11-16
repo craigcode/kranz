@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-15
+last_verified: 2026-11-16
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,8 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-16 (UTC) against the Windows first-run fixes: the event-log lock now probes its holder on Windows (`OpenProcess`, with the process creation time as the identity token) and serializes a steal under a named mutex, so a dead holder is taken over there as on Unix. `kranz exec` checks the AppContainer host preparation before it creates a mission and prints its stdout line with status `ERROR` when the run errors. The review packet JSON gains `schemaVersion`, `missionStatus` and `nativeChecks`. The queue change is a comment. The pipeline and the single-writer rule are unchanged.
 
 Rechecked 2026-11-15 (UTC) against a test-only change in `control.rs` and `container_egress.rs`: two unit tests no longer depend on the scratch directory sitting outside a mission directory, so they pass under the contract gate's `TMPDIR`. No behaviour described here changed.
 
@@ -174,7 +176,8 @@ without claiming current check freshness. See [review packets](../../review-pack
 - **Single writer.** One engine process owns the log, guarded by a lock *file*
   `events.jsonl.lock` (not POSIX advisory locks, so Windows stays first-class),
   acquired via `EventLog::acquire`. A dead holder is detected by `kill(pid,0)`
-  plus a process-identity token that proves pid reuse; a live/unknown holder is
+  (`OpenProcess` on Windows) plus a process-identity token that proves pid
+  reuse; a live/unknown holder is
   honored unless an explicit `LockForce` tier steals it. Two engines on one log
   is the cardinal sin the whole liveness dance exists to prevent.
 - **Contiguous seq.** `seq` starts at 1 and increases by exactly 1 (assigned by

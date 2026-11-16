@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-15
+last_verified: 2026-11-16
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -61,6 +61,8 @@ verified_against:
   - docs/tickets.md
   - crates/engine/src/git_ops.rs
 ---
+
+Rechecked 2026-11-16 (UTC) against the Windows first-run fixes: the review packet JSON gains `schemaVersion`, `missionStatus` and `nativeChecks`, which list recorded native gate results as data and still do not claim a current pass. The event-log change is the Windows lock probe. No gate, verdict or consent rule changed.
 
 Rechecked 2026-11-15 (UTC) against the feature-range secret scan: after every
 worker run, before the judgement turn, the engine now scans the feature's own
