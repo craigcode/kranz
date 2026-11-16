@@ -209,6 +209,7 @@ jobs:
             command_exec::tests::windows_contract_shell_sh_keeps_inner_double_quotes \
             command_exec::tests::windows_contract_shell_cmd_keeps_inner_double_quotes \
             command_exec::tests::windows_contract_shell_sh_sees_pinned_base_sha \
+            command_exec::tests::windows_contract_shell_sh_finds_its_own_tools_off_path \
             command_exec::tests::windows_contract_shell_planted_sh_is_never_executed; do
             log="$RUNNER_TEMP/kranz-windows-${name//::/-}.log"
             set +e

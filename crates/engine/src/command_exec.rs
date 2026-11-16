@@ -439,20 +439,6 @@ pub(crate) fn cmd_raw_tail(command: &str) -> String {
     format!("/S /C \"{command}\"")
 }
 
-/// The full raw command line `<cmd_program> /S /C "<command>"`, quoting the
-/// program only when `appcontainer_windows::quote_arg` would (empty or
-/// containing whitespace) — matched here so both quoting rules agree.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn cmd_raw_command_line(cmd_program: &str, command: &str) -> String {
-    let needs_quotes = cmd_program.is_empty() || cmd_program.chars().any(|c| c == ' ' || c == '\t');
-    let program = if needs_quotes {
-        format!("\"{cmd_program}\"")
-    } else {
-        cmd_program.to_string()
-    };
-    format!("{program} {}", cmd_raw_tail(command))
-}
-
 /// Hand `tail` to the child's command line completely unencoded — the
 /// Windows counterpart to `.args(..)` for the `/S /C "<command>"` tail,
 /// which must reach cmd.exe byte-for-byte (no quote escaping at all).
@@ -1458,6 +1444,48 @@ pub(crate) async fn run_contract_command_sandboxed(
     (code == Some(0), output)
 }
 
+/// Let an uncontained Windows contract `sh` find the POSIX tools it ships
+/// with. A default Git for Windows install puts only `Git\cmd` on `PATH`,
+/// so `grep`, `head` and the rest of `usr\bin` are missing from a contract
+/// command's environment even though the shell beside them was resolved.
+/// The resolved shell's own directory is APPENDED to `PATH`: tools already
+/// on the path keep winning (Git's `usr\bin` also carries a `link.exe` that
+/// must not shadow the MSVC linker), and only the gaps are filled.
+///
+/// The directory is the one [`crate::contract_shell::posix_sh_resolution`]
+/// already proved lies outside every worker-writable root. Uncontained
+/// only: the contained postures get no extra path entry. A no-op off
+/// Windows, where the shell is the bare `sh`.
+fn contract_shell_env(
+    mut env: HashMap<String, String>,
+    sandbox: &GateSandbox,
+    shell: &crate::contract_shell::HostShell,
+    windows: bool,
+) -> HashMap<String, String> {
+    if !windows
+        || !matches!(sandbox, GateSandbox::Disabled)
+        || shell.kind != crate::contract_shell::ShellKind::Sh
+        || !shell.program.is_absolute()
+    {
+        return env;
+    }
+    let Some(dir) = shell.program.parent() else {
+        return env;
+    };
+    let dir = dir.display().to_string();
+    let key = env
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case("PATH"))
+        .cloned()
+        .unwrap_or_else(|| "PATH".to_string());
+    let path = match env.get(&key) {
+        Some(existing) if !existing.is_empty() => format!("{existing};{dir}"),
+        _ => dir,
+    };
+    env.insert(key, path);
+    env
+}
+
 /// [`run_contract_command_sandboxed`] with an explicit timeout and the real
 /// exit code, mirroring [`run_shell_command_sandboxed_with_code`].
 pub(crate) async fn run_contract_command_sandboxed_with_code(
@@ -1468,7 +1496,12 @@ pub(crate) async fn run_contract_command_sandboxed_with_code(
     sandbox: &GateSandbox,
     shell: &crate::contract_shell::HostShell,
 ) -> (Option<i32>, String) {
-    let env = gate_env_for_sandbox(env, sandbox);
+    let env = contract_shell_env(
+        gate_env_for_sandbox(env, sandbox),
+        sandbox,
+        shell,
+        cfg!(windows),
+    );
     let wrapped = match sandbox.wrap_contract_shell(command, &env, shell) {
         Ok(wrapped) => wrapped,
         Err(error) => {
@@ -2268,15 +2301,41 @@ mod tests {
     }
 
     #[test]
-    fn cmd_raw_tail_command_line_quotes_a_spaced_program_and_leaves_cmd_bare() {
-        let spaced = cmd_raw_command_line(r"C:\Program Files\cmd.exe", "echo hi");
-        assert_eq!(
-            spaced,
-            format!("\"C:\\Program Files\\cmd.exe\" {}", cmd_raw_tail("echo hi"))
-        );
+    fn contract_shell_env_appends_the_resolved_sh_directory_only_when_uncontained_on_windows() {
+        let sh = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: if cfg!(windows) {
+                std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin\sh.exe")
+            } else {
+                std::path::PathBuf::from("/opt/git/usr/bin/sh")
+            },
+        };
+        let dir = sh.program.parent().unwrap().display().to_string();
+        let env = HashMap::from([("Path".to_string(), "first".to_string())]);
 
-        let bare = cmd_raw_command_line("cmd", "echo hi");
-        assert_eq!(bare, format!("cmd {}", cmd_raw_tail("echo hi")));
+        // Windows, uncontained, resolved sh: appended under the existing key.
+        let out = contract_shell_env(env.clone(), &GateSandbox::Disabled, &sh, true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out["Path"], format!("first;{dir}"));
+        // No PATH at all: the directory becomes the path.
+        let out = contract_shell_env(HashMap::new(), &GateSandbox::Disabled, &sh, true);
+        assert_eq!(out["PATH"], dir);
+
+        // Off Windows, under cmd, and for the bare `sh`: untouched.
+        assert_eq!(
+            contract_shell_env(env.clone(), &GateSandbox::Disabled, &sh, false),
+            env
+        );
+        let cmd = crate::contract_shell::HostShell::cmd();
+        assert_eq!(
+            contract_shell_env(env.clone(), &GateSandbox::Disabled, &cmd, true),
+            env
+        );
+        let bare = crate::contract_shell::HostShell::bare_sh();
+        assert_eq!(
+            contract_shell_env(env.clone(), &GateSandbox::Disabled, &bare, true),
+            env
+        );
     }
 
     #[cfg(unix)]
@@ -2388,6 +2447,34 @@ mod tests {
         assert!(
             output.contains("KRANZ_QUOTES_OK"),
             "expected the marker to survive the resolved sh's quoting: {output}"
+        );
+    }
+
+    /// A default Git for Windows install leaves `usr\bin` off `PATH`. The
+    /// contract shell must still find the tools it ships with, or the
+    /// anti-vacuity `| grep -qE ...` form fails on a stock host.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_sh_finds_its_own_tools_off_path() {
+        let shell = resolved_uncontained_contract_sh(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = sanitized_gate_env();
+        let system_root = std::env::var("SystemRoot").expect("SystemRoot is set on Windows");
+        env.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+        env.insert("PATH".to_string(), format!(r"{system_root}\System32"));
+        let (code, output) = run_contract_command_sandboxed_with_code(
+            dir.path(),
+            "printf 'KRANZ_TOOLS\\n' | grep -qE 'KRANZ_[A-Z]+'",
+            Duration::from_secs(30),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(0),
+            "grep must resolve from the contract shell's own directory: {output}"
         );
     }
 

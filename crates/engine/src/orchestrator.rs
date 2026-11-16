@@ -400,6 +400,12 @@ pub struct MissionEngine {
     /// `None` outside `run()` (unit tests calling `validation_round`
     /// directly skip the reset).
     pub(crate) workspace_provider: Option<Arc<dyn crate::workspace_provider::WorkspaceProvider>>,
+    /// Test seam: forces the shell [`Self::validation_contract_shell`]
+    /// reports, so approval's `host-shell-syntax` gate can be judged against
+    /// `cmd` on a Unix test host. Compiled only into test builds; there is no
+    /// env var or config key for it.
+    #[cfg(test)]
+    contract_shell_override: Option<crate::contract_shell::HostShell>,
 }
 
 /// Why a denial must not be offered as a grant, if it must not.
@@ -572,6 +578,8 @@ impl MissionEngine {
             grant_request_cap: GRANT_REQUEST_CAP,
             workspace_handle: None,
             workspace_provider: None,
+            #[cfg(test)]
+            contract_shell_override: None,
         };
         if let Some(note) = rules_note {
             engine.emit_decision(&note, None)?;
@@ -714,6 +722,8 @@ impl MissionEngine {
             grant_request_cap: GRANT_REQUEST_CAP,
             workspace_handle: None,
             workspace_provider: None,
+            #[cfg(test)]
+            contract_shell_override: None,
         };
         engine.close_permissions(
             None,
@@ -1529,7 +1539,8 @@ impl MissionEngine {
 
         // Named, deterministic contract-validation gates (ticket
         // contract-validation-gates.md): the defect classes behind the lint —
-        // vacuous-filter, wrong-polarity, passes-on-base, env-sensitive —
+        // vacuous-filter, wrong-polarity, host-shell-syntax, passes-on-base,
+        // env-sensitive —
         // evaluated through the gate plugin interface (gate.rs) so each
         // verdict carries its class name into the approval decision and
         // plan.md below. Static gates inspect the command text against the
@@ -1537,10 +1548,15 @@ impl MissionEngine {
         // report. Advisory only, exactly like the lint: approval never
         // blocks on these.
 
+        // host-shell-syntax is judged against the shell the mission's
+        // validation and final-gate commands will run under, which is not
+        // the lint's own shell: the lint above always runs contained.
+        let validation_shell = self.validation_contract_shell();
         let mut gate_reports = contract_gates::contract_gate_reports(
             &plan.validation_contract,
             Some(&contract_lint_report),
             &self.paths.repo_root,
+            &validation_shell,
         );
         gate_reports.extend(control_reports);
         self.external_plan_checks(&plan, &base_sha, &gate_reports, actor)?;
@@ -5784,6 +5800,34 @@ impl MissionEngine {
             crate::contract_shell::ShellLane::Contract,
             contained,
             &forbidden_roots,
+        )
+    }
+
+    /// The shell this mission's validation-round and final-gate contract
+    /// commands will run under, predicted at approval without resolving a
+    /// gate sandbox (resolution creates leases on Windows). Mirrors
+    /// [`crate::command_exec::resolve_gate_sandbox`]: on Windows an enforced
+    /// worker posture is AppContainer (contained); `enforce: off` is
+    /// uncontained. A posture that cannot be read is treated as contained,
+    /// the conservative answer (`cmd` on Windows). Off Windows the answer is
+    /// always the bare `sh`.
+    fn validation_contract_shell(&self) -> crate::contract_shell::HostShell {
+        #[cfg(test)]
+        if let Some(shell) = &self.contract_shell_override {
+            return shell.clone();
+        }
+        let contained = crate::command_exec::worker_gate_sandbox(&self.state.config)
+            .map(|policy| policy.enforce != SandboxEnforce::Off)
+            .unwrap_or(true);
+        crate::contract_shell::resolve_contract_shell(
+            crate::contract_shell::ShellLane::Contract,
+            contained,
+            &[
+                self.paths.repo_root.clone(),
+                self.paths.mission_dir(),
+                self.paths.runs_dir().join("contract-home"),
+                std::env::temp_dir(),
+            ],
         )
     }
 
@@ -16429,6 +16473,91 @@ pub(crate) mod tests {
             )),
             "the skip still completes the milestone"
         );
+    }
+
+    fn approval_host_shell_plan() -> Plan {
+        Plan {
+            goal: "g".into(),
+            validation_contract: vec![Assertion {
+                id: "a9".to_string(),
+                statement: "the pinned base is x".to_string(),
+                check: AssertionCheck::Command,
+                command: Some(r#"test "$KRANZ_BASE_SHA" = x"#.to_string()),
+                negative_control: None,
+                pty_script: None,
+            }],
+            milestones: vec![PlanMilestone {
+                title: "m".into(),
+                features: vec![PlanFeature {
+                    title: "f".into(),
+                    spec: "s".into(),
+                    validation_criteria: vec![],
+                }],
+            }],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set: vec![],
+            standards_manifest: None,
+            reviewer_independence: None,
+        }
+    }
+
+    /// The approval decision detail carrying the named contract gates.
+    fn approval_gate_decision_detail(engine: &MissionEngine) -> String {
+        EventLog::read_events(&engine.paths.events_file())
+            .unwrap()
+            .iter()
+            .find_map(|e| match &e.kind {
+                EventKind::OrchestratorDecision {
+                    detail: Some(detail),
+                    ..
+                } if detail.contains("named contract gates") => Some(detail.clone()),
+                _ => None,
+            })
+            .expect("approval records the named contract gates")
+    }
+
+    /// The gate is advisory: with the host contract shell forced to cmd, a
+    /// contract using `$NAME` still approves, and both the decision and the
+    /// committed plan.md name the failing gate and the assertion.
+    #[tokio::test]
+    async fn approval_host_shell_records_failing_gate_naming_assertion() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.contract_shell_override = Some(crate::contract_shell::HostShell::cmd());
+
+        engine
+            .approve_plan(approval_host_shell_plan())
+            .expect("an advisory gate never refuses approval");
+
+        let detail = approval_gate_decision_detail(&engine);
+        assert!(detail.contains("host-shell-syntax: FAIL"), "{detail}");
+        assert!(detail.contains("[a9]"), "{detail}");
+        let plan_md = std::fs::read_to_string(engine.paths().plan_md_file()).unwrap();
+        assert!(plan_md.contains("host-shell-syntax: FAIL"), "{plan_md}");
+        assert!(plan_md.contains("[a9]"), "{plan_md}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn approval_host_shell_passes_under_sh() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> = Arc::new(crate::backend_mock::MockBackend::new());
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        engine.approve_plan(approval_host_shell_plan()).unwrap();
+
+        let detail = approval_gate_decision_detail(&engine);
+        assert!(detail.contains("host-shell-syntax: PASS"), "{detail}");
+        let plan_md = std::fs::read_to_string(engine.paths().plan_md_file()).unwrap();
+        assert!(plan_md.contains("host-shell-syntax: PASS"), "{plan_md}");
     }
 
     #[tokio::test]

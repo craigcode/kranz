@@ -8116,7 +8116,14 @@ async fn gate_result_events_record_the_approval_ladder() {
                         .as_str()
                         .unwrap()
                         .to_string(),
-                    artefact_ref.clone(),
+                    // host-shell-syntax names the shell it was judged
+                    // against, an absolute path on Windows: compare the
+                    // stable part.
+                    artefact_ref
+                        .split(" (judged against ")
+                        .next()
+                        .unwrap()
+                        .to_string(),
                 ))
             }
             _ => None,
@@ -8138,14 +8145,20 @@ async fn gate_result_events_record_the_approval_ladder() {
                 "contract gate wrong-polarity".to_string()
             ),
             (
-                "passes-on-base".to_string(),
+                "host-shell-syntax".to_string(),
                 2,
+                "pass".to_string(),
+                "contract gate host-shell-syntax".to_string()
+            ),
+            (
+                "passes-on-base".to_string(),
+                3,
                 "fail".to_string(),
                 "contract gate passes-on-base".to_string()
             ),
             (
                 "env-sensitive".to_string(),
-                3,
+                4,
                 "pass".to_string(),
                 "contract gate env-sensitive".to_string()
             ),
@@ -8264,7 +8277,8 @@ async fn gate_result_events_record_the_final_gate_ladder() {
         vec![
             ("vacuous-filter".to_string(), 0, "pass".to_string()),
             ("wrong-polarity".to_string(), 1, "fail".to_string()),
-            ("env-sensitive".to_string(), 2, "pass".to_string()),
+            ("host-shell-syntax".to_string(), 2, "pass".to_string()),
+            ("env-sensitive".to_string(), 3, "pass".to_string()),
         ],
         "the final-gate floor, in pipeline order, passes and failures alike"
     );

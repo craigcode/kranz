@@ -259,6 +259,20 @@ read access, rejection of a tampered worktree Git pointer, hard-offline
 drive-root DACL stability after the explicit host-preparation baseline. The
 resolver is enabled only behind that exact production path.
 
+Contract commands under the AppContainer gate posture run through `cmd.exe`,
+which receives the command as `/S /C "<command>"` with no escaping added.
+Uncontained contract commands use Git for Windows' `sh` when it resolves
+outside every worker-writable root. Whether that `sh` can run inside the
+AppContainer wrap is not yet known. The Windows CI lane records it: the test
+`windows_contract_shell_appcontainer_sh_receipt` asserts the contained path is
+`cmd.exe`, then attempts `sh` inside the same unchanged posture and prints one
+line, `KRANZ_WINDOWS_SH_CONTAINED=pass` or `KRANZ_WINDOWS_SH_CONTAINED=fail:
+<reason>`. The attempt adds no root, ACL grant, capability or `PATH` entry, and
+its outcome does not fail the job. A follow-up may switch the contained
+contract lane to `sh` in `contract_shell::select_shell` once the line reads
+`pass`; if it reads `fail`, the reason decides whether a narrower read grant is
+worth a separate decision.
+
 Honest constraints remain. Agent backends must resolve to a native `.exe`;
 batch shims are refused because forwarding model-generated arguments through
 `cmd.exe` would add a command-injection surface. `fs+net` is fully offline,

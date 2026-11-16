@@ -1,20 +1,17 @@
-//! Pure types and selection logic for the Windows contract-shell decision.
+//! Which shell runs a validation-contract command, and how it is chosen.
 //!
-//! [`crate::command_exec::shell_argv`] bottoms out every contract/gate
-//! command on `cmd /C` on Windows and `sh -c` elsewhere. On Windows, when
-//! the gate posture is uncontained, validation-contract commands should
-//! instead run under the POSIX `sh` Git for Windows ships at
-//! `<GitRoot>\usr\bin\sh.exe` — kranz already requires Git, so that binary
-//! is always present once Git is. This module builds the types and the pure
-//! selection/resolution logic only; it is NOT wired into execution (a later
-//! feature does that), and it must not change `shell_argv` or any
-//! `GateSandbox` arm.
+//! [`crate::command_exec::shell_argv`] runs every repo-authored command
+//! (merge gates, workspace hooks, external and pack gates) through `cmd` on
+//! Windows and `sh -c` elsewhere. Contract commands are authored in POSIX
+//! syntax, so on Windows, when the gate posture is uncontained, they run
+//! under the POSIX `sh` Git for Windows ships at `<GitRoot>\usr\bin\sh.exe`
+//! instead. kranz already requires Git, so that binary is normally present.
+//! The contained (AppContainer) contract path stays on `cmd` until a CI
+//! receipt proves `sh` runs inside the wrap; see [`select_shell`].
 //!
-//! Not cfg-gated so its tests run on macOS and Linux too.
-//!
-//! Nothing outside this module calls these yet — the wiring lands in a
-//! later feature — so everything here is allowed to look unused for now.
-#![allow(dead_code)]
+//! The selection and path-resolution logic is pure and not cfg-gated, so
+//! its tests run on macOS and Linux too. Only the Git discovery is
+//! Windows-only.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -25,15 +22,6 @@ pub(crate) enum ShellKind {
     Cmd,
 }
 
-impl ShellKind {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            ShellKind::Sh => "sh",
-            ShellKind::Cmd => "cmd",
-        }
-    }
-}
-
 /// The shell a lane resolved to, recorded against the command it ran.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostShell {
@@ -42,6 +30,23 @@ pub(crate) struct HostShell {
 }
 
 impl HostShell {
+    /// The bare `sh` every Unix lane runs under.
+    pub(crate) fn bare_sh() -> Self {
+        HostShell {
+            kind: ShellKind::Sh,
+            program: PathBuf::from("sh"),
+        }
+    }
+
+    /// `cmd`, resolved by the platform the way [`crate::command_exec`]
+    /// already resolves it.
+    pub(crate) fn cmd() -> Self {
+        HostShell {
+            kind: ShellKind::Cmd,
+            program: PathBuf::from("cmd"),
+        }
+    }
+
     /// Human-readable record of which shell ran a command. On Unix the
     /// program is always the bare `sh`, so the label is exactly `sh`. A
     /// discovered Windows sh labels with its absolute path so the record is
@@ -97,26 +102,17 @@ pub(crate) struct HostFacts {
 ///   `Cmd`, with program `cmd`, matching today's resolution.
 pub(crate) fn select_shell(lane: ShellLane, facts: &HostFacts) -> HostShell {
     if !facts.windows {
-        return HostShell {
-            kind: ShellKind::Sh,
-            program: PathBuf::from("sh"),
-        };
+        return HostShell::bare_sh();
     }
     if lane == ShellLane::Repo || facts.contained {
-        return HostShell {
-            kind: ShellKind::Cmd,
-            program: PathBuf::from("cmd"),
-        };
+        return HostShell::cmd();
     }
     match &facts.posix_sh {
         Some(p) => HostShell {
             kind: ShellKind::Sh,
             program: p.clone(),
         },
-        None => HostShell {
-            kind: ShellKind::Cmd,
-            program: PathBuf::from("cmd"),
-        },
+        None => HostShell::cmd(),
     }
 }
 
@@ -125,6 +121,7 @@ pub(crate) fn select_shell(lane: ShellLane, facts: &HostFacts) -> HostShell {
 /// comparison are stripped the same way) and lowercase on Windows, where
 /// path comparison is case-insensitive. A no-op off Windows beyond the
 /// prefix strip, which also never fires off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn comparable_path_components(path: &Path) -> Vec<String> {
     let rendered = path.as_os_str().to_string_lossy();
     let stripped = rendered.strip_prefix(r"\\?\").unwrap_or(&rendered);
@@ -152,6 +149,7 @@ fn comparable_path_components(path: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn path_is_within(root: &[String], candidate: &[String]) -> bool {
     candidate.len() >= root.len() && candidate[..root.len()] == root[..]
 }
@@ -166,6 +164,7 @@ fn path_is_within(root: &[String], candidate: &[String]) -> bool {
 /// Windows, with the `\\?\` verbatim prefix stripped consistently on both
 /// sides so a canonicalized root compares correctly against a canonicalized
 /// candidate.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn posix_sh_resolution(
     candidates: &[PathBuf],
     forbidden_roots: &[PathBuf],

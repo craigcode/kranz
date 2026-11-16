@@ -499,6 +499,7 @@ impl MissionEngine {
                 &contract,
                 None,
                 self.active_root(),
+                &contract_shell,
             );
             let floor_gate_count = pipeline.len();
             for gate in pack_gates {

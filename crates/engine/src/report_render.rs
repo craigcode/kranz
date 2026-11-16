@@ -239,6 +239,8 @@ pub fn render_plan_markdown(
         let mut shells: Vec<&str> = contract_lint
             .results
             .iter()
+            // A command that never ran has no shell to name.
+            .filter(|r| r.outcome != contract_lint::AssertionLintOutcome::NotLinted)
             .map(|r| r.shell_label.as_str())
             .collect();
         shells.sort_unstable();
