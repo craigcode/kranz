@@ -2164,7 +2164,8 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_contract_shell_cmd_keeps_inner_double_quotes() {
-        let env: HashMap<String, String> = std::collections::HashMap::new();
+        let env = crate::runner::contract_env(None);
+        assert!(env.contains_key("PATH"), "contract env must carry PATH");
         let dir = tempfile::tempdir().unwrap();
         let (code, output) = run_shell_command_with_timeout_env(
             dir.path(),
