@@ -58,17 +58,6 @@ fn file_exists_cmd(path: &str) -> String {
     }
 }
 
-/// Portable "write `text` as one line into `path`". `printf` is a POSIX binary
-/// cmd.exe cannot run; `echo` is a builtin in both shells. cmd would carry the
-/// space before `>` into the file, so close it up there.
-fn write_line_cmd(text: &str, path: &str) -> String {
-    if cfg!(windows) {
-        format!("echo {text}>{path}")
-    } else {
-        format!("echo {text} > {path}")
-    }
-}
-
 /// Portable "succeed iff `path` exists, then run `then`".
 fn if_file_exists_cmd(path: &str, then: &str) -> String {
     if cfg!(windows) {
@@ -88,7 +77,8 @@ fn file_exists_contract(path: &str) -> String {
     format!("test -f {path}")
 }
 
-/// Contract-lane variant of `write_line_cmd`, for the same reason.
+/// Contract-lane variant that writes a line via POSIX `sh`, for the same
+/// reason as `file_exists_contract`.
 fn write_line_contract(text: &str, path: &str) -> String {
     format!("echo {text} > {path}")
 }
