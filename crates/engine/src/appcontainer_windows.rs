@@ -132,6 +132,15 @@ struct LaunchPlan {
     /// the operator-owned, read-only `RUSTUP_HOME`.
     #[serde(default)]
     rustup_toolchain: Option<PathBuf>,
+    /// The cmd.exe raw command-tail (`/S /C "<command>"`) for the gate's
+    /// uncontained-equivalent AppContainer cmd launch, handed to the child
+    /// verbatim instead of `args` — the AppContainer counterpart to
+    /// `command_exec::apply_raw_tail`. `#[serde(default)]` keeps plans
+    /// written before this field existed readable. Mutually exclusive with a
+    /// non-empty `args` (checked in `run_plan`): a plan can carry an argv OR
+    /// a raw tail, never both.
+    #[serde(default)]
+    raw_command_tail: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2807,6 +2816,7 @@ pub(crate) fn prepare_launch_in_context(
     program: &Path,
     args: &[String],
     env: &HashMap<String, String>,
+    raw_command_tail: Option<&str>,
 ) -> Result<PreparedCommand> {
     let mut slot = context.0.lock().map_err(|_| {
         EngineError::Backend("AppContainer gate launch context mutex was poisoned".to_string())
@@ -2821,7 +2831,7 @@ pub(crate) fn prepare_launch_in_context(
         .as_mut()
         .expect("AppContainer gate lease was initialized above");
     let sid = derive_profile_sid(&lease.profile_name)?;
-    prepare_launch_for_lease(lease, sid.0, inputs, program, args, env)
+    prepare_launch_for_lease(lease, sid.0, inputs, program, args, env, raw_command_tail)
 }
 
 /// Build the trusted helper command and apply a unique session launch's
@@ -2837,7 +2847,8 @@ pub(crate) fn prepare_launch(
     let rustup_toolchain = resolve_installed_rustup_toolchain(&inputs.session_cwd, env);
     let (profile_name, sid) = create_profile(inputs.enforce == crate::types::SandboxEnforce::Fs)?;
     let mut lease = new_lease(profile_name, rustup_toolchain);
-    let prepared = match prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env) {
+    let prepared = match prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env, None)
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             // Setup already created a disposable profile and may have applied
@@ -2861,7 +2872,13 @@ fn prepare_launch_for_lease(
     program: &Path,
     args: &[String],
     env: &HashMap<String, String>,
+    raw_command_tail: Option<&str>,
 ) -> Result<PreparedCommand> {
+    if raw_command_tail.is_some() && !args.is_empty() {
+        return Err(EngineError::Backend(
+            "AppContainer launch cannot carry both a raw command tail and an argv".to_string(),
+        ));
+    }
     std::fs::create_dir_all(&inputs.tmpdir).map_err(|error| {
         EngineError::Backend(format!(
             "failed to create AppContainer private scratch {}: {error}",
@@ -2988,6 +3005,7 @@ fn prepare_launch_for_lease(
         allow_network: inputs.enforce == crate::types::SandboxEnforce::Fs,
         path: Some(path),
         rustup_toolchain: lease.rustup_toolchain.clone(),
+        raw_command_tail: raw_command_tail.map(str::to_string),
     };
     let plan_path = inputs.tmpdir.join(format!(
         "appcontainer-plan-{}.json",
@@ -3320,6 +3338,19 @@ fn command_line(executable: &Path, args: &[String]) -> Vec<u16> {
     out
 }
 
+/// Sibling to [`command_line`] for the raw-tail AppContainer gate path: the
+/// executable is quoted exactly as `command_line` would quote it, but `tail`
+/// is appended VERBATIM — no quote escaping at all, matching
+/// `command_exec::apply_raw_tail`'s `raw_arg` hand-off for the uncontained
+/// cmd.exe path. Used only when [`LaunchPlan::raw_command_tail`] is set.
+fn raw_tail_command_line(executable: &Path, tail: &str) -> Vec<u16> {
+    let mut out = quote_arg(executable.as_os_str(), true);
+    out.push(b' ' as u16);
+    out.extend(tail.encode_utf16());
+    out.push(0);
+    out
+}
+
 /// Convert a canonical local-drive path (`\\?\D:\...`) into the ordinary DOS
 /// spelling accepted by cmd.exe as a current directory. Keep UNC/device paths
 /// untouched: collapsing `\\?\UNC\...` would change their meaning.
@@ -3516,7 +3547,17 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
     // final process boundary.
     let process_cwd = local_dos_path(&plan.cwd);
     let cwd = wide(process_cwd.as_os_str());
-    let mut line = command_line(&plan.executable, &plan.args);
+    let mut line = match &plan.raw_command_tail {
+        Some(tail) => {
+            if !plan.args.is_empty() {
+                return Err(EngineError::Backend(
+                    "AppContainer plan carries both a raw command tail and an argv".to_string(),
+                ));
+            }
+            raw_tail_command_line(&plan.executable, tail)
+        }
+        None => command_line(&plan.executable, &plan.args),
+    };
     let environment = environment_block(
         &process_cwd,
         plan.path.as_deref(),
@@ -5156,6 +5197,32 @@ mod tests {
             rendered,
             r#""C:\Windows\System32\cmd.exe" /C "set X=1&& echo ok""#
         );
+    }
+
+    #[test]
+    fn raw_tail_command_line_keeps_inner_quotes_verbatim_with_no_inserted_backslashes() {
+        let command = r#"prog -e "a 'b' c""#;
+        let tail = crate::command_exec::cmd_raw_tail(command);
+        let encoded = raw_tail_command_line(Path::new("cmd"), &tail);
+        let rendered = String::from_utf16(&encoded[..encoded.len() - 1])
+            .expect("the command line is valid UTF-16");
+        assert_eq!(rendered, r#""cmd" /S /C "prog -e "a 'b' c"""#);
+        assert!(!rendered.contains('\\'));
+    }
+
+    #[test]
+    fn launch_plan_without_raw_command_tail_deserializes_to_none() {
+        let json = r#"{
+            "version": 1,
+            "profileName": "kranz.test",
+            "executable": "C:\\Windows\\System32\\cmd.exe",
+            "args": ["/C", "echo hi"],
+            "cwd": "C:\\",
+            "allowNetwork": false
+        }"#;
+        let plan: LaunchPlan =
+            serde_json::from_str(json).expect("a plan missing rawCommandTail must deserialize");
+        assert!(plan.raw_command_tail.is_none());
     }
 
     fn populate_toolchain_fixture(

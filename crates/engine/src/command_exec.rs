@@ -712,9 +712,15 @@ impl GateSandbox {
             } => {
                 #[cfg(windows)]
                 {
-                    let (program, args) = shell_argv(command);
+                    let (program, _args) = shell_argv(command);
+                    let raw_tail = cmd_raw_tail(command);
                     let prepared = crate::appcontainer_windows::prepare_launch_in_context(
-                        context, inputs, &program, &args, env,
+                        context,
+                        inputs,
+                        &program,
+                        &[],
+                        env,
+                        Some(&raw_tail),
                     )?;
                     Ok(WrappedCommand {
                         program: prepared.program,
@@ -2179,6 +2185,53 @@ mod tests {
         assert!(
             output.contains("KRANZ_QUOTES_OK"),
             "expected the marker to survive cmd.exe's quoting: {output}"
+        );
+    }
+
+    /// The AppContainer gate path had the same quoting bug as the uncontained
+    /// cmd path: the trusted helper rebuilt the command line with
+    /// `command_line`/`quote_arg`, turning inner `"` into `\"`. This drives a
+    /// real child through a resolved `GateSandbox::AppContainer` posture (the
+    /// same resolution as
+    /// `windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed`)
+    /// and must fail (not skip) if `node` is missing.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_appcontainer_cmd_keeps_inner_double_quotes() {
+        let repo = tempfile::tempdir().unwrap();
+        let mission = repo.path().join(".kranz").join("missions").join("m-x");
+        std::fs::create_dir_all(&mission).unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let process = fs_sandbox_config(crate::types::SandboxEnforce::Fs);
+        let resolution = resolve_gate_sandbox_target(
+            &process,
+            repo.path(),
+            &mission,
+            scratch.path(),
+            scratch.path(),
+            "windows",
+            false,
+            None,
+            None,
+        )
+        .expect("Windows process gate enforcement resolves");
+        let mut sandbox = resolution.sandbox;
+        let env = crate::runner::contract_env(None);
+        let (code, output) = run_shell_command_sandboxed_with_code(
+            repo.path(),
+            r#"node -e "process.stdout.write('KRANZ_QUOTES_OK')""#,
+            Duration::from_secs(60),
+            &env,
+            &sandbox,
+        )
+        .await;
+        sandbox
+            .cleanup()
+            .expect("AppContainer gate cleanup must succeed");
+        assert_eq!(code, Some(0), "node must exit 0: {output}");
+        assert!(
+            output.contains("KRANZ_QUOTES_OK"),
+            "expected the marker to survive the AppContainer helper's quoting: {output}"
         );
     }
 
