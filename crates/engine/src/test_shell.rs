@@ -56,6 +56,27 @@ pub(crate) fn write_line(text: &str, path: &str) -> String {
     }
 }
 
+/// Block for at least `millis` under the cmd-aware Repo-lane shell, without
+/// relying on a `sleep` binary (stock Windows ships none). Same
+/// copied-test-binary timer as [`contract::sleep_millis`], invoked with
+/// cmd's `set VAR=value&&` prefix and a `.\` relative path instead of sh's
+/// `VAR=value prog` and `./`.
+pub(crate) fn sleep_millis(cwd: &std::path::Path, millis: u64) -> String {
+    if cfg!(windows) {
+        std::fs::copy(
+            std::env::current_exe().unwrap(),
+            cwd.join("kranz-sleep-fixture.exe"),
+        )
+        .unwrap();
+        format!(
+            "set KRANZ_TEST_SLEEP_MILLIS={millis}&&.\\kranz-sleep-fixture.exe --ignored --exact test_shell::sleep_fixture --nocapture"
+        )
+    } else {
+        let seconds = millis as f64 / 1000.0;
+        format!("sleep {seconds}")
+    }
+}
+
 /// Contract-lane fixtures: the validation-contract commands (validation
 /// rounds, final-gate command assertions, the approval contract lint) that
 /// [`crate::contract_shell::select_shell`] resolves to POSIX `sh` — on Unix

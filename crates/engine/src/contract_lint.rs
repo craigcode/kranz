@@ -348,18 +348,30 @@ pub(crate) fn run_contract_lint_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_shell::contract::sleep_millis;
+    use crate::contract_shell::{HostShell, ShellKind, ShellLane};
     use crate::test_shell::{FAIL, SUCCEED};
 
-    fn test_sh_shell() -> crate::contract_shell::HostShell {
-        crate::contract_shell::HostShell {
-            kind: crate::contract_shell::ShellKind::Sh,
-            program: std::path::PathBuf::from("sh"),
+    /// Resolve the shell this test's contract-lane commands actually run
+    /// under, exactly the way production does: on Unix this is always bare
+    /// `sh`; on Windows it is Git's absolute `sh` (or `cmd`, if Git's `sh`
+    /// cannot be resolved outside `roots`).
+    fn resolve_test_shell(roots: &[&Path]) -> HostShell {
+        let roots: Vec<std::path::PathBuf> = roots.iter().map(|p| p.to_path_buf()).collect();
+        crate::contract_shell::resolve_contract_shell(ShellLane::Contract, false, &roots)
+    }
+
+    /// A command that blocks for at least `millis`, spelled for whichever
+    /// shell `shell` resolved to.
+    fn sleep_for(shell: &HostShell, cwd: &Path, millis: u64) -> String {
+        match shell.kind {
+            ShellKind::Sh => crate::test_shell::contract::sleep_millis(cwd, millis),
+            ShellKind::Cmd => crate::test_shell::sleep_millis(cwd, millis),
         }
     }
 
     fn run_lint(cwd: &Path, base_sha: Option<&str>, contract: &[Assertion]) -> ContractLintReport {
         let scratch = tempfile::tempdir().unwrap();
+        let shell = resolve_test_shell(&[cwd, scratch.path()]);
         run_contract_lint(
             cwd,
             scratch.path(),
@@ -368,7 +380,7 @@ mod tests {
             true,
             &[],
             &crate::command_exec::GateSandbox::Disabled,
-            &test_sh_shell(),
+            &shell,
         )
     }
 
@@ -532,9 +544,10 @@ mod tests {
     #[test]
     fn approval_lint_runner_times_out_slow_command() {
         let scratch = tempfile::tempdir().unwrap();
+        let shell = resolve_test_shell(&[scratch.path()]);
         let contract = vec![command_assertion(
             "a1",
-            &sleep_millis(scratch.path(), 5_000),
+            &sleep_for(&shell, scratch.path(), 5_000),
         )];
         let start = Instant::now();
         let report = run_contract_lint_with_limits(
@@ -547,7 +560,7 @@ mod tests {
             Duration::from_secs(600),
             &[],
             &crate::command_exec::GateSandbox::Disabled,
-            &test_sh_shell(),
+            &shell,
         );
         let elapsed = start.elapsed();
 
@@ -569,8 +582,9 @@ mod tests {
             .prefix("kranz timer's ")
             .tempdir()
             .unwrap();
+        let shell = resolve_test_shell(&[scratch.path()]);
         let contract = vec![
-            command_assertion("a1", &sleep_millis(scratch.path(), 200)),
+            command_assertion("a1", &sleep_for(&shell, scratch.path(), 200)),
             command_assertion("a2", SUCCEED),
             command_assertion("a3", FAIL),
         ];
@@ -585,7 +599,7 @@ mod tests {
             Duration::from_millis(50),
             &[],
             &crate::command_exec::GateSandbox::Disabled,
-            &test_sh_shell(),
+            &shell,
         );
 
         assert_eq!(report.results.len(), 3);

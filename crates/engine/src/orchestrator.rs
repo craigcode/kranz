@@ -16444,10 +16444,11 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let env = HashMap::new();
         let sandbox = crate::command_exec::GateSandbox::Disabled;
-        let shell = crate::contract_shell::HostShell {
-            kind: crate::contract_shell::ShellKind::Sh,
-            program: std::path::PathBuf::from("sh"),
-        };
+        let shell = crate::contract_shell::resolve_contract_shell(
+            crate::contract_shell::ShellLane::Contract,
+            false,
+            &[root.path().to_path_buf()],
+        );
         let rendered = MissionEngine::run_contract_commands_for_validation(
             &contract,
             root.path(),
@@ -16458,7 +16459,7 @@ pub(crate) mod tests {
         .await
         .expect("one command assertion renders a line");
         assert!(
-            rendered.contains("(shell: sh)"),
+            rendered.contains(&format!("(shell: {})", shell.label())),
             "expected a shell label on the validation-round line: {rendered}"
         );
     }
