@@ -2626,7 +2626,10 @@ mod tests {
             matches!(sandbox, GateSandbox::AppContainer { .. }),
             "expected the resolved sandbox to be AppContainer, not a weaker posture"
         );
-        let env = sanitized_gate_env();
+        // The AppContainer launch needs the profile tuple redirected into a
+        // writable root, as `run_bounded_gate_command` does in production.
+        let mut env = sanitized_gate_env();
+        crate::agent_env::redirect_windows_profile_env(&mut env, scratch.path());
         assert!(env.contains_key("PATH"), "contract env must carry PATH");
         let (code, output) = run_shell_command_sandboxed_with_code(
             repo.path(),
@@ -2716,7 +2719,8 @@ mod tests {
             shell.label()
         );
 
-        let env = sanitized_gate_env();
+        let mut env = sanitized_gate_env();
+        crate::agent_env::redirect_windows_profile_env(&mut env, scratch.path());
         let (code, output) = run_contract_command_sandboxed_with_code(
             repo.path(),
             r#"node -e "process.stdout.write('KRANZ_QUOTES_OK')""#,
