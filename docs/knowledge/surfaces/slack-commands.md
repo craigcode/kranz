@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-16
+last_verified: 2026-11-17
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -17,6 +17,8 @@ verified_against:
   - crates/engine/src/planning.rs
   - 'command: cargo test -p kranz-slack'
 ---
+
+Rechecked 2026-11-17 (UTC) against the temp-directory cleanup: in `crates/server/src/host.rs` the `ask` session's scratch home is removed when the session ends, and the abandon and delete routes now also remove the mission's worktrees that hold only committed files, through `mission_catalog`. Commands, routing and authorization are unchanged.
 
 Rechecked 2026-11-16 (UTC) against the test temp-directory cleanup: only the test modules of `catalog.rs`, `bridge.rs` and `host.rs` changed, so that their temp directories are removed when the test or the test process ends. Commands, routing and authorization are unchanged.
 

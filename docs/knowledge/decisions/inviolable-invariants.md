@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-16
+last_verified: 2026-11-17
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-17 (UTC) against the temp-directory cleanup in `orchestrator.rs`, `git_ops.rs`, `event_log.rs`, `sandbox_container.rs` and `mount_proof.rs`. `kranz abandon` and `kranz clean` now remove a terminal mission's leftover worktrees, but only one that holds no modified, untracked or ignored file, with `git worktree remove` without `--force` and without deleting a branch, so a worktree kept for inspection or holding an uncommitted repair is still never destroyed, and the primary checkout is not touched. They remove none when the mission lock was taken over or a lock file is still present; `EventLog::replaced_an_existing_lock` is a read of the lock generation and changes nothing about how a lock is taken or stolen. In `sandbox_container.rs` the no-follow remover keeps its descriptor-relative walk; it now carries on past an entry it cannot remove and returns the first error, repairs a directory's mode only without following a link on every Unix (the Linux call no longer follows one), and has a variant that checks the type and owner of the top directory on the open descriptor, which session scratch homes use. The empty user git config is still a regular file the engine creates and owns for the life of the process; the `kranz` binary removes it on exit only where no other user can take its name. The `mount_proof.rs` change is one test that restores a directory's mode if it fails. All documented invariants hold.
 
 Rechecked 2026-11-16 (UTC) against the Windows first-run fixes: the lock probe on Windows reports Dead only when no process has the pid or the process has exited, and any other failure stays Unknown, so the rule that uncertainty never reports Dead holds. A steal there is serialized by a named mutex. The review packet's new JSON fields are observations and grant nothing. `kranz exec` still pushes only through `--push`. No invariant changed.
 
