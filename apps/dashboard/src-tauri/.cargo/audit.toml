@@ -8,5 +8,10 @@
 # Remove the patch and this disposition when compatible upstream packages ship
 # the fix or Tauri leaves GTK 3. See vendor/README.md for provenance.
 # RUSTSEC-2024-0370 is resolved by removing proc-macro-error and its attribute
-# crate; no maintenance advisory is ignored.
-ignore = ["RUSTSEC-2024-0429"]
+# crate.
+# RUSTSEC-2026-0543 (issued 2026-11-17) is the one maintenance advisory
+# ignored: informational, chrono is unmaintained, with no vulnerability
+# reported and no patched version. Waived by the operator on 2026-11-17, with
+# the same entry in the root deny.toml. Ticket `replace-chrono` does the
+# replacement and removes both entries.
+ignore = ["RUSTSEC-2024-0429", "RUSTSEC-2026-0543"]
