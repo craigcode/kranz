@@ -13,6 +13,7 @@
 
 use crate::backend::{AgentBackend, AgentEvent, PromptMode, SessionExit, SessionSpec};
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Outcome of driving a trivial session under a candidate worker env.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +48,13 @@ fn has_auth_failure_signature(text: &str) -> bool {
 
 /// Build the minimal single-shot [`SessionSpec`] used to probe whether
 /// `candidate_env` lets the worker's `claude` CLI authenticate: a tiny prompt
-/// asking the model to reply with a single token, cwd-independent (auth is
-/// what's under test, not repo state).
-fn probe_spec(candidate_env: &HashMap<String, String>) -> SessionSpec {
+/// asking the model to reply with a single token. Auth is what is under
+/// test, not repo state, so the session runs in `cwd`, a directory the caller
+/// owns and removes. It must not be the shared temp directory: anything the
+/// session wrote with a relative path would be left there.
+fn probe_spec(candidate_env: &HashMap<String, String>, cwd: &Path) -> SessionSpec {
     SessionSpec {
-        cwd: std::env::temp_dir(),
+        cwd: cwd.to_path_buf(),
         prompt: PromptMode::SingleShot(
             "Reply with the single word: ack. Nothing else.".to_string(),
         ),
@@ -75,15 +78,20 @@ fn probe_spec(candidate_env: &HashMap<String, String>) -> SessionSpec {
     }
 }
 
-/// Drive a trivial session under `candidate_env` via `backend` and classify
-/// whether the worker's `claude` CLI can authenticate under it. Never panics;
-/// any spawn/IO error or ambiguous outcome yields [`AuthVerdict::Inconclusive`]
-/// rather than a guess in either direction.
+/// Drive a trivial session under `candidate_env` via `backend`, with `cwd` as
+/// its working directory, and classify whether the worker's `claude` CLI can
+/// authenticate under it. Never panics; any spawn/IO error or ambiguous
+/// outcome yields [`AuthVerdict::Inconclusive`] rather than a guess in either
+/// direction.
 pub async fn verify_worker_auth(
     backend: &dyn AgentBackend,
     candidate_env: &HashMap<String, String>,
+    cwd: &Path,
 ) -> AuthVerdict {
-    let spec = probe_spec(candidate_env);
+    let spec = probe_spec(candidate_env, cwd);
+    // Dropped after `session`: removes anything the backend put under the
+    // probe session's own scratch root.
+    let _scratch = crate::session_scratch::SessionScratch::for_session(&spec.session_id);
 
     let mut session = match backend.start(spec).await {
         Ok(session) => session,
@@ -173,9 +181,10 @@ mod tests {
 
     #[tokio::test]
     async fn verify_worker_auth_normal_reply_is_authenticated() {
+        let cwd = tempfile::tempdir().unwrap();
         let backend = MockBackend::with_scripts(vec![MockScript::single_shot("ack")]);
 
-        let verdict = verify_worker_auth(&backend, &candidate_env()).await;
+        let verdict = verify_worker_auth(&backend, &candidate_env(), cwd.path()).await;
 
         assert_eq!(verdict, AuthVerdict::Authenticated);
         // The candidate env is what was actually handed to the backend.
@@ -185,10 +194,15 @@ mod tests {
             started[0].env.get("HOME").map(String::as_str),
             Some("/tmp/kranz-scratch-home")
         );
+        // The probe runs in the directory it was given, never in the shared
+        // temp directory.
+        assert_eq!(started[0].cwd, cwd.path());
+        assert_ne!(started[0].cwd, std::env::temp_dir());
     }
 
     #[tokio::test]
     async fn verify_worker_auth_not_logged_in_zero_activity_is_unauthenticated() {
+        let cwd = tempfile::tempdir().unwrap();
         let script = MockScript {
             events: vec![
                 mock_init("mock-session"),
@@ -198,13 +212,14 @@ mod tests {
         };
         let backend = MockBackend::with_scripts(vec![script]);
 
-        let verdict = verify_worker_auth(&backend, &candidate_env()).await;
+        let verdict = verify_worker_auth(&backend, &candidate_env(), cwd.path()).await;
 
         assert_eq!(verdict, AuthVerdict::Unauthenticated);
     }
 
     #[tokio::test]
     async fn verify_worker_auth_zero_activity_zero_cost_is_unauthenticated() {
+        let cwd = tempfile::tempdir().unwrap();
         let mut zero_cost_error = mock_result_error("session ended");
         if let AgentEvent::Result { cost_usd, .. } = &mut zero_cost_error {
             *cost_usd = Some(0.0);
@@ -215,23 +230,25 @@ mod tests {
         };
         let backend = MockBackend::with_scripts(vec![script]);
 
-        let verdict = verify_worker_auth(&backend, &candidate_env()).await;
+        let verdict = verify_worker_auth(&backend, &candidate_env(), cwd.path()).await;
 
         assert_eq!(verdict, AuthVerdict::Unauthenticated);
     }
 
     #[tokio::test]
     async fn verify_worker_auth_backend_start_error_is_inconclusive() {
+        let cwd = tempfile::tempdir().unwrap();
         // No scripts queued: MockBackend::start errors with "no script queued".
         let backend = MockBackend::new();
 
-        let verdict = verify_worker_auth(&backend, &candidate_env()).await;
+        let verdict = verify_worker_auth(&backend, &candidate_env(), cwd.path()).await;
 
         assert_eq!(verdict, AuthVerdict::Inconclusive);
     }
 
     #[tokio::test]
     async fn verify_worker_auth_ambiguous_success_with_no_text_is_inconclusive() {
+        let cwd = tempfile::tempdir().unwrap();
         // Successful result but no assistant text at all: ambiguous, not a
         // confident Authenticated call.
         let script = MockScript {
@@ -240,7 +257,7 @@ mod tests {
         };
         let backend = MockBackend::with_scripts(vec![script]);
 
-        let verdict = verify_worker_auth(&backend, &candidate_env()).await;
+        let verdict = verify_worker_auth(&backend, &candidate_env(), cwd.path()).await;
 
         assert_eq!(verdict, AuthVerdict::Inconclusive);
     }

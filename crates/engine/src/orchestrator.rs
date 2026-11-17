@@ -1139,26 +1139,51 @@ impl MissionEngine {
         }
         let real_home = std::env::var_os("HOME").map(PathBuf::from);
         let real_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-        let scratch_root = crate::backend_claude::scratch_home_root(&format!(
-            "preflight-{}",
-            self.state.mission.id
+        // The preflight home holds a copy of the credential file. The
+        // verdict is cached in memory and the home is seeded again by the
+        // next engine that needs one, so it is removed as soon as the
+        // verdict is known, whatever the verdict is. The name ends in a
+        // fresh UUID: mission ids are only unique within one repository, and
+        // an engine in another repository with the same mission id must not
+        // have its home removed under its running probe.
+        let preflight_scratch = crate::session_scratch::SessionScratch::for_session(&format!(
+            "preflight-{}-{}",
+            self.state.mission.id,
+            uuid::Uuid::new_v4()
         ));
-        let verdict = match crate::backend_claude::seed_worker_scratch_home(
+        let scratch_root = preflight_scratch.path().to_path_buf();
+        let seeded = crate::backend_claude::seed_worker_scratch_home(
             &scratch_root,
             real_home.as_deref(),
             real_config_dir.as_deref(),
-        ) {
-            Ok((home, config_dir)) => {
+        )
+        .and_then(|(home, config_dir)| {
+            // The probe session's working directory: inside the preflight
+            // root and beside `home`, so a relative write by the session
+            // lands here and is removed with the rest.
+            let cwd = scratch_root.join("cwd");
+            std::fs::create_dir_all(&cwd)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o700))?;
+            }
+            Ok((home, config_dir, cwd))
+        });
+        let verdict = match seeded {
+            Ok((home, config_dir, cwd)) => {
                 let mut candidate_env = HashMap::new();
                 candidate_env.insert("HOME".to_string(), home.display().to_string());
                 candidate_env.insert(
                     "CLAUDE_CONFIG_DIR".to_string(),
                     config_dir.display().to_string(),
                 );
-                crate::auth_verify::verify_worker_auth(self.backend.as_ref(), &candidate_env).await
+                crate::auth_verify::verify_worker_auth(self.backend.as_ref(), &candidate_env, &cwd)
+                    .await
             }
             Err(_) => AuthVerdict::Inconclusive,
         };
+        preflight_scratch.remove().await;
         self.worker_auth_verdict = Some(verdict);
         verdict
     }

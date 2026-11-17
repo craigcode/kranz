@@ -2008,6 +2008,28 @@ fn preflight_unauthenticated_script() -> MockScript {
     }
 }
 
+/// The preflight home a probe session ran in: the parent of its working
+/// directory. Asserts that it is a scratch home named for `mission_id`, with
+/// a suffix that keeps two engines holding the same mission id apart.
+fn preflight_home_of(probe: &kranz_engine::backend::SessionSpec, mission_id: &str) -> PathBuf {
+    let home = probe
+        .cwd
+        .parent()
+        .expect("the probe's working directory has a parent")
+        .to_path_buf();
+    let expected_prefix =
+        kranz_engine::backend_claude::scratch_home_root(&format!("preflight-{mission_id}-"));
+    let prefix = expected_prefix.file_name().unwrap().to_str().unwrap();
+    let name = home.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with(prefix) && name.len() > prefix.len(),
+        "the probe's working directory {} must be inside a preflight home named {prefix}<unique>",
+        probe.cwd.display()
+    );
+    assert_eq!(home.parent(), expected_prefix.parent());
+    home
+}
+
 /// Every `SessionSpec` in `specs` whose prompt is the auth-preflight probe
 /// (see `crate::auth_verify::probe_spec`): a single-shot "Reply with the
 /// single word: ack." prompt, distinguishable from every worker/orchestrator
@@ -2087,6 +2109,18 @@ async fn worker_auth_preflight_cached_once_per_mission() {
          how many workers spawn: {:?}",
         specs.iter().map(|s| &s.prompt).collect::<Vec<_>>()
     );
+    // The probe runs in a directory of its own inside the preflight home,
+    // not in the shared temp directory, and the whole preflight home, which
+    // held a copy of the credential file, is gone once the verdict is known.
+    let preflight_home = preflight_home_of(probes[0], engine.mission_id());
+    assert_ne!(probes[0].cwd, std::env::temp_dir());
+    if kranz_engine::session_scratch::REMOVES_SCRATCH_HOMES {
+        assert!(
+            !preflight_home.exists(),
+            "the preflight home {} must be removed after the verdict",
+            preflight_home.display()
+        );
+    }
 
     let workers = worker_specs(&specs);
     assert_eq!(
@@ -2101,6 +2135,15 @@ async fn worker_auth_preflight_cached_once_per_mission() {
              (CLAUDE_CONFIG_DIR deliberately unset — keychain OAuth poison): {:?}",
             spec.env
         );
+        // On both spawn paths a finished worker's scratch home is removed.
+        let home = kranz_engine::backend_claude::scratch_home_root(&spec.session_id);
+        if kranz_engine::session_scratch::REMOVES_SCRATCH_HOMES {
+            assert!(
+                !home.exists(),
+                "worker scratch home {} must be removed when its session ends",
+                home.display()
+            );
+        }
     }
 }
 
@@ -2156,6 +2199,16 @@ async fn worker_auth_both_spawn_paths_gated() {
             1,
             "exactly one preflight session per mission"
         );
+        // Whatever the verdict, the preflight home does not outlive it.
+        let preflight_home =
+            preflight_home_of(preflight_probe_specs(&specs)[0], engine.mission_id());
+        if kranz_engine::session_scratch::REMOVES_SCRATCH_HOMES {
+            assert!(
+                !preflight_home.exists(),
+                "the preflight home {} must be removed after the verdict",
+                preflight_home.display()
+            );
+        }
         let workers = worker_specs(&specs);
         assert_eq!(
             workers.len(),
