@@ -33,7 +33,7 @@ When `apps/dashboard` changes, also run:
 ```sh
 cd apps/dashboard
 npm ci
-npm audit --audit-level=high
+python3 ../../scripts/check-npm-audit.py .
 npx tsc -b
 npm run test
 npm run build

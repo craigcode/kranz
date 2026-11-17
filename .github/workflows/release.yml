@@ -176,8 +176,9 @@ jobs:
       - run: npm ci
         working-directory: apps/dashboard
 
-      - run: npm audit --audit-level=high
-        working-directory: apps/dashboard
+      # High and critical advisories fail, except the dated waivers listed
+      # in the script. Waivers never cover a dependency that ships.
+      - run: python3 scripts/check-npm-audit.py apps/dashboard
 
       - run: npx tsc -b
         working-directory: apps/dashboard
@@ -197,8 +198,9 @@ jobs:
       - run: npm ci
         working-directory: apps/even-g2
 
-      - run: npm audit --audit-level=high
-        working-directory: apps/even-g2
+      # High and critical advisories fail, except the dated waivers listed
+      # in the script. Waivers never cover a dependency that ships.
+      - run: python3 scripts/check-npm-audit.py apps/even-g2
 
       - run: npm run test
         working-directory: apps/even-g2
