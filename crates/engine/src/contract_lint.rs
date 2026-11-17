@@ -68,6 +68,9 @@ pub struct AssertionLint {
     pub command: String,
     pub outcome: AssertionLintOutcome,
     pub output_tail: String,
+    /// The [`crate::contract_shell::HostShell::label`] this command ran
+    /// under.
+    pub shell_label: String,
 }
 
 /// Full lint report for a contract's command assertions.
@@ -115,6 +118,7 @@ impl ContractLintReport {
                     command: a.command.clone()?,
                     outcome: AssertionLintOutcome::NotLinted,
                     output_tail: String::new(),
+                    shell_label: "sh".to_string(),
                 })
             })
             .collect();
@@ -235,14 +239,16 @@ pub(crate) fn containment_usable(
     scratch: &Path,
     base_sha: Option<&str>,
     sandbox: &crate::command_exec::GateSandbox,
+    shell: &crate::contract_shell::HostShell,
 ) -> bool {
     let env = lint_env(scratch, base_sha, &[]);
-    let (code, _) = crate::command_exec::run_shell_command_sandboxed_blocking(
+    let (code, _) = crate::command_exec::run_contract_command_sandboxed_blocking(
         cwd,
         "exit 0",
         Duration::from_secs(30),
         &env,
         sandbox,
+        shell,
     );
     code == Some(0)
 }
@@ -251,6 +257,7 @@ pub(crate) fn containment_usable(
 /// untouched base tree, using the module's default per-command timeout and
 /// overall budget. `passthrough` is the mission config's
 /// `contractEnvPassthrough` (see [`lint_env`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_contract_lint(
     cwd: &Path,
     scratch: &Path,
@@ -259,6 +266,7 @@ pub(crate) fn run_contract_lint(
     tree_clean_at_base: bool,
     passthrough: &[String],
     sandbox: &crate::command_exec::GateSandbox,
+    shell: &crate::contract_shell::HostShell,
 ) -> ContractLintReport {
     run_contract_lint_with_limits(
         cwd,
@@ -270,6 +278,7 @@ pub(crate) fn run_contract_lint(
         OVERALL_BUDGET,
         passthrough,
         sandbox,
+        shell,
     )
 }
 
@@ -287,6 +296,7 @@ pub(crate) fn run_contract_lint_with_limits(
     overall: Duration,
     passthrough: &[String],
     sandbox: &crate::command_exec::GateSandbox,
+    shell: &crate::contract_shell::HostShell,
 ) -> ContractLintReport {
     let env = lint_env(scratch, base_sha, passthrough);
     let overall_start = Instant::now();
@@ -306,16 +316,18 @@ pub(crate) fn run_contract_lint_with_limits(
                 command: command.to_string(),
                 outcome: AssertionLintOutcome::NotLinted,
                 output_tail: String::new(),
+                shell_label: shell.label(),
             });
             continue;
         }
 
-        let (code, output_tail) = crate::command_exec::run_shell_command_sandboxed_blocking(
+        let (code, output_tail) = crate::command_exec::run_contract_command_sandboxed_blocking(
             cwd,
             command,
             per_command,
             &env,
             sandbox,
+            shell,
         );
         let outcome = classify(code.is_some(), code == Some(0));
         results.push(AssertionLint {
@@ -323,6 +335,7 @@ pub(crate) fn run_contract_lint_with_limits(
             command: command.to_string(),
             outcome,
             output_tail,
+            shell_label: shell.label(),
         });
     }
 
@@ -335,10 +348,30 @@ pub(crate) fn run_contract_lint_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_shell::{sleep_millis, FAIL, SUCCEED};
+    use crate::contract_shell::{HostShell, ShellKind, ShellLane};
+    use crate::test_shell::{FAIL, SUCCEED};
+
+    /// Resolve the shell this test's contract-lane commands actually run
+    /// under, exactly the way production does: on Unix this is always bare
+    /// `sh`; on Windows it is Git's absolute `sh` (or `cmd`, if Git's `sh`
+    /// cannot be resolved outside `roots`).
+    fn resolve_test_shell(roots: &[&Path]) -> HostShell {
+        let roots: Vec<std::path::PathBuf> = roots.iter().map(|p| p.to_path_buf()).collect();
+        crate::contract_shell::resolve_contract_shell(ShellLane::Contract, false, &roots)
+    }
+
+    /// A command that blocks for at least `millis`, spelled for whichever
+    /// shell `shell` resolved to.
+    fn sleep_for(shell: &HostShell, cwd: &Path, millis: u64) -> String {
+        match shell.kind {
+            ShellKind::Sh => crate::test_shell::contract::sleep_millis(cwd, millis),
+            ShellKind::Cmd => crate::test_shell::sleep_millis(cwd, millis),
+        }
+    }
 
     fn run_lint(cwd: &Path, base_sha: Option<&str>, contract: &[Assertion]) -> ContractLintReport {
         let scratch = tempfile::tempdir().unwrap();
+        let shell = resolve_test_shell(&[cwd, scratch.path()]);
         run_contract_lint(
             cwd,
             scratch.path(),
@@ -347,6 +380,7 @@ mod tests {
             true,
             &[],
             &crate::command_exec::GateSandbox::Disabled,
+            &shell,
         )
     }
 
@@ -383,6 +417,7 @@ mod tests {
                 command: "true".to_string(),
                 outcome: AssertionLintOutcome::PassedOnBase,
                 output_tail: String::new(),
+                shell_label: "sh".to_string(),
             }],
             tree_clean_at_base: false,
         };
@@ -509,9 +544,10 @@ mod tests {
     #[test]
     fn approval_lint_runner_times_out_slow_command() {
         let scratch = tempfile::tempdir().unwrap();
+        let shell = resolve_test_shell(&[scratch.path()]);
         let contract = vec![command_assertion(
             "a1",
-            &sleep_millis(scratch.path(), 5_000),
+            &sleep_for(&shell, scratch.path(), 5_000),
         )];
         let start = Instant::now();
         let report = run_contract_lint_with_limits(
@@ -524,6 +560,7 @@ mod tests {
             Duration::from_secs(600),
             &[],
             &crate::command_exec::GateSandbox::Disabled,
+            &shell,
         );
         let elapsed = start.elapsed();
 
@@ -545,8 +582,9 @@ mod tests {
             .prefix("kranz timer's ")
             .tempdir()
             .unwrap();
+        let shell = resolve_test_shell(&[scratch.path()]);
         let contract = vec![
-            command_assertion("a1", &sleep_millis(scratch.path(), 200)),
+            command_assertion("a1", &sleep_for(&shell, scratch.path(), 200)),
             command_assertion("a2", SUCCEED),
             command_assertion("a3", FAIL),
         ];
@@ -561,6 +599,7 @@ mod tests {
             Duration::from_millis(50),
             &[],
             &crate::command_exec::GateSandbox::Disabled,
+            &shell,
         );
 
         assert_eq!(report.results.len(), 3);

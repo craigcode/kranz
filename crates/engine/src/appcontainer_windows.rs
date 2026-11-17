@@ -132,6 +132,15 @@ struct LaunchPlan {
     /// the operator-owned, read-only `RUSTUP_HOME`.
     #[serde(default)]
     rustup_toolchain: Option<PathBuf>,
+    /// The cmd.exe raw command-tail (`/S /C "<command>"`) for the gate's
+    /// uncontained-equivalent AppContainer cmd launch, handed to the child
+    /// verbatim instead of `args` — the AppContainer counterpart to
+    /// `command_exec::apply_raw_tail`. `#[serde(default)]` keeps plans
+    /// written before this field existed readable. Mutually exclusive with a
+    /// non-empty `args` (checked in `run_plan`): a plan can carry an argv OR
+    /// a raw tail, never both.
+    #[serde(default)]
+    raw_command_tail: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2807,6 +2816,7 @@ pub(crate) fn prepare_launch_in_context(
     program: &Path,
     args: &[String],
     env: &HashMap<String, String>,
+    raw_command_tail: Option<&str>,
 ) -> Result<PreparedCommand> {
     let mut slot = context.0.lock().map_err(|_| {
         EngineError::Backend("AppContainer gate launch context mutex was poisoned".to_string())
@@ -2821,7 +2831,7 @@ pub(crate) fn prepare_launch_in_context(
         .as_mut()
         .expect("AppContainer gate lease was initialized above");
     let sid = derive_profile_sid(&lease.profile_name)?;
-    prepare_launch_for_lease(lease, sid.0, inputs, program, args, env)
+    prepare_launch_for_lease(lease, sid.0, inputs, program, args, env, raw_command_tail)
 }
 
 /// Build the trusted helper command and apply a unique session launch's
@@ -2837,16 +2847,17 @@ pub(crate) fn prepare_launch(
     let rustup_toolchain = resolve_installed_rustup_toolchain(&inputs.session_cwd, env);
     let (profile_name, sid) = create_profile(inputs.enforce == crate::types::SandboxEnforce::Fs)?;
     let mut lease = new_lease(profile_name, rustup_toolchain);
-    let prepared = match prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            // Setup already created a disposable profile and may have applied
-            // some ACLs. The spawn is failing either way, but teardown still
-            // must be attempted explicitly rather than disappearing into Drop.
-            lease.cleanup()?;
-            return Err(error);
-        }
-    };
+    let prepared =
+        match prepare_launch_for_lease(&mut lease, sid.0, inputs, program, args, env, None) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // Setup already created a disposable profile and may have applied
+                // some ACLs. The spawn is failing either way, but teardown still
+                // must be attempted explicitly rather than disappearing into Drop.
+                lease.cleanup()?;
+                return Err(error);
+            }
+        };
     Ok(PreparedLaunch {
         program: prepared.program,
         args: prepared.args,
@@ -2861,7 +2872,13 @@ fn prepare_launch_for_lease(
     program: &Path,
     args: &[String],
     env: &HashMap<String, String>,
+    raw_command_tail: Option<&str>,
 ) -> Result<PreparedCommand> {
+    if raw_command_tail.is_some() && !args.is_empty() {
+        return Err(EngineError::Backend(
+            "AppContainer launch cannot carry both a raw command tail and an argv".to_string(),
+        ));
+    }
     std::fs::create_dir_all(&inputs.tmpdir).map_err(|error| {
         EngineError::Backend(format!(
             "failed to create AppContainer private scratch {}: {error}",
@@ -2988,6 +3005,7 @@ fn prepare_launch_for_lease(
         allow_network: inputs.enforce == crate::types::SandboxEnforce::Fs,
         path: Some(path),
         rustup_toolchain: lease.rustup_toolchain.clone(),
+        raw_command_tail: raw_command_tail.map(str::to_string),
     };
     let plan_path = inputs.tmpdir.join(format!(
         "appcontainer-plan-{}.json",
@@ -3320,6 +3338,19 @@ fn command_line(executable: &Path, args: &[String]) -> Vec<u16> {
     out
 }
 
+/// Sibling to [`command_line`] for the raw-tail AppContainer gate path: the
+/// executable is quoted exactly as `command_line` would quote it, but `tail`
+/// is appended VERBATIM — no quote escaping at all, matching
+/// `command_exec::apply_raw_tail`'s `raw_arg` hand-off for the uncontained
+/// cmd.exe path. Used only when [`LaunchPlan::raw_command_tail`] is set.
+fn raw_tail_command_line(executable: &Path, tail: &str) -> Vec<u16> {
+    let mut out = quote_arg(executable.as_os_str(), true);
+    out.push(b' ' as u16);
+    out.extend(tail.encode_utf16());
+    out.push(0);
+    out
+}
+
 /// Convert a canonical local-drive path (`\\?\D:\...`) into the ordinary DOS
 /// spelling accepted by cmd.exe as a current directory. Keep UNC/device paths
 /// untouched: collapsing `\\?\UNC\...` would change their meaning.
@@ -3516,7 +3547,17 @@ fn run_plan(plan: LaunchPlan) -> Result<u32> {
     // final process boundary.
     let process_cwd = local_dos_path(&plan.cwd);
     let cwd = wide(process_cwd.as_os_str());
-    let mut line = command_line(&plan.executable, &plan.args);
+    let mut line = match &plan.raw_command_tail {
+        Some(tail) => {
+            if !plan.args.is_empty() {
+                return Err(EngineError::Backend(
+                    "AppContainer plan carries both a raw command tail and an argv".to_string(),
+                ));
+            }
+            raw_tail_command_line(&plan.executable, tail)
+        }
+        None => command_line(&plan.executable, &plan.args),
+    };
     let environment = environment_block(
         &process_cwd,
         plan.path.as_deref(),
@@ -4321,7 +4362,15 @@ mod tests {{
         &gate_env,
         &sandbox,
     )?;
+    eprintln!("gate self test: rust gate retired; checking the contract shell");
+    let contract_shell = contract_shell_receipt(
+        &worktree,
+        &[repo.clone(), mission.clone(), gate_home.clone()],
+        &gate_env,
+        &sandbox,
+    );
     sandbox.cleanup()?;
+    contract_shell?;
     let receipt = ProductionGateReceipt {
         host: crate::sandbox_windows::probe(),
         enforcement: "fs+net",
@@ -4339,6 +4388,101 @@ mod tests {{
         )));
     }
     Ok(rendered)
+}
+
+/// The contract-shell half of the normal-gate receipt, run through the same
+/// resolved posture as the timing samples. The launcher is this executable,
+/// so the check lives here and not in a library test.
+///
+/// It requires what production does today: the contained contract lane
+/// resolves to `cmd`, and `cmd` hands a command with inner double quotes to
+/// the child intact. It then only attempts Git's `sh` under the same posture
+/// and forbidden roots, adding no root, ACL, capability or PATH entry, and
+/// prints the outcome on stderr as the single `KRANZ_WINDOWS_SH_CONTAINED=`
+/// line CI reads. That attempt never fails the receipt:
+/// [`crate::contract_shell::select_shell`] keeps the contained lane on `cmd`
+/// until the line reads `pass`.
+fn contract_shell_receipt(
+    worktree: &Path,
+    roots: &[PathBuf],
+    env: &HashMap<String, String>,
+    sandbox: &crate::command_exec::GateSandbox,
+) -> Result<()> {
+    use crate::contract_shell::{HostShell, ShellKind, ShellLane};
+
+    let mut forbidden_roots = roots.to_vec();
+    forbidden_roots.push(worktree.to_path_buf());
+    forbidden_roots.push(std::env::temp_dir());
+    if let crate::command_exec::GateSandbox::AppContainer { inputs, .. } = sandbox {
+        forbidden_roots.extend(crate::sandbox::write_allowlist(inputs));
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            EngineError::Backend(format!("failed to create contract-shell runtime: {error}"))
+        })?;
+    let timeout = std::time::Duration::from_secs(60);
+
+    let shell =
+        crate::contract_shell::resolve_contract_shell(ShellLane::Contract, true, &forbidden_roots);
+    if shell.kind != ShellKind::Cmd {
+        return Err(EngineError::Backend(format!(
+            "the contained contract lane must resolve to cmd, got {}",
+            shell.label()
+        )));
+    }
+    let (code, output) = runtime.block_on(
+        crate::command_exec::run_contract_command_sandboxed_with_code(
+            worktree,
+            r#".\node.exe -e "process.stdout.write('KRANZ_QUOTES_OK')""#,
+            timeout,
+            env,
+            sandbox,
+            &shell,
+        ),
+    );
+    if code != Some(0) || !output.contains("KRANZ_QUOTES_OK") {
+        return Err(EngineError::Backend(format!(
+            "contained cmd lost the inner double quotes: exit {code:?}: {output:?}"
+        )));
+    }
+
+    let candidates = crate::contract_shell::git_for_windows_sh_candidates();
+    let outcome = match crate::contract_shell::posix_sh_resolution(&candidates, &forbidden_roots) {
+        None => Err("no Git for Windows sh.exe resolved outside every forbidden root".to_string()),
+        Some(program) => {
+            let sh = HostShell {
+                kind: ShellKind::Sh,
+                program,
+            };
+            let (code, output) = runtime.block_on(
+                crate::command_exec::run_contract_command_sandboxed_with_code(
+                    worktree,
+                    r#"printf '%s\n' "KRANZ_SH_CONTAINED_OK""#,
+                    timeout,
+                    env,
+                    sandbox,
+                    &sh,
+                ),
+            );
+            if code == Some(0) && output.contains("KRANZ_SH_CONTAINED_OK") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "sh did not run contained (code {code:?}): {output}"
+                ))
+            }
+        }
+    };
+    match outcome {
+        Ok(()) => eprintln!("KRANZ_WINDOWS_SH_CONTAINED=pass"),
+        Err(reason) => eprintln!(
+            "KRANZ_WINDOWS_SH_CONTAINED=fail: {}",
+            reason.replace(['\n', '\r'], " ")
+        ),
+    }
+    Ok(())
 }
 
 pub fn internal_gate_self_test_requested() -> bool {
@@ -5156,6 +5300,32 @@ mod tests {
             rendered,
             r#""C:\Windows\System32\cmd.exe" /C "set X=1&& echo ok""#
         );
+    }
+
+    #[test]
+    fn raw_tail_command_line_keeps_inner_quotes_verbatim_with_no_inserted_backslashes() {
+        let command = r#"prog -e "a 'b' c""#;
+        let tail = crate::command_exec::cmd_raw_tail(command);
+        let encoded = raw_tail_command_line(Path::new("cmd"), &tail);
+        let rendered = String::from_utf16(&encoded[..encoded.len() - 1])
+            .expect("the command line is valid UTF-16");
+        assert_eq!(rendered, r#""cmd" /S /C "prog -e "a 'b' c"""#);
+        assert!(!rendered.contains('\\'));
+    }
+
+    #[test]
+    fn launch_plan_without_raw_command_tail_deserializes_to_none() {
+        let json = r#"{
+            "version": 1,
+            "profileName": "kranz.test",
+            "executable": "C:\\Windows\\System32\\cmd.exe",
+            "args": ["/C", "echo hi"],
+            "cwd": "C:\\",
+            "allowNetwork": false
+        }"#;
+        let plan: LaunchPlan =
+            serde_json::from_str(json).expect("a plan missing rawCommandTail must deserialize");
+        assert!(plan.raw_command_tail.is_none());
     }
 
     fn populate_toolchain_fixture(

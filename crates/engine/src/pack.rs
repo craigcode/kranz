@@ -1285,7 +1285,13 @@ kind = "local-dir"
         let tree = tempfile::tempdir().unwrap();
         let mut pipeline = GatePipeline::new();
         // The orchestrator's composition: floor FIRST, pack after.
-        crate::contract_gates::register_contract_gates(&mut pipeline, &contract, None, tree.path());
+        crate::contract_gates::register_contract_gates(
+            &mut pipeline,
+            &contract,
+            None,
+            tree.path(),
+            &crate::contract_shell::HostShell::bare_sh(),
+        );
         let floor_len = pipeline.len();
         assert!(floor_len > 0, "floor gates registered");
         pipeline.register(Box::new(PackGate::from_run(

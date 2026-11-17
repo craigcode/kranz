@@ -18,6 +18,19 @@ Notable user-visible changes are documented here. This project follows
   `orchestrator.decision`, naming the commands. The first such run for a
   feature is not counted against `maxRespawns`. See
   `docs/scoping/worker-long-command-stall.md`.
+- Fixed: on Windows, validation-contract commands run as the planner writes
+  them. Without a sandbox (`enforce: off`) they run under the POSIX `sh` that
+  Git for Windows ships, found from the engine's own Git installation and
+  never from a child's `PATH` or working directory. Where `cmd.exe` still
+  runs a command (the AppContainer postures, hosts with no usable `sh`, and
+  every repo-authored gate or hook), it receives the command text unencoded,
+  so inner double quotes reach the program. Before, a `node -e "..."` check
+  failed before any assertion ran.
+- Added: validation-round lines, final-gate command findings and the plan.md
+  lint section name the shell that ran each contract command. A new advisory
+  contract gate, `host-shell-syntax`, records at approval which commands use
+  syntax the host shell will not honor. See
+  `docs/knowledge/validation/gates.md`.
 - Fixed: on Windows, a mission lock left by an engine that was killed is
   now recognised as stale and taken over, as on Unix. `kranz abandon` and a
   resumed `kranz run` no longer need `--force-lock` for it. The holder is

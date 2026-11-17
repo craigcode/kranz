@@ -3,6 +3,13 @@
 
 use super::*;
 
+/// Evidence text for a final-gate command assertion that failed, naming the
+/// shell it ran under so the operator can tell a Windows `cmd` failure from
+/// a POSIX `sh` one.
+fn command_failed_evidence(shell_label: &str, command: &str, output: &str) -> String {
+    format!("command failed (shell: {shell_label}): {command}\n{output}")
+}
+
 impl MissionEngine {
     pub(super) fn block_reviewer_independence(
         &mut self,
@@ -215,6 +222,11 @@ impl MissionEngine {
         // assertion below shares the gate tree + contract scratch shape.
         let gate_root = self.active_root().to_path_buf();
         let mut gate_sandbox = self.gate_sandbox(&gate_root)?;
+        let contract_shell = self.contract_shell(&gate_root, &gate_sandbox);
+        self.emit_decision(
+            "contract commands run under the resolved contract shell",
+            Some(format!("shell: {}", contract_shell.label())),
+        )?;
 
         // command assertions — engine-run (design.md: the hard gate).
         for assertion in contract
@@ -232,13 +244,23 @@ impl MissionEngine {
                 });
                 continue;
             };
-            let (ok, output) =
-                run_shell_command_sandboxed(&gate_root, command, &env, &gate_sandbox).await;
+            let (ok, output) = crate::command_exec::run_contract_command_sandboxed(
+                &gate_root,
+                command,
+                &env,
+                &gate_sandbox,
+                &contract_shell,
+            )
+            .await;
             if !ok {
                 findings.push(Finding {
                     subject: assertion.id.clone(),
                     severity: "critical".to_string(),
-                    evidence: scrub::scrub(&format!("command failed: {command}\n{output}")),
+                    evidence: scrub::scrub(&command_failed_evidence(
+                        &contract_shell.label(),
+                        command,
+                        &output,
+                    )),
                     suggested_fix: String::new(),
                     class: "command-assertion".to_string(),
                     rule: None,
@@ -477,6 +499,7 @@ impl MissionEngine {
                 &contract,
                 None,
                 self.active_root(),
+                &contract_shell,
             );
             let floor_gate_count = pipeline.len();
             for gate in pack_gates {
@@ -1067,5 +1090,29 @@ impl MissionEngine {
         )?;
         self.emit(EventKind::MissionCompleted {})?;
         Ok(MissionStatus::Complete)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contract_shell_recorded_in_final_gate_failing_finding() {
+        let evidence = command_failed_evidence("sh", "exit 1", "");
+        assert!(
+            evidence.contains("shell: sh"),
+            "expected the shell label in the failing-finding evidence: {evidence}"
+        );
+        let finding = Finding {
+            subject: "a1".to_string(),
+            severity: "critical".to_string(),
+            evidence,
+            suggested_fix: String::new(),
+            class: "command-assertion".to_string(),
+            rule: None,
+        };
+        assert!(finding.evidence.contains("shell: sh"));
+        assert_eq!(finding.class, "command-assertion");
     }
 }
