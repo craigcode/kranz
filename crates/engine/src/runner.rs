@@ -1660,7 +1660,11 @@ async fn build_worker_spec(
         hook_status: None,
     };
     spec.env = contract_env(base_sha);
-    apply_agent_command_timeout(cfg, &mut spec.env);
+    // A profiled ACP session admits a fixed set of caller variables and
+    // refuses any other, so the limit is not offered there.
+    if role_cfg.acp_profile.is_none() {
+        apply_agent_command_timeout(cfg, &mut spec.env);
+    }
     // The seeding below can put a copy of the credential file in this
     // session's scratch home. The owner exists first, so the home is removed
     // if a later step here refuses the session (an unresolvable sandbox, for
@@ -2077,7 +2081,11 @@ pub async fn run_validator_in(
         hook_status: None,
     };
     spec.env = contract_env(base_sha);
-    apply_agent_command_timeout(cfg, &mut spec.env);
+    // A profiled ACP session admits a fixed set of caller variables and
+    // refuses any other, so the limit is not offered there.
+    if role_cfg.acp_profile.is_none() {
+        apply_agent_command_timeout(cfg, &mut spec.env);
+    }
     spec.sandbox = match validator_sandbox {
         Some(mut resolved) => {
             // The orchestrator pre-resolved the mandatory containment wrap
