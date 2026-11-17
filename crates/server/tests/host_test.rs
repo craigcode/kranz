@@ -65,6 +65,8 @@ fn isolate_git_env() {
             std::process::id()
         ));
         let _ = std::fs::create_dir_all(&home);
+        kranz_engine::test_dirs::remove_dir_at_exit(&home);
+        kranz_engine::test_dirs::isolate_worker_scratch();
         std::env::set_var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, &home);
     });
 }
@@ -124,6 +126,43 @@ fn init_repo() -> (TempDir, PathBuf) {
     raw_git(dir.path(), &["commit", "-m", "seed"]);
     let root = std::fs::canonicalize(dir.path()).expect("canonicalize repo root");
     (dir, root)
+}
+
+/// Cleans up after a test that returns while its hosted run is still live.
+///
+/// Nothing ends that run, so nothing removes the mission's integration
+/// worktree from the system temp directory, and the run can still be writing
+/// when the repo's `TempDir` drops, which makes that removal fail silently.
+/// This removes both, repeating until two checks in a row find them gone or
+/// five seconds pass. Best effort: a run that writes again after that leaves
+/// its files behind, and on Windows a directory the run still holds open
+/// cannot be removed. It blocks the dropping thread, which is why the test
+/// runs on the multi-thread runtime, and it never panics.
+struct LiveRunCleanup {
+    repo: PathBuf,
+    mission_id: Option<String>,
+}
+
+impl Drop for LiveRunCleanup {
+    fn drop(&mut self) {
+        let worktree = self
+            .mission_id
+            .as_deref()
+            .map(|id| kranz_engine::orchestrator::mission_worktree_path(&self.repo, id));
+        let mut gone_before = false;
+        for _ in 0..50 {
+            if let Some(worktree) = &worktree {
+                let _ = std::fs::remove_dir_all(worktree);
+            }
+            let _ = std::fs::remove_dir_all(&self.repo);
+            let gone = !self.repo.exists() && worktree.as_ref().is_none_or(|w| !w.exists());
+            if gone && gone_before {
+                break;
+            }
+            gone_before = gone;
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -858,6 +897,7 @@ async fn read_only_convenience_router_never_accepts_a_tokenless_mutation() {
 
 #[tokio::test]
 async fn mutation_token_gates_every_post_and_no_get() {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     seed_mission_log(&root, "m-01");
@@ -1739,13 +1779,24 @@ async fn second_start_and_planning_turns_conflict_while_running() {
         return;
     }
     let (_dir, root) = init_repo();
+    let mut cleanup = LiveRunCleanup {
+        repo: root.clone(),
+        mission_id: None,
+    };
 
     // The judgement turn's batch is deliberately missing: the run parks in
     // the orchestrator turn, keeping the mission running for the duration of
-    // the test. Session-start order here: worker first (run phase), then the
-    // orchestrator (first needed at the judgement).
+    // the test. Session-start order here: the one-per-mission auth preflight
+    // probe, then the worker (run phase), then the orchestrator (first needed
+    // at the judgement). Without its own script the probe would take the
+    // worker's, and the probe's working directory is the system temp
+    // directory, so the worker's deliverable would be written there.
     let orch = MockScript::streaming(vec![mock_init("orch-session"), mock_result_text("ready")]);
-    let backend = Arc::new(MockBackend::with_scripts(vec![worker_pass(), orch]));
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        MockScript::single_shot("ack"),
+        worker_pass(),
+        orch,
+    ]));
     let app = hosted_app(&root, backend);
 
     let (status, body) = post_json(
@@ -1757,6 +1808,7 @@ async fn second_start_and_planning_turns_conflict_while_running() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let id = body["id"].as_str().unwrap().to_string();
+    cleanup.mission_id = Some(id.clone());
 
     // Approve straight away (no conversation needed — the plan is supplied).
     let (status, body) = post_json(

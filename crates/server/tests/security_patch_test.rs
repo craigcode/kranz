@@ -14,6 +14,7 @@ const DUMMY_MUTATION: &str = "dummy-mutation";
 const READ: &str = "dummy-read";
 
 fn app(root: &std::path::Path, read_auth: bool, read: Option<&str>) -> axum::Router {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     kranz_server::router_with_read_authority_and_addr(
         Arc::new(MultiRepoHost::with_host(Arc::new(MissionHost::new(
             root.into(),

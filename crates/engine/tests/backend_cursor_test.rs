@@ -22,6 +22,21 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Assert that a finished session's scratch home is gone. Where the engine
+/// removes none (see `kranz_engine::session_scratch`), remove it here so the
+/// test leaves nothing behind.
+fn assert_scratch_home_removed(scratch_root: &Path) {
+    if kranz_engine::session_scratch::REMOVES_SCRATCH_HOMES {
+        assert!(
+            !scratch_root.exists(),
+            "the scratch home {} must be removed when its session ends",
+            scratch_root.display()
+        );
+    } else {
+        let _ = std::fs::remove_dir_all(scratch_root);
+    }
+}
+
 /// Write an executable mock-`agent` script and return its path.
 fn write_mock(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
@@ -39,6 +54,7 @@ fn write_mock(dir: &Path, name: &str, body: &str) -> PathBuf {
 /// tests never read the operator's real `~/.cursor` (scratch-home seeding
 /// has its own unit tests in `backend_cursor.rs`).
 fn spec(dir: &Path, session_id: &str, writable: bool) -> SessionSpec {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let mut env = HashMap::new();
     env.insert("HOME".to_string(), dir.display().to_string());
     SessionSpec {
@@ -460,9 +476,15 @@ async fn backend_cursor_completed_turn_with_phrase_on_stderr_stays_completed() {
 
 /// Emits a one-line result and exits 0 after CAPTURING the child env's
 /// `$HOME` into `home-capture.txt` (the harness reads it back to find the
-/// session-private home the hook-status install must have landed in).
+/// session-private home the hook-status install must have landed in), and
+/// the hooks file from that home, when there is one, into
+/// `hooks-capture.json`. The engine removes the home when the session ends,
+/// so what the session was given has to be recorded while it runs.
 const HOME_CAPTURE_MOCK: &str = r#"#!/bin/sh
 echo "$HOME" > "__CAPTURE_DIR__/home-capture.txt"
+if [ -f "$HOME/.cursor/hooks.json" ]; then
+  cp "$HOME/.cursor/hooks.json" "__CAPTURE_DIR__/hooks-capture.json"
+fi
 cat <<'MOCK_EOF'
 {"type":"system","subtype":"init","session_id":"cursor-mock-sess-home","model":"m"}
 {"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"cursor-mock-sess-home"}
@@ -528,6 +550,7 @@ async fn run_home_capture(
 /// NO `.cursor` writes (install hygiene at the spawn seam).
 #[tokio::test]
 async fn hook_status_signal_cursor_run_installs_the_lane_into_the_session_home() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let cfg = MissionConfig {
         worker: kranz_engine::types::RoleConfig {
@@ -548,7 +571,7 @@ async fn hook_status_signal_cursor_run_installs_the_lane_into_the_session_home()
     );
 
     // The session-private HOME carries the lane install.
-    let hooks_text = std::fs::read_to_string(home.join(".cursor").join("hooks.json"))
+    let hooks_text = std::fs::read_to_string(dir.path().join("hooks-capture.json"))
         .expect("hooks.json installed into the session HOME");
     let hooks: serde_json::Value = serde_json::from_str(&hooks_text).unwrap();
     assert_eq!(hooks["version"], 1);
@@ -586,7 +609,10 @@ async fn hook_status_signal_cursor_run_installs_the_lane_into_the_session_home()
         "spawning must never write hook config into the tracked tree"
     );
 
-    let _ = std::fs::remove_dir_all(home.parent().unwrap_or(&home));
+    // The session-private home, with the per-run token in its spec file,
+    // does not outlive the session.
+    let scratch_root = home.parent().unwrap_or(&home);
+    assert_scratch_home_removed(scratch_root);
 }
 
 /// Hooks-disabled regression (the acceptance hint's headline): a default
@@ -594,6 +620,7 @@ async fn hook_status_signal_cursor_run_installs_the_lane_into_the_session_home()
 /// hooks.json, a byte-identical pre-lane session.
 #[tokio::test]
 async fn hook_status_signal_cursor_run_without_opt_in_installs_nothing() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let cfg = MissionConfig::default();
 
@@ -604,7 +631,7 @@ async fn hook_status_signal_cursor_run_without_opt_in_installs_nothing() {
     );
 
     assert!(
-        !home.join(".cursor").join("hooks.json").exists(),
+        !dir.path().join("hooks-capture.json").exists(),
         "hooks disabled is the byte-identical default: no hooks.json"
     );
     assert!(
@@ -612,7 +639,9 @@ async fn hook_status_signal_cursor_run_without_opt_in_installs_nothing() {
         "no projection dir is even created"
     );
 
-    let _ = std::fs::remove_dir_all(home.parent().unwrap_or(&home));
+    // The scratch home does not outlive the session.
+    let scratch_root = home.parent().unwrap_or(&home);
+    assert_scratch_home_removed(scratch_root);
 }
 
 /// Per-backend opt-in: an ENABLED lane on a non-hook-capable configured
@@ -622,6 +651,7 @@ async fn hook_status_signal_cursor_run_without_opt_in_installs_nothing() {
 /// for.)
 #[tokio::test]
 async fn hook_status_signal_enabled_lane_ignores_non_hook_capable_backends() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let cfg = MissionConfig {
         hook_status: Some(kranz_engine::types::HookStatusConfig {
@@ -643,11 +673,13 @@ async fn hook_status_signal_enabled_lane_ignores_non_hook_capable_backends() {
         "a non-hook-capable backend gets no registration"
     );
     assert!(
-        !home.join(".cursor").join("hooks.json").exists(),
+        !dir.path().join("hooks-capture.json").exists(),
         "and no session install"
     );
 
-    let _ = std::fs::remove_dir_all(home.parent().unwrap_or(&home));
+    // The scratch home does not outlive the session.
+    let scratch_root = home.parent().unwrap_or(&home);
+    assert_scratch_home_removed(scratch_root);
 }
 
 /// Engine-level resumability: a worker run whose `agent` dies mid-line
@@ -656,6 +688,7 @@ async fn hook_status_signal_enabled_lane_ignores_non_hook_capable_backends() {
 /// makes the NEXT acquire clean) — the kill-mid-session resumable-log case.
 #[tokio::test]
 async fn backend_cursor_cli_death_mid_run_leaves_a_resumable_event_log() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let paths = MissionPaths::new(dir.path(), "m-cursor-test");
     let mut log = EventLog::acquire(

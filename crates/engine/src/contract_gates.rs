@@ -1405,18 +1405,17 @@ mod tests {
     /// the assertion never examined the property.
     #[test]
     fn contract_gate_wrong_polarity_catches_negated_grep_on_missing_path() {
-        let dir = std::env::temp_dir().join(format!("kranz-cg-wp-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         let checks = vec![
             check("a1", "! grep -q landed-marker no/such/file.txt"),
             check("a2", "grep -q landed-marker no/such/file.txt || true"),
         ];
-        let findings = wrong_polarity_findings(&checks, &dir);
+        let findings = wrong_polarity_findings(&checks, dir);
         assert_eq!(findings.len(), 2, "{findings:?}");
         assert!(findings[0].contains("[a1]"), "{findings:?}");
         assert!(findings[0].contains("negated"), "{findings:?}");
         assert!(findings[1].contains("[a2]"), "{findings:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Well-formed negated greps must pass: the target exists (the property
@@ -1425,8 +1424,8 @@ mod tests {
     /// stdin.
     #[test]
     fn contract_gate_wrong_polarity_passes_examined_or_undeterminable_targets() {
-        let dir = std::env::temp_dir().join(format!("kranz-cg-wp2-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
         std::fs::write(dir.join("present.txt"), "contents\n").unwrap();
         let checks = vec![
             // Negated grep on an EXISTING path: the property is checked.
@@ -1438,9 +1437,8 @@ mod tests {
             // Piped grep reads stdin: no path to check.
             check("a4", "cargo build 2>&1 | grep -q warning"),
         ];
-        let findings = wrong_polarity_findings(&checks, &dir);
+        let findings = wrong_polarity_findings(&checks, dir);
         assert!(findings.is_empty(), "{findings:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- passes-on-base -------------------------------------------------

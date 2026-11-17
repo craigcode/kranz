@@ -373,6 +373,8 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
         serde_json::json!({"claudeBinary":fake}).to_string(),
     )
     .unwrap();
+    let child_tmp = dir.path().join("tmp");
+    std::fs::create_dir(&child_tmp).unwrap();
     let mut child = Process::new(env!("CARGO_BIN_EXE_kranz"))
         .args([
             "--repo",
@@ -382,6 +384,14 @@ fn exec_sigint_stops_the_backend_tree_and_retains_resumable_state() {
             ticket.to_str().unwrap(),
         ])
         .env("KRANZ_HOME", &authority)
+        // The engine leaves a session's scratch home and the process's empty
+        // git config in place; keep the child's inside this test's own
+        // directory.
+        .env(
+            kranz_engine::backend_claude::SCRATCH_ROOT_ENV,
+            dir.path().join("scratch"),
+        )
+        .env("TMPDIR", &child_tmp)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

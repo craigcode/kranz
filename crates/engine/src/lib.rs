@@ -91,6 +91,7 @@ pub mod sandbox;
 pub mod sandbox_container;
 pub mod sandbox_windows;
 pub mod scrub;
+pub mod session_scratch;
 pub mod sgian;
 pub mod sgian_terminal;
 pub mod signals;
@@ -104,6 +105,10 @@ mod strict_json;
 /// Runtime-gated test support: skip loudly, and fail where the capability is
 /// required, so a silent skip cannot masquerade as a pass.
 pub mod test_capability;
+/// Test support: directories shared by a whole test binary, removed when
+/// the process exits.
+#[doc(hidden)]
+pub mod test_dirs;
 /// Portable `sh`/`cmd` snippets for test fixtures; see the module docs for why
 /// literal `true`/`false`/`test`/`sleep` must not appear in one.
 #[cfg(test)]

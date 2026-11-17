@@ -3,9 +3,11 @@
 if not __debug__:
     raise SystemExit("ACP proof checks require assertions; disable PYTHONOPTIMIZE and -O")
 
+import atexit
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +16,7 @@ import time
 binary = str(Path(sys.argv[1]).resolve())
 image = sys.argv[2]
 root = Path(tempfile.mkdtemp(prefix="kranz-acp-tool-proof-"))
+atexit.register(shutil.rmtree, root, ignore_errors=True)
 peer = r'''
 import errno, json, os, subprocess, sys
 from pathlib import Path

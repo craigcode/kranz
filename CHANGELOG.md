@@ -18,6 +18,42 @@ Notable user-visible changes are documented here. This project follows
   `orchestrator.decision`, naming the commands. The first such run for a
   feature is not counted against `maxRespawns`. See
   `docs/scoping/worker-long-command-stall.md`.
+- Fixed: on macOS and Linux a session's scratch home
+  (`kranz-worker-home-<session id>` in the temp directory or under
+  `KRANZ_SCRATCH_ROOT`) is removed when the session ends, and also when the
+  session is refused before it starts. It can hold a copy of the agent CLI
+  credential file, and before this nothing removed it, so a machine that ran
+  many missions kept thousands. This covers worker and validator sessions,
+  the decompose planner, the contract read-back reviewer, `ask`, and the
+  per-mission worker-auth preflight home, whose name now ends in a UUID.
+  Removal never follows a symbolic link, removes the credential and keychain
+  entries first, and runs on a background thread. In a directory that other
+  users or a group can write (a default Linux `/tmp`, or a directory of mode
+  `0775`) the home is emptied and the empty directory is kept, so that no
+  other user can take its name. Not removed yet: the long-lived orchestrator
+  session's home, and every scratch home on Windows.
+- Fixed: the `kranz` binary removes its empty `kranz-gitconfig-<uuid>`
+  directory when it exits, where the temp directory is private to the user
+  (the macOS default). Before, every `kranz` process that ran git left one.
+  It is still left in a temp directory other users can write and on Windows.
+- Fixed: the worker-auth preflight session runs in a directory of its own
+  inside the preflight home. Before, its working directory was the shared
+  temp directory, where anything it wrote by relative path stayed.
+- Changed: `kranz abandon` and `kranz clean`, and the abandon and delete
+  routes of `kranz serve`, remove the mission's leftover git worktree
+  directories (`kranz-wt-*`, `kranz-pool-*`), wherever they are. A worktree is
+  removed only if it holds nothing but committed files: one holding a
+  modified, untracked or ignored file is kept and its path is printed. No
+  branch is deleted. Nothing is removed when `kranz abandon` had to take the
+  mission lock over from an engine that did not release it, or when
+  `kranz clean` finds a lock file still present, because a worker of that
+  engine may still be running in a worktree. Before, these commands removed
+  no worktree, and a Blocked or Paused mission that was abandoned kept its
+  integration worktree for good.
+- Added: `docs/scoping/worker-sandboxing.md` lists what Kranz puts in the
+  temp directory, when each kind is removed, and how to remove the
+  directories earlier versions left behind. Kranz does not delete those
+  itself.
 - Fixed: on Windows, validation-contract commands run as the planner writes
   them. Without a sandbox (`enforce: off`) they run under the POSIX `sh` that
   Git for Windows ships, found from the engine's own Git installation and

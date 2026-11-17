@@ -1233,9 +1233,10 @@ impl MissionHost {
     /// opts in to deleting Complete missions (which otherwise stay: they feed
     /// the cost-calibration corpus), and a live lock is re-checked immediately
     /// before removal so nothing is ever deleted under a running engine.
-    /// Only the mission directory and its own `missions/index.md` line go;
-    /// branches, tags, and every other mission's index line are left intact
-    /// (same contract as the CLI).
+    /// The mission directory and its own `missions/index.md` line go, and
+    /// first the mission's leftover worktrees that hold only committed
+    /// files; branches, tags, and every other mission's index line are left
+    /// intact (same contract as the CLI).
     pub fn clean(&self, id: &str, all: bool) -> Result<(), ApiError> {
         use kranz_engine::mission_catalog::{
             cleanable_class, mission_lock_is_live, prune_mission_index_file, CleanClass,
@@ -1280,6 +1281,10 @@ impl MissionHost {
                 "mission '{id}' became live — nothing was deleted"
             )));
         }
+        // As `kranz clean` does: the directory is the only record tying the
+        // mission's leftover worktrees to it, so the ones holding only
+        // committed files are removed first. What was kept is logged.
+        kranz_engine::mission_catalog::remove_worktrees_of_terminal_mission(&self.repo_root, id);
         kranz_engine::queue::remove(&self.repo_root, id);
         std::fs::remove_dir_all(paths.mission_dir())
             .map_err(|e| ApiError::internal(format!("removing mission '{id}': {e}")))?;
@@ -1726,6 +1731,8 @@ async fn run_ask_session(
     backend: Arc<dyn AgentBackend>,
     spec: SessionSpec,
 ) -> Result<AskRunOutcome, ApiError> {
+    // Dropped after `session`: removes the ask session's scratch home.
+    let _scratch = kranz_engine::session_scratch::SessionScratch::for_session(&spec.session_id);
     let mut session = backend.start(spec).await.map_err(ApiError::from)?;
     let mut streamed_text = String::new();
     let mut result_text = None;
@@ -2504,6 +2511,8 @@ mod tests {
             let home =
                 std::env::temp_dir().join(format!("kranz-host-test-home-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&home);
+            kranz_engine::test_dirs::remove_dir_at_exit(&home);
+            kranz_engine::test_dirs::isolate_worker_scratch();
             std::env::set_var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, &home);
         });
     }

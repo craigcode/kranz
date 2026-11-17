@@ -359,7 +359,15 @@ pub fn scratch_root_base() -> std::path::PathBuf {
             );
             std::env::temp_dir()
         }
-        None => std::env::temp_dir(),
+        None => {
+            // This crate's unit tests get a root of their own, removed
+            // when the test process exits.
+            #[cfg(test)]
+            if let Some(root) = crate::test_dirs::unit_test_scratch_base() {
+                return root;
+            }
+            std::env::temp_dir()
+        }
     }
 }
 

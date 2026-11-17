@@ -482,6 +482,9 @@ impl ReadbackReviewer for AgentBackendReviewer<'_> {
             input,
             isolated_prompt,
         );
+        // Dropped after the session below: removes its scratch home.
+        let _session_scratch =
+            crate::session_scratch::SessionScratch::for_session(&spec.session_id);
         let text = self.handle.block_on(async {
             let mut session = self.backend.start(spec).await?;
             let mut result_text = None;

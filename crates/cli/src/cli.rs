@@ -271,8 +271,12 @@ pub enum Command {
 
     /// Retire a mission: mark it ABANDONED (a terminal state, not a failure).
     ///
-    /// Appends `mission.abandoned` to the event log and stops here — git
-    /// branches, tags, and the deliverable are left untouched. A mission that
+    /// Appends `mission.abandoned` to the event log. Git branches, tags, and
+    /// the deliverable are left untouched. The mission's leftover worktree
+    /// directories are then removed where they hold only committed files;
+    /// one holding a modified, untracked or ignored file is kept and its path
+    /// printed, and none is removed when the lock had to be taken over from
+    /// an engine that did not release it. A mission that
     /// is already terminal (Complete/Failed/Abandoned) is rejected. If a live
     /// engine still holds the mission lock, stop it first; --force-lock
     /// steals only a lock whose holder is not provably alive, and
@@ -291,8 +295,11 @@ pub enum Command {
     /// Cleans Failed, Abandoned, and abandoned-in-planning husks (Planning
     /// with no plan.json) by default; --all additionally removes Complete
     /// missions. A mission whose lock is held by a live engine is never
-    /// cleaned. Only mission directories are removed — git branches/tags and
-    /// the missions index.md are left intact.
+    /// cleaned. Mission directories are removed, and with each the mission's
+    /// leftover worktree directories that hold only committed files; a
+    /// worktree holding a modified, untracked or ignored file is kept and
+    /// its path printed. Git branches and tags are never touched, and only
+    /// the removed missions' own lines leave the missions index.md.
     Clean {
         /// Skip the confirmation prompt (assume yes)
         #[arg(long)]

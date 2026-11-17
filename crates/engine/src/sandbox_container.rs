@@ -254,29 +254,192 @@ pub(crate) fn scratch_root_base() -> PathBuf {
 /// the check and the use cannot redirect the walk outside the tree
 /// (2026-11-10 audit CTR-4 / ACP-1). The parent of `path` is the caller's
 /// trust anchor and is opened by path.
+///
+/// An entry that cannot be removed does not stop the walk: its siblings are
+/// still removed, and the first error is returned at the end.
 #[cfg(unix)]
 pub(crate) fn remove_owned_tree_nofollow(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let Some((parent_fd, name)) = nofollow_walk::open_parent(path)? else {
+        return Ok(());
+    };
+    nofollow_walk::remove_at(parent_fd.as_raw_fd(), &name)
+}
+
+/// Removes the directory at `path` when it is a real directory owned by the
+/// calling user, or only empties it when `keep_directory` is set.
+///
+/// Unlike [`remove_owned_tree_nofollow`], this also checks the top directory
+/// itself, and does so on the object it then works on: `path` is opened once
+/// with `O_NOFOLLOW | O_DIRECTORY`, the type and owner are read from that
+/// descriptor, and every entry is listed and removed relative to it. A
+/// symbolic link, or another user's directory, put at `path` at any moment is
+/// refused with an error and nothing under it is touched. The parent of
+/// `path` is opened by path and is the caller's trust anchor only for the
+/// name lookup.
+///
+/// `first` names entries, as component lists relative to `path`, that are
+/// removed before the general walk, so the most sensitive files go even if
+/// the walk later meets an entry it cannot remove. The walk does not stop at
+/// such an entry; the first error is returned once everything else is gone.
+/// With `keep_directory` the emptied directory is left with mode `0700`.
+/// `ErrorKind::NotFound` is treated as `Ok(())`.
+#[cfg(unix)]
+pub(crate) fn remove_own_directory_nofollow(
+    path: &Path,
+    first: &[&[&str]],
+    keep_directory: bool,
+) -> std::io::Result<()> {
+    use nofollow_walk::{check, cstr, not_found_ok, open_dir_at, remove_at};
+    use std::os::fd::AsRawFd;
+
+    let Some((parent_fd, name)) = nofollow_walk::open_parent(path)? else {
+        return Ok(());
+    };
+    let parent = parent_fd.as_raw_fd();
+    let euid = unsafe { libc::geteuid() };
+    let root = match open_dir_at(parent, &name) {
+        Ok(root) => root,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            // The session may have made its own top directory unreadable.
+            // Restore the mode only on a real directory this user owns, and
+            // never through a link; the re-open refuses a link again.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            check(unsafe {
+                libc::fstatat(parent, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW)
+            })?;
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR || stat.st_uid != euid {
+                return Err(err);
+            }
+            check(unsafe {
+                libc::fchmodat(parent, name.as_ptr(), 0o700, libc::AT_SYMLINK_NOFOLLOW)
+            })?;
+            open_dir_at(parent, &name)?
+        }
+        Err(err) => return Err(err),
+    };
+    let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+    check(unsafe { libc::fstat(root.as_raw_fd(), &mut opened) })?;
+    if opened.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the path is not a directory",
+        ));
+    }
+    if opened.st_uid != euid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the directory belongs to another user",
+        ));
+    }
+    if (opened.st_mode & 0o777) != 0o700 {
+        check(unsafe { libc::fchmod(root.as_raw_fd(), 0o700) })?;
+    }
+
+    // The entries named in `first`, each reached through directories opened
+    // without following a link. Best effort: the walk below covers them too.
+    for components in first {
+        let Some((last, dirs)) = components.split_last() else {
+            continue;
+        };
+        let mut held = Vec::new();
+        let mut dir = root.as_raw_fd();
+        let mut reached = true;
+        for component in dirs {
+            let Ok(component) = cstr(component.as_bytes()) else {
+                reached = false;
+                break;
+            };
+            match open_dir_at(dir, &component) {
+                Ok(next) => {
+                    dir = next.as_raw_fd();
+                    held.push(next);
+                }
+                Err(_) => {
+                    reached = false;
+                    break;
+                }
+            }
+        }
+        if reached {
+            if let Ok(last) = cstr(last.as_bytes()) {
+                let _ = remove_at(dir, &last);
+            }
+        }
+        drop(held);
+    }
+
+    let mut first_error = None;
+    for entry in nofollow_walk::entry_names(&root)? {
+        if let Err(error) = remove_at(root.as_raw_fd(), &entry) {
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    drop(root);
+    if keep_directory {
+        return Ok(());
+    }
+    // Only an empty directory can be removed here, whatever now has the name.
+    not_found_ok(check(unsafe {
+        libc::unlinkat(parent, name.as_ptr(), libc::AT_REMOVEDIR)
+    }))
+}
+
+/// The descriptor-relative steps shared by the no-follow removers above.
+#[cfg(unix)]
+mod nofollow_walk {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
 
-    fn cstr(bytes: &[u8]) -> std::io::Result<std::ffi::CString> {
+    pub(super) fn cstr(bytes: &[u8]) -> std::io::Result<std::ffi::CString> {
         std::ffi::CString::new(bytes)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
     }
-    fn not_found_ok(result: std::io::Result<()>) -> std::io::Result<()> {
+    pub(super) fn not_found_ok(result: std::io::Result<()>) -> std::io::Result<()> {
         match result {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             other => other,
         }
     }
-    fn check(rc: libc::c_int) -> std::io::Result<()> {
+    pub(super) fn check(rc: libc::c_int) -> std::io::Result<()> {
         if rc == 0 {
             Ok(())
         } else {
             Err(std::io::Error::last_os_error())
         }
     }
-    fn open_dir_at(dir: libc::c_int, name: &std::ffi::CStr) -> std::io::Result<OwnedFd> {
+    /// Open the parent of `path` by path and return it with the final name.
+    /// `None` when the parent does not exist.
+    pub(super) fn open_parent(
+        path: &Path,
+    ) -> std::io::Result<Option<(OwnedFd, std::ffi::CString)>> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let parent_c = cstr(parent.as_os_str().as_bytes())?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        let parent_fd = unsafe { libc::open(parent_c.as_ptr(), flags) };
+        if parent_fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(err);
+        }
+        let parent_fd = unsafe { OwnedFd::from_raw_fd(parent_fd) };
+        Ok(Some((parent_fd, cstr(name.as_bytes())?)))
+    }
+    pub(super) fn open_dir_at(dir: libc::c_int, name: &std::ffi::CStr) -> std::io::Result<OwnedFd> {
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         let fd = unsafe { libc::openat(dir, name.as_ptr(), flags) };
         if fd < 0 {
@@ -284,7 +447,7 @@ pub(crate) fn remove_owned_tree_nofollow(path: &Path) -> std::io::Result<()> {
         }
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
-    fn entry_names(dir: &OwnedFd) -> std::io::Result<Vec<std::ffi::CString>> {
+    pub(super) fn entry_names(dir: &OwnedFd) -> std::io::Result<Vec<std::ffi::CString>> {
         // `fdopendir` takes ownership of the descriptor it is given.
         let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if dup < 0 {
@@ -310,7 +473,7 @@ pub(crate) fn remove_owned_tree_nofollow(path: &Path) -> std::io::Result<()> {
         unsafe { libc::closedir(stream) };
         Ok(names)
     }
-    fn remove_at(dir: libc::c_int, name: &std::ffi::CStr) -> std::io::Result<()> {
+    pub(super) fn remove_at(dir: libc::c_int, name: &std::ffi::CStr) -> std::io::Result<()> {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::fstatat(dir, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) };
         if rc != 0 {
@@ -326,17 +489,19 @@ pub(crate) fn remove_owned_tree_nofollow(path: &Path) -> std::io::Result<()> {
             Ok(child) => child,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             // A guest `chmod 0000` on a directory we own: restore search and
-            // read so it can be opened. A symlink swapped in here is not
-            // followed on macOS (AT_SYMLINK_NOFOLLOW) and is refused by the
-            // O_NOFOLLOW re-open on every platform.
+            // read so it can be opened. The mode is never changed through a
+            // symlink swapped in here: `AT_SYMLINK_NOFOLLOW` makes the call
+            // fail on a link instead, and the O_NOFOLLOW re-open refuses one
+            // on every platform. Where the C library cannot change a mode
+            // without following (Linux with glibc older than 2.32), the call
+            // fails for every entry and the directory is reported as not
+            // removable rather than repaired.
             Err(err)
                 if err.kind() == std::io::ErrorKind::PermissionDenied && stat.st_uid == euid =>
             {
-                #[cfg(target_os = "macos")]
-                let flag = libc::AT_SYMLINK_NOFOLLOW;
-                #[cfg(not(target_os = "macos"))]
-                let flag = 0;
-                check(unsafe { libc::fchmodat(dir, name.as_ptr(), 0o700, flag) })?;
+                check(unsafe {
+                    libc::fchmodat(dir, name.as_ptr(), 0o700, libc::AT_SYMLINK_NOFOLLOW)
+                })?;
                 open_dir_at(dir, name)?
             }
             Err(err) => return Err(err),
@@ -346,31 +511,21 @@ pub(crate) fn remove_owned_tree_nofollow(path: &Path) -> std::io::Result<()> {
         if opened.st_uid == euid && (opened.st_mode & 0o700) != 0o700 {
             check(unsafe { libc::fchmod(child.as_raw_fd(), 0o700) })?;
         }
+        // One entry that cannot be removed must not shield its siblings.
+        let mut first_error = None;
         for entry in entry_names(&child)? {
-            remove_at(child.as_raw_fd(), &entry)?;
+            if let Err(error) = remove_at(child.as_raw_fd(), &entry) {
+                first_error.get_or_insert(error);
+            }
         }
         drop(child);
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         not_found_ok(check(unsafe {
             libc::unlinkat(dir, name.as_ptr(), libc::AT_REMOVEDIR)
         }))
     }
-
-    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
-    };
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    let parent_c = cstr(parent.as_os_str().as_bytes())?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    let parent_fd = unsafe { libc::open(parent_c.as_ptr(), flags) };
-    if parent_fd < 0 {
-        return not_found_ok(Err(std::io::Error::last_os_error()));
-    }
-    let parent_fd = unsafe { OwnedFd::from_raw_fd(parent_fd) };
-    remove_at(parent_fd.as_raw_fd(), &cstr(name.as_bytes())?)
 }
 
 /// Windows has no descriptor-relative walk here; the container contracts that

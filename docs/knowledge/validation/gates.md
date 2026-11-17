@@ -66,6 +66,8 @@ verified_against:
 
 Rechecked 2026-11-17 (UTC) against the grant wait and stall record in `orchestrator.rs`: the feature-range secret scan's respawn check now subtracts the same credit as the judgement respawn check (grant re-runs, plus one run per feature that ended with its command moved to the background). The grant wait before deny-default is configurable (`grantRequestTimeoutSecs`). No gate, its order or its failure mode changed.
 
+Rechecked 2026-11-17 (UTC) against the temp-directory cleanup. `.github/workflows/ci.yml`: the Ubuntu and macOS workspace test steps now build the tests, run them with a temp directory of their own, and fail through `scripts/check-test-temp-leftovers.py` if a passing run left anything in it; the Windows step is unchanged. `runner.rs`, `readback.rs` and `orchestrator.rs`: a session's scratch home is removed after its hook records are folded into the log, so the `hook.gate.fired` evidence is unchanged. `git_ops.rs` and `commands.rs`: `kranz abandon` and `kranz clean` remove a mission's worktrees that hold only committed files, and print what they removed, kept or left alone. The two ACP probe scripts cited here changed earlier only to remove their working directory at exit; the `sourceSha256` values under `docs/compatibility/acp/` are dated receipts of the scripts as they were when each proof ran, nothing compares them with the tree, and they are not expected to match it. No gate, verdict or consent rule changed.
+
 Rechecked 2026-11-17 (UTC) against a test move in `command_exec.rs`, `appcontainer_windows.rs` and `.github/workflows/ci.yml`: the contained contract-shell checks (the `cmd.exe` quoting check and the Git `sh` attempt that prints `KRANZ_WINDOWS_SH_CONTAINED=`) now run inside the CLI's AppContainer normal-gate self test, because the AppContainer launcher is the `kranz` binary itself. No shell selection, containment rule or gate behaviour changed.
 
 Rechecked 2026-11-16 (UTC) against the Windows contract-shell change: on Windows an uncontained contract command runs under Git for Windows' POSIX `sh` when it resolves outside every worker-writable root, and under `cmd.exe` otherwise. `cmd.exe` now receives the command text unencoded. Validation-round lines, final-gate command findings and the plan.md lint section carry a `shell:` label, and a fifth named contract gate, `host-shell-syntax`, is advisory. See "Which shell runs a contract command" below. Unix behaviour, gate commands and verdict rules are unchanged.
@@ -249,7 +251,10 @@ cargo build --workspace
 
 `.github/workflows/ci.yml` runs fmt/clippy/workspace tests on Ubuntu and
 Windows (no standalone `build` job — `cargo test` covers it), a separate macOS
-workspace suite, and a wrapped macOS dogfood suite. The Windows lane begins
+workspace suite, and a wrapped macOS dogfood suite. The Ubuntu and macOS
+workspace suites run with a temp directory of their own and fail when a
+passing run leaves anything in it (`scripts/check-test-temp-leftovers.py`).
+The Windows lane begins
 with the explicit minimal host-preparation step — drive-root and derived
 profile-parent metadata ACEs plus the per-boot null-device descriptor — then
 runs the production LPAC/AppContainer containment receipts. It ends with a

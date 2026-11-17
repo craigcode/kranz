@@ -328,10 +328,18 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    fn repo(id: &str, team: &str, channel: &str, healthy: bool) -> SlackRepo {
+    /// `parent` is the calling test's own temp directory, so the repo root
+    /// is removed with it.
+    fn repo(
+        parent: &std::path::Path,
+        id: &str,
+        team: &str,
+        channel: &str,
+        healthy: bool,
+    ) -> SlackRepo {
         SlackRepo {
             id: id.into(),
-            root: tempdir().unwrap().keep(),
+            root: tempfile::tempdir_in(parent).unwrap().keep(),
             display_name: id.into(),
             routes: vec![SlackRoute {
                 team_id: team.into(),
@@ -364,8 +372,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let catalog = SlackCatalog::new(
             vec![
-                repo("alpha", "T1", "CA", true),
-                repo("beta", "T1", "CB", true),
+                repo(tmp.path(), "alpha", "T1", "CA", true),
+                repo(tmp.path(), "beta", "T1", "CB", true),
             ],
             tmp.path().join("affinity.json"),
         )
@@ -396,10 +404,10 @@ mod tests {
     #[test]
     fn app_home_follows_default_repo_when_several_are_healthy() {
         let tmp = tempdir().unwrap();
-        let mut beta = repo("beta", "T1", "CB", true);
+        let mut beta = repo(tmp.path(), "beta", "T1", "CB", true);
         beta.default = true;
         let catalog = SlackCatalog::new(
-            vec![repo("alpha", "T1", "CA", true), beta],
+            vec![repo(tmp.path(), "alpha", "T1", "CA", true), beta],
             tmp.path().join("affinity.json"),
         )
         .unwrap();
@@ -410,10 +418,10 @@ mod tests {
     #[test]
     fn app_home_default_precedes_channel_and_healthy_repo_fallbacks() {
         let tmp = tempdir().unwrap();
-        let mut beta = repo("beta", "T1", "CB", false);
+        let mut beta = repo(tmp.path(), "beta", "T1", "CB", false);
         beta.default = true;
         let catalog = SlackCatalog::new(
-            vec![repo("alpha", "T1", "D-HOME", true), beta],
+            vec![repo(tmp.path(), "alpha", "T1", "D-HOME", true), beta],
             tmp.path().join("affinity.json"),
         )
         .unwrap();
@@ -429,7 +437,7 @@ mod tests {
     fn app_home_without_default_uses_the_only_repository() {
         let tmp = tempdir().unwrap();
         let catalog = SlackCatalog::new(
-            vec![repo("alpha", "T1", "CA", true)],
+            vec![repo(tmp.path(), "alpha", "T1", "CA", true)],
             tmp.path().join("affinity.json"),
         )
         .unwrap();
@@ -444,8 +452,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let catalog = SlackCatalog::new(
             vec![
-                repo("alpha", "T1", "CA", true),
-                repo("beta", "T1", "CB", true),
+                repo(tmp.path(), "alpha", "T1", "CA", true),
+                repo(tmp.path(), "beta", "T1", "CB", true),
             ],
             tmp.path().join("affinity.json"),
         )
@@ -459,8 +467,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let catalog = SlackCatalog::new(
             vec![
-                repo("alpha", "T1", "CA", true),
-                repo("beta", "T1", "CB", true),
+                repo(tmp.path(), "alpha", "T1", "CA", true),
+                repo(tmp.path(), "beta", "T1", "CB", true),
             ],
             tmp.path().join("affinity.json"),
         )
@@ -483,8 +491,8 @@ mod tests {
 
         let catalog = SlackCatalog::new(
             vec![
-                repo("alpha", "T1", "CA", true),
-                repo("beta", "T1", "CB", false),
+                repo(tmp.path(), "alpha", "T1", "CA", true),
+                repo(tmp.path(), "beta", "T1", "CB", false),
             ],
             tmp.path().join("affinity-sole.json"),
         )
@@ -505,8 +513,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let catalog = SlackCatalog::new(
             vec![
-                repo("alpha", "T1", "CA", true),
-                repo("beta", "T1", "CB", false),
+                repo(tmp.path(), "alpha", "T1", "CA", true),
+                repo(tmp.path(), "beta", "T1", "CB", false),
             ],
             tmp.path().join("affinity.json"),
         )
@@ -528,8 +536,8 @@ mod tests {
         affinities.save(&affinity_path).unwrap();
         let catalog = SlackCatalog::new(
             vec![
-                repo("alpha", "T1", "CA", true),
-                repo("beta", "T1", "CB", true),
+                repo(tmp.path(), "alpha", "T1", "CA", true),
+                repo(tmp.path(), "beta", "T1", "CB", true),
             ],
             affinity_path,
         )

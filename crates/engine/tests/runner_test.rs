@@ -54,6 +54,20 @@ fn seeded_log(p: &MissionPaths) -> EventLog {
     log
 }
 
+/// Assert that a finished session's scratch home is gone. Where the engine
+/// removes none (see `kranz_engine::session_scratch`), remove it here so the
+/// test leaves nothing behind.
+fn assert_scratch_home_removed(scratch_root: &std::path::Path) {
+    if kranz_engine::session_scratch::REMOVES_SCRATCH_HOMES {
+        assert!(
+            !scratch_root.exists(),
+            "the scratch home must be removed when its session ends"
+        );
+    } else {
+        let _ = std::fs::remove_dir_all(scratch_root);
+    }
+}
+
 fn feature() -> Feature {
     Feature {
         id: "f-1".to_string(),
@@ -109,6 +123,7 @@ fn worker_report_json() -> serde_json::Value {
 }
 
 fn session_spec(prompt: PromptMode) -> SessionSpec {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     SessionSpec {
         cwd: std::env::temp_dir(),
         prompt,
@@ -1217,6 +1232,7 @@ fn parse_validator_report_fallbacks() {
 
 #[tokio::test]
 async fn run_worker_builds_spec_and_uses_report_result() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1314,6 +1330,7 @@ async fn run_worker_builds_spec_and_uses_report_result() {
 
 #[tokio::test]
 async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1321,6 +1338,17 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
 
     let backend =
         MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    // The scratch home is removed when the session ends, so what the session
+    // was given is observed as it starts.
+    let config_dir_seeded = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed = std::sync::Arc::clone(&config_dir_seeded);
+    backend.observe_start(move |spec| {
+        let seeded = spec
+            .env
+            .get("HOME")
+            .is_some_and(|home| std::path::Path::new(home).join(".claude").is_dir());
+        *observed.lock().unwrap() = Some(seeded);
+    });
     let base_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
     run_worker(
         &backend,
@@ -1371,15 +1399,20 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         !spec.env.contains_key("CLAUDE_CONFIG_DIR"),
         "CLAUDE_CONFIG_DIR must NOT be relocated (keychain OAuth poison)"
     );
-    assert!(
-        std::path::Path::new(home).join(".claude").is_dir(),
-        "the seeded scratch config dir is HOME/.claude"
+    assert_eq!(
+        *config_dir_seeded.lock().unwrap(),
+        Some(true),
+        "the seeded scratch config dir is HOME/.claude while the session runs"
     );
+    // The home held a copy of the credential file. Nothing reads it once the
+    // session is over, so the run removes it.
+    assert_scratch_home_removed(&scratch_root);
 }
 
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn run_worker_routes_macos_fs_net_through_egress_proxy() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1445,6 +1478,7 @@ async fn run_worker_routes_macos_fs_net_through_egress_proxy() {
 
 #[tokio::test]
 async fn run_validator_builds_spec_permissions_and_parses_report() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1547,6 +1581,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
 /// the worker says it ran these, and is told they are not permitted.
 #[tokio::test]
 async fn worker_reported_commands_never_become_validator_allow_rules() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1614,6 +1649,7 @@ async fn worker_reported_commands_never_become_validator_allow_rules() {
 /// grants it: provenance is what changed, not the grant path.
 #[tokio::test]
 async fn granted_commands_still_allow_even_when_the_worker_reported_them() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1687,6 +1723,7 @@ async fn run_validator_rejects_non_validator_roles() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn run_validator_routes_macos_fs_net_through_egress_proxy() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1810,6 +1847,7 @@ fn validator_command_patterns_cover_natural_variations() {
 /// RunOutcome matches the live path.
 #[tokio::test]
 async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let log = seeded_log(&p);
@@ -2261,6 +2299,7 @@ async fn run_session_fs_net_proxy_start_failure_fails_closed_before_spawn() {
 /// the authoritative layer).
 #[tokio::test]
 async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -2268,6 +2307,14 @@ async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() 
 
     let backend =
         MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    // The spec file sits in the session's scratch home, which is removed when
+    // the session ends, so it is read as the session starts.
+    let spec_file_at_start = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed = std::sync::Arc::clone(&spec_file_at_start);
+    backend.observe_start(move |spec| {
+        *observed.lock().unwrap() =
+            std::fs::read_to_string(kranz_engine::hook_gates::spec_file(&spec.session_id)).ok();
+    });
     let touch_set = vec!["src/**".to_string(), "!src/generated/**".to_string()];
     let outcome = run_worker(
         &backend,
@@ -2318,8 +2365,14 @@ async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() 
         )),
         "the spec file lives under the session-private scratch root"
     );
-    let written: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&spec_path).unwrap()).unwrap();
+    let written: serde_json::Value = serde_json::from_str(
+        spec_file_at_start
+            .lock()
+            .unwrap()
+            .as_deref()
+            .expect("the spec file exists when the session starts"),
+    )
+    .unwrap();
     assert_eq!(written["touchSet"], json!(touch_set));
     assert_eq!(
         written["sessionCwd"],
@@ -2350,7 +2403,7 @@ async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() 
         .iter()
         .any(|e| matches!(&e.kind, EventKind::WorkerCompleted { .. })));
 
-    let _ = std::fs::remove_dir_all(kranz_engine::backend_claude::scratch_home_root(
+    assert_scratch_home_removed(&kranz_engine::backend_claude::scratch_home_root(
         &spec.session_id,
     ));
 }
@@ -2361,6 +2414,7 @@ async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() 
 /// backends without hook support behave (they ignore settings_json).
 #[tokio::test]
 async fn hook_gate_projection_empty_touch_set_leaves_worker_spec_unchanged() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -2368,6 +2422,14 @@ async fn hook_gate_projection_empty_touch_set_leaves_worker_spec_unchanged() {
 
     let backend =
         MockBackend::with_scripts(vec![MockScript::single_shot_json(&worker_report_json())]);
+    // The scratch home, where a spec file would be, is removed when the
+    // session ends, so the absence of the file is observed as it starts.
+    let spec_file_at_start = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed = std::sync::Arc::clone(&spec_file_at_start);
+    backend.observe_start(move |spec| {
+        *observed.lock().unwrap() =
+            Some(kranz_engine::hook_gates::spec_file(&spec.session_id).exists());
+    });
     run_worker(
         &backend,
         &mut log,
@@ -2396,7 +2458,11 @@ async fn hook_gate_projection_empty_touch_set_leaves_worker_spec_unchanged() {
         specs[0].settings_json.is_none(),
         "an empty touch set projects nothing"
     );
-    assert!(!kranz_engine::hook_gates::spec_file(&specs[0].session_id).exists());
+    assert_eq!(
+        *spec_file_at_start.lock().unwrap(),
+        Some(false),
+        "no spec file is projected for the session"
+    );
 }
 
 /// A gate-failing action inside the session surfaces as a structured
@@ -2482,7 +2548,36 @@ async fn hook_gate_projection_records_fold_into_the_log_before_worker_completed(
         other => panic!("expected hook.gate.fired, got {other:?}"),
     }
 
-    let _ = std::fs::remove_dir_all(kranz_engine::backend_claude::scratch_home_root(&session_id));
+    // The record was folded into the log above, and only then was the
+    // scratch home that held it removed.
+    assert_scratch_home_removed(&kranz_engine::backend_claude::scratch_home_root(
+        &session_id,
+    ));
+}
+
+/// A session that never starts still had a scratch home seeded for it when
+/// its spec was built. The failed run removes it rather than leaving a copy
+/// of the credential file behind.
+#[tokio::test]
+async fn a_session_that_fails_to_start_leaves_no_scratch_home() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    let mut spec = session_spec(PromptMode::SingleShot("task".to_string()));
+    spec.session_id = format!("start-failure-{}", uuid::Uuid::new_v4());
+    let scratch_root = kranz_engine::backend_claude::scratch_home_root(&spec.session_id);
+    let (home, _config) =
+        kranz_engine::backend_claude::seed_worker_scratch_home(&scratch_root, None, None).unwrap();
+    std::fs::write(home.join(".claude").join(".credentials.json"), "{}").unwrap();
+
+    // No script is queued, so the mock backend refuses to start a session.
+    let backend = MockBackend::new();
+    let result = run_session(&backend, spec, &mut log, &p, worker_meta("run-x"), None).await;
+
+    assert!(result.is_err(), "the backend refused to start");
+    assert_scratch_home_removed(&scratch_root);
 }
 
 /// The authoritative layer is unchanged: a worker that bypasses the hook
@@ -2494,6 +2589,7 @@ async fn hook_gate_projection_records_fold_into_the_log_before_worker_completed(
 /// also keep firing untouched.
 #[tokio::test]
 async fn hook_gate_projection_bypassed_failure_still_caught_by_the_sweep() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     // A real repo so the scripted commit lands; `.kranz/` ignored so the
@@ -2705,6 +2801,7 @@ fn spawned_prompt_hash(p: &MissionPaths) -> String {
 
 #[tokio::test]
 async fn flight_rules_projection_worker_prompt_projects_implementation_stage_only() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -2785,6 +2882,7 @@ async fn flight_rules_projection_worker_prompt_projects_implementation_stage_onl
 
 #[tokio::test]
 async fn flight_rules_projection_validator_prompts_project_validation_stage_only() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     for (role, surface) in [
         (Role::ValidatorScrutiny, "validator-scrutiny projection"),
         (Role::ValidatorFunctional, "validator-functional projection"),
@@ -2856,6 +2954,7 @@ async fn flight_rules_projection_validator_prompts_project_validation_stage_only
 
 #[tokio::test]
 async fn flight_rules_projection_no_pin_keeps_prompt_and_hash_byte_identical() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -2911,6 +3010,7 @@ async fn flight_rules_projection_no_pin_keeps_prompt_and_hash_byte_identical() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_worker_issues_and_revokes_a_sgian_credential() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     // This test changes process-wide binary selection. Keep every other
     // worker fixture in the workspace outside that environment.
     const MARKER: &str = "KRANZ_SGIAN_RUNNER_FIXTURE";
