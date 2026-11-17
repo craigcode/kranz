@@ -919,6 +919,17 @@ mod containment_remediation_tests {
         std::fs::create_dir_all(&locked_sub).unwrap();
         std::fs::write(locked_sub.join("data"), "x").unwrap();
         std::fs::set_permissions(&locked_sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // If an assertion below fails before the reap removes this
+        // directory, the temp directory could not delete a tree it cannot
+        // read. Declared after `dir`, so it runs first and makes the
+        // directory readable again. After a successful reap it finds nothing.
+        struct Unlock(std::path::PathBuf);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _unlock = Unlock(locked_sub.clone());
 
         let dead_ledger = tempfile::Builder::new()
             .prefix("kranz-mount-ledger-")
