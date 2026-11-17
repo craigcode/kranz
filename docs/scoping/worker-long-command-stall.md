@@ -83,9 +83,8 @@ session mode, not by a kranz deny pattern.
   session as `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`, the Claude
   CLI's documented variables for the default and the maximum foreground
   limit (the default is 120000, the "120s timeout" in the notice above).
-  Both carry the same value, so the model cannot name a shorter limit than
-  the operator configured and lose the command that way. Other backends
-  ignore the variables.
+  Both carry the same value, so the configured limit is also the ceiling.
+  Other backends ignore the variables.
 
 Checked on 2026-11-17 with Claude CLI 2.1.281, in a single-shot session with
 both variables set to 600000: a command that sleeps for 140 seconds stayed in
@@ -97,6 +96,13 @@ two-minute behaviour is the one recorded in the mission log above.
 
 - The record says a command left the foreground and the run did not pass. It
   does not prove the command was still running when the session ended.
+- The model can still name a shorter limit for a single command. That
+  command is moved to the background at the shorter limit, as before.
+- Nothing in the engine watches a worker or validator session for silence,
+  so while a long command runs the event log shows the tool call and then
+  nothing until it returns.
+- If a future agent CLI stops honouring the variables, sessions fall back to
+  the two-minute limit. The stall record is what would show it.
 - A worker can still start a command in the background itself. The limit
   does not change that, and such a run is still recorded as a stall.
 - A command that hangs now holds its session for up to the configured limit

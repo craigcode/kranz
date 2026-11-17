@@ -1114,8 +1114,9 @@ pub fn contract_env(base_sha: Option<&str>) -> HashMap<String, String> {
 /// variables: `BASH_DEFAULT_TIMEOUT_MS` is the limit a command gets when the
 /// model names none, and the CLI moves a command that outlasts it to the
 /// background; `BASH_MAX_TIMEOUT_MS` is the most the model may ask for. Both
-/// carry the same value so the model cannot ask for less room than the
-/// operator configured and then lose the command. `0` sets neither.
+/// carry the same value, so the configured limit is also the ceiling. The
+/// model may still name a shorter limit for one command, and that command
+/// is then moved to the background at the shorter limit. `0` sets neither.
 fn apply_agent_command_timeout(cfg: &MissionConfig, env: &mut HashMap<String, String>) {
     let secs = cfg
         .agent_command_timeout_secs
