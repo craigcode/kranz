@@ -1,6 +1,6 @@
 ---
 state: done
-state-note: Mission m-2a80fd delivered milestones 1 and 2 and was abandoned while blocked; milestone 3 was finished by hand on the same branch.
+state-note: Mission m-2a80fd delivered milestones 1 and 2 and was abandoned while blocked; milestone 3 was finished by hand on the same branch. Still owed: a retest on the reporting Windows host with a build from main, and a check of its worker.sandbox.enforce. Windows CI showed Git sh cannot start inside the AppContainer sandbox, so a host with the worker sandbox on still runs contract commands under cmd.exe; if the reporting host is one, open a ticket for a shell that runs inside the sandbox.
 title: Run contract commands on Windows the way the planner writes them
 priority: 1
 schedule: once
