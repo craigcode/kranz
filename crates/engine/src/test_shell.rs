@@ -88,22 +88,6 @@ pub(crate) fn sleep_millis(cwd: &std::path::Path, millis: u64) -> String {
 /// Git's `usr/bin` from PATH and leaves no `sleep`, `true`, or `false`
 /// binary — only the absolute `sh` the engine discovered itself.
 pub(crate) mod contract {
-    /// Succeed iff `path` exists as a file, relative to the command's cwd.
-    pub(crate) fn file_exists(path: &str) -> String {
-        format!("test -f {path}")
-    }
-
-    /// Succeed iff `path` exists, and then run `then` (itself a contract-lane
-    /// snippet).
-    pub(crate) fn if_file_exists(path: &str, then: &str) -> String {
-        format!("test -f {path} && {then}")
-    }
-
-    /// Write `text` to `path` as a single line.
-    pub(crate) fn write_line(text: &str, path: &str) -> String {
-        format!("echo {text} > {path}")
-    }
-
     /// Block for at least `millis`, without relying on a `sleep` binary.
     pub(crate) fn sleep_millis(cwd: &std::path::Path, millis: u64) -> String {
         if cfg!(windows) {
@@ -130,15 +114,6 @@ pub(crate) mod contract {
 #[cfg(unix)]
 #[test]
 fn contract_shell_lane_fixtures_unchanged_on_unix() {
-    assert_eq!(contract::file_exists(".marker"), "test -f .marker");
-    assert_eq!(
-        contract::if_file_exists(".marker", "echo mig > .out"),
-        "test -f .marker && echo mig > .out"
-    );
-    assert_eq!(
-        contract::write_line("hello", "out.txt"),
-        "echo hello > out.txt"
-    );
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(contract::sleep_millis(dir.path(), 1500), "sleep 1.5");
 }
