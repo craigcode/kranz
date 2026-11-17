@@ -10,7 +10,13 @@ targets = [
 all-features = true
 
 [advisories]
-ignore = []
+# RUSTSEC-2026-0543 (issued 2026-11-17): informational, chrono is
+# unmaintained. It reports no vulnerability and no unsound code, and no
+# patched version exists. Waived by the operator on 2026-11-17 so the
+# workspace can keep merging while chrono is replaced. Ticket
+# `replace-chrono` does the replacement and removes this entry. Every other
+# advisory, including any later one against chrono, still fails this check.
+ignore = ["RUSTSEC-2026-0543"]
 
 [licenses]
 confidence-threshold = 0.8
