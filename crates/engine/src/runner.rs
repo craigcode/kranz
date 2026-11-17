@@ -313,6 +313,13 @@ pub struct RunOutcome {
     /// through no proxy (unsandboxed, `fs`/`off`, bubblewrap, or container
     /// `--network none`). Mirrors `denied_commands`' shape.
     pub denied_egress: Vec<crate::egress_proxy::EgressDenial>,
+    /// Shell commands the agent CLI reported it had moved to, or started in,
+    /// the background (see [`is_backgrounded_command_notice`]), in first-seen
+    /// order; scrubbed, bounded and de-duplicated like `denied_commands`.
+    /// The stream never says whether such a command later finished, so this
+    /// records only that it left the foreground (ticket
+    /// `worker-long-command-stall`).
+    pub backgrounded_commands: Vec<String>,
 }
 
 /// Longest refusal category kept in the event log. Categories are short
@@ -354,6 +361,18 @@ fn refusal_note(raw: &serde_json::Value) -> Option<String> {
 /// command denials never reach this path.
 fn is_grantable_shell_tool(tool: &str) -> bool {
     tool.eq_ignore_ascii_case("bash") || tool.eq_ignore_ascii_case("command_execution")
+}
+
+/// Whether a tool result is the agent CLI's notice that a shell command left
+/// the foreground. These are the Claude CLI's two phrasings (a command that
+/// outlasted the foreground limit, and one started in the background); a
+/// backend with no such notice never matches. Matched at the start of the
+/// result so file contents that quote the phrase are not mistaken for it.
+fn is_backgrounded_command_notice(summary: &str) -> bool {
+    let summary = summary.trim_start();
+    summary.starts_with("Command running in background with ID:")
+        || (summary.starts_with("Command did not complete within its")
+            && summary.contains("was moved to the background"))
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +521,8 @@ async fn run_session_body(
     let mut last_tool_use: Option<(String, String)> = None;
     let mut denied_commands: Vec<String> = Vec::new();
     const DENIED_COMMANDS_CAP: usize = 16;
+    let mut backgrounded_commands: Vec<String> = Vec::new();
+    const BACKGROUNDED_COMMANDS_CAP: usize = 8;
     let mut cancelled = false;
 
     {
@@ -566,6 +587,23 @@ async fn run_session_body(
                     }
                     if let AgentEvent::ToolUse { tool, summary, .. } = &event {
                         last_tool_use = Some((tool.clone(), summary.clone()));
+                    }
+                    // Same positional correlation as a denial below: the
+                    // notice names no command, the preceding call does.
+                    if let AgentEvent::ToolResult { summary, .. } = &event {
+                        if is_backgrounded_command_notice(summary)
+                            && backgrounded_commands.len() < BACKGROUNDED_COMMANDS_CAP
+                        {
+                            if let Some((tool, command)) = &last_tool_use {
+                                let cmd = scrub::scrub_and_truncate(command, MESSAGE_CONTENT_MAX);
+                                if is_grantable_shell_tool(tool)
+                                    && !cmd.trim().is_empty()
+                                    && !backgrounded_commands.contains(&cmd)
+                                {
+                                    backgrounded_commands.push(cmd);
+                                }
+                            }
+                        }
                     }
                     if sink.handle(&run_meta.run_id, &event)? {
                         denied_count += 1;
@@ -765,6 +803,7 @@ async fn run_session_body(
         denied_count,
         denied_commands,
         denied_egress,
+        backgrounded_commands,
     })
 }
 
@@ -2124,6 +2163,26 @@ fn apply_egress_grants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Claude CLI's two notices match only at the start of a tool
+    /// result, so a file that quotes them is not read as a notice.
+    #[test]
+    fn backgrounded_command_notice_matches_only_the_cli_notices() {
+        assert!(is_backgrounded_command_notice(
+            "Command did not complete within its 120s timeout and was moved to the background \
+             (ID: b1). Output is being written to: /tmp/out"
+        ));
+        assert!(is_backgrounded_command_notice(
+            "Command running in background with ID: b2. Output is being written to: /tmp/out"
+        ));
+        assert!(!is_backgrounded_command_notice(
+            "12\t    \"Command running in background with ID: b2\""
+        ));
+        assert!(!is_backgrounded_command_notice(
+            "Command did not complete within its 120s timeout"
+        ));
+        assert!(!is_backgrounded_command_notice("test result: ok. 3 passed"));
+    }
 
     #[test]
     fn refusal_note_fires_only_on_a_refusal_stop_reason() {

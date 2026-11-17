@@ -5,6 +5,19 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: config `grantRequestTimeoutSecs` sets how long a parked grant
+  request waits before it is denied by default. Without it the wait stays
+  one hour. `kranz exec` now defaults to 300 seconds and takes
+  `--grant-wait <SECS>`; an `--enqueue` mission keeps the one-hour default
+  unless the flag or the config key is given. When a wait starts the engine
+  prints one stderr line naming the request, the wait and the
+  `kranz grant approve` command that answers it, and the `grant.denied`
+  reason states the wait. Nothing is ever approved by a timeout.
+- Changed: a worker run that ends without passing after the agent CLI moved
+  one of its commands to the background is recorded as its own
+  `orchestrator.decision`, naming the commands. The first such run for a
+  feature is not counted against `maxRespawns`. See
+  `docs/scoping/worker-long-command-stall.md`.
 - Fixed: on macOS and Linux a session's scratch home
   (`kranz-worker-home-<session id>` in the temp directory or under
   `KRANZ_SCRATCH_ROOT`) is removed when the session ends, and also when the

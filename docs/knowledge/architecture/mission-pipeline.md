@@ -41,6 +41,8 @@ verified_against:
   - docs/design.md
 ---
 
+Rechecked 2026-11-17 (UTC) against the grant wait and stall record: the wait before a parked grant request is denied by default comes from config `grantRequestTimeoutSecs` (absent keeps one hour; `kranz exec` substitutes 300 seconds unless `--grant-wait` or the config key says otherwise), the engine prints one stderr line per request naming the wait and the answering command, and the denial reason states the wait. A worker run that ends without passing after the agent CLI moved one of its commands to the background is recorded as an `orchestrator.decision`, and the first such run per feature is not counted against `maxRespawns` (`docs/scoping/worker-long-command-stall.md`). Pipeline stages, their order and the event schema are unchanged.
+
 Rechecked 2026-11-17 (UTC) against the temp-directory cleanup: on Unix `runner::run_session_to` owns the session's scratch home through `session_scratch::SessionScratch` and removes it after the hook records are folded, on every return path, and the worker spec builder owns it from before it is seeded, so a worker refused before its session starts leaves none; the decompose planner, the read-back reviewer, `ask` and the worker-auth preflight do the same, and the preflight probe now runs in a directory inside its own home, whose name ends in a UUID. The removal runs on the runtime's blocking pool. Nothing is removed on Windows. The `kranz` binary releases its empty git config directory after the runtime is dropped (`main.rs`, `git_ops::release_empty_global_config`). Abandon, `kranz clean` and the server's delete route remove a mission's worktrees that hold only committed files; see "Resumability" below. `EventLog::replaced_an_existing_lock` reports whether an acquire took an existing lock file over. Pipeline stages, event kinds and their order are unchanged. The long-lived orchestrator session's scratch home is still not removed.
 
 Rechecked 2026-11-16 (UTC) against the Windows first-run fixes: the event-log lock now probes its holder on Windows (`OpenProcess`, with the process creation time as the identity token) and serializes a steal under a named mutex, so a dead holder is taken over there as on Unix. `kranz exec` checks the AppContainer host preparation before it creates a mission and prints its stdout line with status `ERROR` when the run errors. The review packet JSON gains `schemaVersion`, `missionStatus` and `nativeChecks`. The queue change is a comment. The pipeline and the single-writer rule are unchanged.
@@ -302,8 +304,9 @@ records `start_sha`; then the next feature runs or the milestone enters
 `max_parallel_workers > 1`.
 
 So the loop walks **milestones → features → workers → validators → judgement**:
-`run_feature` runs the worker (bounded respawn, dirty-tree discipline, a JSON
-judgement turn), then refreshes protected Git handles before inspecting the
+`run_feature` runs the worker (bounded respawn, with one uncounted respawn per
+feature for a run that ended with its command in the background; dirty-tree
+discipline; a JSON judgement turn), then refreshes protected Git handles before inspecting the
 delivered tree. Every local Git invocation rechecks the handle's original
 driver boundary and refuses new driver names or conditional includes. Sequential
 features pin their baseline in `feature.progress` before execution and retain

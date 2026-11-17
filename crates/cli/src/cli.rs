@@ -435,6 +435,13 @@ pub enum Command {
         /// lesson 3). The `KRANZ_ALLOW_UNVALIDATED=1` env var is equivalent.
         #[arg(long)]
         allow_unvalidated: bool,
+
+        /// Seconds a parked grant request waits for `kranz grant approve`
+        /// before it is denied by default. Without this flag exec uses
+        /// config `grantRequestTimeoutSecs`, else 300 (the interactive and
+        /// served default is 3600). 0 denies at once.
+        #[arg(long, value_name = "SECS")]
+        grant_wait: Option<u64>,
     },
 
     /// Show or remove an entry from the per-repo execution queue

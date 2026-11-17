@@ -467,6 +467,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             enqueue_external_ref,
             push,
             allow_unvalidated,
+            grant_wait,
         } => crate::exec::cmd_exec(
             repo,
             file,
@@ -482,6 +483,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
                 push,
                 dangerously_allow_all: cli.dangerously_allow_all,
                 allow_unvalidated,
+                grant_wait_secs: grant_wait,
             },
         )
         .await

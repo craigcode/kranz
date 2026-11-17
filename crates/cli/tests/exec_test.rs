@@ -144,6 +144,21 @@ fn exec_enqueue_is_explicit_and_conflicts_with_push() {
 }
 
 #[test]
+fn parses_exec_grant_wait_and_defaults_to_unset() {
+    let cli = Cli::try_parse_from(["kranz", "exec", "-f", "mission.md"]).unwrap();
+    match cli.command {
+        Command::Exec { grant_wait, .. } => assert_eq!(grant_wait, None),
+        other => panic!("unexpected: {other:?}"),
+    }
+    let cli =
+        Cli::try_parse_from(["kranz", "exec", "-f", "mission.md", "--grant-wait", "45"]).unwrap();
+    match cli.command {
+        Command::Exec { grant_wait, .. } => assert_eq!(grant_wait, Some(45)),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
 fn allow_unvalidated_defaults_to_false() {
     let cli = Cli::try_parse_from(["kranz", "exec", "-f", "mission.md"]).unwrap();
     match cli.command {

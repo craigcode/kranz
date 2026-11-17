@@ -94,6 +94,29 @@ pub struct ExecOptions {
     pub push: Option<String>,
     pub dangerously_allow_all: bool,
     pub allow_unvalidated: bool,
+    /// `--grant-wait`: seconds a parked grant request waits before it is
+    /// denied by default.
+    pub grant_wait_secs: Option<u64>,
+}
+
+/// How long `kranz exec` lets a parked grant request wait when neither
+/// `--grant-wait` nor config `grantRequestTimeoutSecs` says otherwise. A
+/// headless run has no operator by definition, so the engine's one-hour
+/// default would be most of the run. Long enough to answer from another
+/// terminal with `kranz grant approve`.
+pub const EXEC_DEFAULT_GRANT_WAIT_SECS: u64 = 300;
+
+/// The grant wait an exec mission is created with: the flag, else the
+/// configured value, else the headless default. An enqueue-only mission is
+/// run later by `kranz work`, which may have an operator, so it gets the
+/// headless default only when asked for by flag or config.
+pub fn exec_grant_wait_secs(
+    flag: Option<u64>,
+    configured: Option<u64>,
+    enqueue: bool,
+) -> Option<u64> {
+    flag.or(configured)
+        .or((!enqueue).then_some(EXEC_DEFAULT_GRANT_WAIT_SECS))
 }
 
 pub struct ExternalEnqueueSource {
@@ -218,7 +241,7 @@ fn sandbox_host_preflight(cfg: &MissionConfig) -> std::result::Result<(), String
 /// a real `claude` binary.
 async fn cmd_exec_with_backend(
     repo: PathBuf,
-    cfg: MissionConfig,
+    mut cfg: MissionConfig,
     backend: Arc<dyn AgentBackend>,
     ticket: Ticket,
     file: PathBuf,
@@ -242,6 +265,11 @@ async fn cmd_exec_with_backend(
     // are out of the way.
     let mut checkout_guard = EnqueueCheckoutGuard::new(&repo, options.enqueue);
     let goal = ticket.mission_goal();
+    cfg.grant_request_timeout_secs = exec_grant_wait_secs(
+        options.grant_wait_secs,
+        cfg.grant_request_timeout_secs,
+        options.enqueue,
+    );
     let mut engine = MissionEngine::create(backend, repo.clone(), &goal, cfg)?;
     let mission_id = engine.mission_id().to_string();
     eprintln!(
@@ -665,6 +693,20 @@ mod tests {
         (tmp, repo)
     }
 
+    /// A headless run gets the short wait; a flag or a configured value
+    /// wins; an enqueue-only mission keeps the engine default unless told.
+    #[test]
+    fn exec_grant_wait_defaults_short_and_yields_to_flag_and_config() {
+        assert_eq!(EXEC_DEFAULT_GRANT_WAIT_SECS, 300);
+        assert_eq!(exec_grant_wait_secs(None, None, false), Some(300));
+        assert_eq!(exec_grant_wait_secs(Some(30), Some(900), false), Some(30));
+        assert_eq!(exec_grant_wait_secs(None, Some(900), false), Some(900));
+        assert_eq!(exec_grant_wait_secs(Some(0), None, false), Some(0));
+        assert_eq!(exec_grant_wait_secs(None, None, true), None);
+        assert_eq!(exec_grant_wait_secs(Some(30), None, true), Some(30));
+        assert_eq!(exec_grant_wait_secs(None, Some(900), true), Some(900));
+    }
+
     fn push_preflight_options(remote: &str) -> ExecOptions {
         ExecOptions {
             max_cycles: Some(1),
@@ -673,6 +715,7 @@ mod tests {
             push: Some(remote.to_string()),
             dangerously_allow_all: false,
             allow_unvalidated: false,
+            grant_wait_secs: None,
         }
     }
 
@@ -1133,6 +1176,7 @@ mod tests {
                 push: None,
                 dangerously_allow_all: false,
                 allow_unvalidated: false,
+                grant_wait_secs: None,
             },
         )
         .await

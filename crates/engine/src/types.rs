@@ -1769,6 +1769,14 @@ pub struct MissionConfig {
     /// all). Empty (the default) means loopback only.
     #[serde(default)]
     pub local_backend_allowed_hosts: Vec<String>,
+    /// How long a parked grant request waits for an operator before it is
+    /// denied by default, in seconds (ticket
+    /// `headless-grant-request-fails-fast`). Absent keeps the one-hour
+    /// default; `kranz exec` substitutes its own short default when the key
+    /// is absent. `0` denies on the first run-loop tick. The outcome is
+    /// always a denial: this key never approves anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_request_timeout_secs: Option<u64>,
 }
 
 impl Default for MissionConfig {
@@ -1861,6 +1869,7 @@ impl Default for MissionConfig {
             hook_status: None,
             validator_allow_uncontained_degrade: false,
             local_backend_allowed_hosts: Vec::new(),
+            grant_request_timeout_secs: None,
         }
     }
 }
