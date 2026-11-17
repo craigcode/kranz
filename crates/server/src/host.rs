@@ -1726,6 +1726,8 @@ async fn run_ask_session(
     backend: Arc<dyn AgentBackend>,
     spec: SessionSpec,
 ) -> Result<AskRunOutcome, ApiError> {
+    // Dropped after `session`: removes the ask session's scratch home.
+    let _scratch = kranz_engine::session_scratch::SessionScratch::for_session(&spec.session_id);
     let mut session = backend.start(spec).await.map_err(ApiError::from)?;
     let mut streamed_text = String::new();
     let mut result_text = None;

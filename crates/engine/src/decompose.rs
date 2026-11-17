@@ -163,6 +163,8 @@ pub async fn plan_decomposition(
         &mut spec,
     );
 
+    // Dropped after `session`: removes the planner session's scratch home.
+    let _scratch = crate::session_scratch::SessionScratch::for_session(&spec.session_id);
     let mut session = backend.start(spec).await?;
     let text = pump_planner(session.as_mut()).await?;
     parse_planner_output(&text)
