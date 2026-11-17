@@ -58,17 +58,6 @@ fn file_exists_cmd(path: &str) -> String {
     }
 }
 
-/// Portable "write `text` as one line into `path`". `printf` is a POSIX binary
-/// cmd.exe cannot run; `echo` is a builtin in both shells. cmd would carry the
-/// space before `>` into the file, so close it up there.
-fn write_line_cmd(text: &str, path: &str) -> String {
-    if cfg!(windows) {
-        format!("echo {text}>{path}")
-    } else {
-        format!("echo {text} > {path}")
-    }
-}
-
 /// Portable "succeed iff `path` exists, then run `then`".
 fn if_file_exists_cmd(path: &str, then: &str) -> String {
     if cfg!(windows) {
@@ -76,6 +65,22 @@ fn if_file_exists_cmd(path: &str, then: &str) -> String {
     } else {
         format!("test -f {path} && {then}")
     }
+}
+
+/// Contract-lane variant of `file_exists_cmd`: validation-contract command
+/// assertions (final-gate, approval lint) run under `sh` everywhere —
+/// uncontained Windows resolves a Git-for-Windows `sh.exe`, same as Unix —
+/// so these need only the POSIX spelling, never the cmd one. Integration
+/// tests cannot see `kranz_engine::test_shell`'s crate-private helpers, so
+/// this is a local copy rather than a re-export.
+fn file_exists_contract(path: &str) -> String {
+    format!("test -f {path}")
+}
+
+/// Contract-lane variant that writes a line via POSIX `sh`, for the same
+/// reason as `file_exists_contract`.
+fn write_line_contract(text: &str, path: &str) -> String {
+    format!("echo {text} > {path}")
 }
 
 /// Generous bound proving the engine loop cannot hang in tests.
@@ -2162,7 +2167,7 @@ async fn workspace_bootstrap_readiness_gate_runs_before_workers() {
     let contract = vec![assertion(
         "a-1",
         "the workspace marker exists",
-        Some(&file_exists_cmd(".boot-marker")),
+        Some(&file_exists_contract(".boot-marker")),
     )];
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
@@ -3110,7 +3115,7 @@ async fn golden_data_hooks_run_in_provision_order_before_workers() {
     let contract = vec![assertion(
         "a-1",
         "the skew check ran",
-        Some(&file_exists_cmd(".data-skew-marker")),
+        Some(&file_exists_contract(".data-skew-marker")),
     )];
     let backend = Arc::new(MockBackend::with_scripts(vec![
         worker_pass(),
@@ -7689,7 +7694,7 @@ async fn approval_lint_uses_disposable_base_and_preserves_primary_checkout() {
         vec![assertion(
             "",
             "hostile approval assertion",
-            Some(&write_line_cmd("tampered", "README.md")),
+            Some(&write_line_contract("tampered", "README.md")),
         )],
     );
     engine.approve_plan(plan).unwrap();
@@ -7751,7 +7756,7 @@ async fn approval_lint_is_contained_when_enforce_is_off() {
         vec![assertion(
             "",
             "hostile approval assertion",
-            Some(&write_line_cmd(
+            Some(&write_line_contract(
                 "escaped",
                 &format!("'{}'", target.display()),
             )),
@@ -8112,7 +8117,14 @@ async fn gate_result_events_record_the_approval_ladder() {
                         .as_str()
                         .unwrap()
                         .to_string(),
-                    artefact_ref.clone(),
+                    // host-shell-syntax names the shell it was judged
+                    // against, an absolute path on Windows: compare the
+                    // stable part.
+                    artefact_ref
+                        .split(" (judged against ")
+                        .next()
+                        .unwrap()
+                        .to_string(),
                 ))
             }
             _ => None,
@@ -8134,14 +8146,20 @@ async fn gate_result_events_record_the_approval_ladder() {
                 "contract gate wrong-polarity".to_string()
             ),
             (
-                "passes-on-base".to_string(),
+                "host-shell-syntax".to_string(),
                 2,
+                "pass".to_string(),
+                "contract gate host-shell-syntax".to_string()
+            ),
+            (
+                "passes-on-base".to_string(),
+                3,
                 "fail".to_string(),
                 "contract gate passes-on-base".to_string()
             ),
             (
                 "env-sensitive".to_string(),
-                3,
+                4,
                 "pass".to_string(),
                 "contract gate env-sensitive".to_string()
             ),
@@ -8260,7 +8278,8 @@ async fn gate_result_events_record_the_final_gate_ladder() {
         vec![
             ("vacuous-filter".to_string(), 0, "pass".to_string()),
             ("wrong-polarity".to_string(), 1, "fail".to_string()),
-            ("env-sensitive".to_string(), 2, "pass".to_string()),
+            ("host-shell-syntax".to_string(), 2, "pass".to_string()),
+            ("env-sensitive".to_string(), 3, "pass".to_string()),
         ],
         "the final-gate floor, in pipeline order, passes and failures alike"
     );

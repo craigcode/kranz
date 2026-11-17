@@ -1,0 +1,369 @@
+# Mission plan — m-2a80fd
+
+**Goal:** On Windows, run validation-contract commands under an absolute, worker-unwritable Git-for-Windows POSIX sh when it is available and the gate posture is uncontained; otherwise run them through cmd.exe with the command text handed over unencoded. Record which shell ran each command, and add an advisory approval-stage `host-shell-syntax` gate that flags contract syntax the resolved host shell will not honor. Unix behaviour stays byte-identical.
+
+Branch `kranz/mission-m-2a80fd` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Authority granted on approval
+
+Approving this plan grants the following to the mission's sessions with no further prompt.
+
+**Write paths** (6; glob patterns the mission may change):
+- `crates/engine/src/**`
+- `crates/engine/tests/**`
+- `crates/cli/tests/**`
+- `.github/workflows/ci.yml`
+- `docs/knowledge/**`
+- `docs/scoping/m7-windows-containment.md`
+
+## Cost estimate
+
+Estimated **$14.09 – $70.44** (expected ~$32.26). Rough estimate — live usage is authoritative; based on 50 completed mission(s).
+
+Context-fit check (corpus p90 over 58 plan(s): 4275 chars / 23 files):
+- **f-1-1** (Contract-shell type, Git-for-Windows sh discovery, and lane/posture selection) — spec is 5542 chars (corpus p90: 4275)
+- **f-1-2** (Hand the command to cmd.exe unencoded on the uncontained and AppContainer paths) — spec is 4973 chars (corpus p90: 4275); spec points at 27 files (corpus p90: 23)
+- **f-2-1** (Route contract commands through the resolved contract shell and record the shell in evidence) — spec is 5094 chars (corpus p90: 4275)
+
+## Considered alternatives
+
+**Chosen approach:** Use a Git-for-Windows absolute sh for uncontained contract commands only. Keep cmd (now fed the command unencoded via `/S /C`) for the AppContainer contract path and all repo-authored lanes. Add a CI receipt that records whether sh can run contained, and an advisory host-shell-syntax gate judged against the validation posture's shell. This fixes the reported case (enforce defaults to off), honours 'prove before making it the default' on a mission host that cannot run Windows, and changes no repo-authored hook semantics.
+
+Rejected shapes:
+- **Make sh the default for every Windows posture, including AppContainer, now** — Breaks the operator's rule to prove sh runs contained first, and the mission host (macOS) cannot produce that proof.
+- **Probe sh inside the wrap at every gate resolution and fall back to cmd on failure** — Adds a contained launch to every resolution, and the shell can change silently between hosts or runs.
+- **Switch every shell_argv lane (merge gates, workspace hooks, external and pack gates) to sh on Windows** — Changes the meaning of repo-authored commands that may be written in cmd syntax, well beyond the contract-command fault that was reported.
+- **Fix only cmd quoting and keep cmd everywhere** — Leaves `$KRANZ_BASE_SHA` and the other POSIX syntax that the planner prompt and docs use failing on Windows.
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** On Unix, GateSandbox::Disabled and the contract-command lane still produce exactly program `sh` with args [`-c`, <command>], byte-identical to the pre-mission shell_argv, for both contract and repo-authored lanes.
+  `cargo test --workspace shell_argv_unix_ 2>&1 | grep -qE 'test result: ok\. [1-9]'`
+- **[a2]** The cmd.exe command-line builder hands the command text over verbatim as `/S /C "<command>"`: a command of the shape `prog -e "a 'b' c"` keeps every inner double quote with no backslash inserted, and a command that begins with a quoted program path survives intact.
+  `cargo test --workspace cmd_raw_tail_ 2>&1 | grep -qE 'test result: ok\. [1-9]'`
+- **[a3]** POSIX sh resolution accepts only an absolute, existing, canonicalized candidate that lies outside every forbidden root (repo, worktree, mission dir, gate scratch, sandbox write roots). It refuses bare names, relative paths and a planted sh inside a forbidden root, including one reached through `..` or a symlink, and returns none when no candidate exists.
+  `cargo test --workspace posix_sh_resolution_ 2>&1 | grep -qE 'test result: ok\. [1-9]'`
+- **[a4]** Shell selection: Unix always selects bare `sh`. On Windows, repo-authored lanes (merge gates, workspace hooks, external and pack gates) select cmd. The contract lane selects cmd under the AppContainer posture, selects the resolved absolute sh when uncontained with sh available, and selects cmd when uncontained without sh.
+  `cargo test --workspace contract_shell_lane_ 2>&1 | grep -qE 'test result: ok\. [1-9]'`
+- **[a5]** The evidence names the shell that ran each contract command: the validation-round verdict line, the final-gate failing-command finding evidence, and the approval contract-lint rendering each carry a `shell:` label (just `sh` on Unix).
+  `cargo test --workspace contract_shell_recorded_ 2>&1 | grep -qE 'test result: ok\. [1-9]'`
+- **[a6]** The `host-shell-syntax` contract gate, judged against cmd, FAILs and names the assertion id for `$NAME`/`${NAME}` expansion, `$(...)`/backticks, single-quoted arguments, a leading `!` negation and `;` sequencing. It PASSes `node -e "..."` one-liners and the repo's own .kranz/merge-gates.json commands, and PASSes every command when judged against sh.
+  `cargo test --workspace host_shell_syntax_ 2>&1 | grep -qE 'test result: ok\. [1-9]'`
+- **[a7]** With the host contract shell resolved to cmd (no sh available), approving a contract that contains `$NAME` expansion still approves (the gate is advisory), and the approval decision and plan.md record `host-shell-syntax: FAIL` naming that assertion's id. Under sh the same contract records PASS.
+  `cargo test --workspace approval_host_shell_ 2>&1 | grep -qE 'test result: ok\. [1-9]'`
+- **[a8]** Every named Windows receipt exists as a test function and is run by name in the Windows CI lane: inner double quotes on the sh and cmd paths, the pinned KRANZ_BASE_SHA under sh, a planted sh.exe never executed, contained cmd quoting, and the contained-sh receipt.
+  `for t in windows_contract_shell_sh_keeps_inner_double_quotes windows_contract_shell_cmd_keeps_inner_double_quotes windows_contract_shell_sh_sees_pinned_base_sha windows_contract_shell_planted_sh_is_never_executed windows_contract_shell_appcontainer_cmd_keeps_inner_double_quotes windows_contract_shell_appcontainer_sh_receipt; do grep -q "$t" .github/workflows/ci.yml && grep -rqE "fn $t\(" crates/ || exit 1; done`
+- **[a9]** The Windows CI lane surfaces the contained-sh proof outcome by requiring and printing the `KRANZ_WINDOWS_SH_CONTAINED=` marker line.
+  `grep -q 'KRANZ_WINDOWS_SH_CONTAINED=' .github/workflows/ci.yml && grep -rq 'KRANZ_WINDOWS_SH_CONTAINED=' crates/`
+- **[a10]** Formatting is clean.
+  `cargo fmt --all --check`
+- **[a11]** Clippy passes with warnings denied across the workspace and all targets.
+  `cargo clippy --workspace --all-targets -- -D warnings`
+- **[a12]** The full workspace test suite passes.
+  `cargo test --workspace`
+- **[a13]** The workspace builds.
+  `cargo build --workspace`
+- **[a14]** The knowledge vault is fresh: every check-on-touch note citing a changed file has been rechecked.
+  `cargo run --locked --package kranz -- knowledge-refresh`
+- **[a15]** Contract files change additively only: no line is removed from crates/engine/src/types.rs or crates/engine/src/events.rs relative to the pinned base.
+  `! git diff $KRANZ_BASE_SHA -- crates/engine/src/types.rs crates/engine/src/events.rs | grep -qE '^-([^-]|$)'`
+- **[a16]** The frozen planner prompt file is untouched.
+  `git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/prompts.rs`
+- **[a17]** No sandbox is widened. No write root, read root, ACL grant, capability, authority deny or Seatbelt/bubblewrap/AppContainer profile rule is added to make sh run. The gate signal policy is unchanged. Every wrap or resolution failure still fails closed, never falling back to an unsandboxed run. The AppContainer contract path stays cmd. *(agent judgement)*
+- **[a18]** sh is never resolved by bare name from a child's PATH or working directory. Discovery uses only the engine's own Git installation, and the chosen path is canonicalized and checked against every worker-writable root before use. *(agent judgement)*
+- **[a19]** The docs (docs/knowledge/validation/child-containment.md, docs/knowledge/validation/gates.md, docs/scoping/m7-windows-containment.md) cover four things. They state which shell runs contract commands on each platform and posture. They state that the AppContainer contract path stays cmd until the KRANZ_WINDOWS_SH_CONTAINED receipt passes. They explain how to read the `shell:` label in the evidence. They describe the advisory host-shell-syntax gate. *(agent judgement)*
+## Contract lint
+
+Each `check: command` assertion above was run once against the untouched base tree at approval time. Suspects are assertions that already pass (or could not reach a verdict) before this plan's work lands — a possible polarity/vacuity bug in the assertion itself. This never blocks approval.
+
+author-bug suspects (already pass / no verdict on the untouched base): [a10] cargo fmt --all --check; [a11] cargo clippy --workspace --all-targets -- -D warnings
+base-expected-to-fail (benign): [a1] cargo test --workspace shell_argv_unix_ 2>&1 | grep -qE 'test result: ok\. [1-9]'; [a2] cargo test --workspace cmd_raw_tail_ 2>&1 | grep -qE 'test result: ok\. [1-9]'; [a3] cargo test --workspace posix_sh_resolution_ 2>&1 | grep -qE 'test result: ok\. [1-9]'; [a4] cargo test --workspace contract_shell_lane_ 2>&1 | grep -qE 'test result: ok\. [1-9]'; [a5] cargo test --workspace contract_shell_recorded_ 2>&1 | grep -qE 'test result: ok\. [1-9]'; [a6] cargo test --workspace host_shell_syntax_ 2>&1 | grep -qE 'test result: ok\. [1-9]'; [a7] cargo test --workspace approval_host_shell_ 2>&1 | grep -qE 'test result: ok\. [1-9]'; [a8] for t in windows_contract_shell_sh_keeps_inner_double_quotes windows_contract_shell_cmd_keeps_inner_double_quotes windows_contract_shell_sh_sees_pinned_base_sha windows_contract_shell_planted_sh_is_never_executed windows_contract_shell_appcontainer_cmd_keeps_inner_double_quotes windows_contract_shell_appcontainer_sh_receipt; do grep -q "$t" .github/workflows/ci.yml && grep -rqE "fn $t\(" crates/ || exit 1; done; [a9] grep -q 'KRANZ_WINDOWS_SH_CONTAINED=' .github/workflows/ci.yml && grep -rq 'KRANZ_WINDOWS_SH_CONTAINED=' crates/; [a12] cargo test --workspace
+not linted (never run on the base): [a13] cargo build --workspace; [a14] cargo run --locked --package kranz -- knowledge-refresh; [a15] ! git diff $KRANZ_BASE_SHA -- crates/engine/src/types.rs crates/engine/src/events.rs | grep -qE '^-([^-]|$)'; [a16] git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/prompts.rs
+
+named contract gates (defect classes):
+- vacuous-filter: PASS
+- wrong-polarity: PASS
+- passes-on-base: FAIL
+  [a10] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo fmt --all --check`
+  [a11] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo clippy --workspace --all-targets -- -D warnings`
+- env-sensitive: PASS
+
+
+## Milestone 1 — Windows shell selection and cmd.exe hand-off are correct in isolation
+
+### 1.1 Contract-shell type, Git-for-Windows sh discovery, and lane/posture selection
+
+Repo: Rust workspace at the repo root (crates/engine is `kranz-engine`). Read docs/knowledge/validation/child-containment.md first: children are hostile, nothing may widen the sandbox, and wraps fail closed.
+
+BACKGROUND: every contract, gate and hook command bottoms out in `shell_argv` (crates/engine/src/command_exec.rs:408). It returns `cmd /C <command>` on Windows and `sh -c <command>` elsewhere. The operator has decided that on Windows, validation-contract commands should run under a POSIX sh when one is safely available. Git for Windows ships one at `<GitRoot>\usr\bin\sh.exe`, and kranz already requires Git. Everything else stays on cmd.
+
+THIS FEATURE builds only the types and the pure selection logic. Do NOT wire it into execution: a later feature does that. Do NOT change shell_argv or any existing behaviour.
+
+Create a new module crates/engine/src/contract_shell.rs, declared in crates/engine/src/lib.rs with `pub(crate) mod contract_shell;` and NOT cfg-gated, so its tests run on macOS and Linux.
+
+(1) Types:
+- `pub(crate) enum ShellKind { Sh, Cmd }` with `as_str()` returning "sh" or "cmd".
+- `pub(crate) struct HostShell { pub kind: ShellKind, pub program: PathBuf }` with `label() -> String`. On Unix the program is exactly the bare `sh` and the label is exactly `sh`. A Windows sh labels as `sh (<absolute path>)`. cmd labels as `cmd`.
+- `pub(crate) enum ShellLane { Contract, Repo }`. Contract means validation-contract command assertions (validation rounds, final-gate command assertions, the approval contract lint). Repo means merge gates, workspace bootstrap/readiness/data hooks, external gates, and pack/standards gate declarations.
+
+(2) Pure selection: `pub(crate) struct HostFacts { pub windows: bool, pub contained: bool, pub posix_sh: Option<PathBuf> }` and `pub(crate) fn select_shell(lane: ShellLane, facts: &HostFacts) -> HostShell`. Here `contained` means the gate posture is AppContainer. Rules:
+- Not Windows: Sh with bare `sh`, for every lane.
+- Windows, Repo lane: Cmd.
+- Windows, Contract lane, contained: Cmd. Git's sh has not been proven to run inside the AppContainer wrap. That proof is a CI receipt written in a later feature, so the contained path stays cmd. Say so in a doc comment.
+- Windows, Contract lane, uncontained, posix_sh Some(p): Sh with program p.
+- Otherwise: Cmd. The Cmd program is `cmd`, matching today's resolution.
+
+(3) Pure resolution: `pub(crate) fn posix_sh_resolution(candidates: &[PathBuf], forbidden_roots: &[PathBuf]) -> Option<PathBuf>`.
+- A candidate must be absolute; refuse bare names like `sh.exe` and relative paths.
+- It must exist as a regular file after `std::fs::canonicalize`.
+- Its canonical path must not be inside any canonicalized forbidden root. Compare by path components, case-insensitively on Windows; strip the `\\?\` verbatim prefix consistently. appcontainer_windows.rs has `local_dos_path` and `comparable_path`, but that module is cfg(windows), so write a small cross-platform helper here.
+- Return the first passing candidate in order.
+
+(4) Windows-only discovery, `#[cfg(windows)] pub(crate) fn git_for_windows_sh_candidates() -> Vec<PathBuf>`:
+- Run the ENGINE's own git, exactly the way the engine already runs git. Search crates/engine/src/git_ops.rs for how it spawns git and reuse that resolution. Use the engine's host environment, never a child's cleared or sanitized PATH. Set the working directory to a neutral directory such as std::env::temp_dir(), never the worktree.
+- Ask it for `git --exec-path`, typically `C:/Program Files/Git/mingw64/libexec/git-core`. Walk up the ancestors to the first directory containing `usr\bin\sh.exe`, and add that file.
+- Also add `%ProgramFiles%\Git\usr\bin\sh.exe`, read from the engine's own environment.
+- Prefer `usr\bin\sh.exe`, the real MSYS shell, over the `bin\sh.exe` launcher wrapper.
+- No registry access and no new dependencies.
+
+(5) Glue: `pub(crate) fn resolve_contract_shell(lane: ShellLane, contained: bool, forbidden_roots: &[PathBuf]) -> HostShell`. It builds HostFacts from cfg!(windows), the given `contained`, and (on Windows only, for the Contract lane only, when uncontained) posix_sh_resolution(git_for_windows_sh_candidates(), forbidden_roots). Callers will pass these forbidden roots: primary repo root, active root/worktree, mission dir, gate scratch and TMPDIR, and every sandbox write root (`crate::sandbox::write_allowlist(inputs)` where inputs exist). Document that list in the doc comment.
+
+TESTS go in a `#[cfg(test)] mod tests` in contract_shell.rs and must run on macOS. Name them with these exact prefixes:
+- `posix_sh_resolution_`: bare name refused; relative path refused; a file planted inside a forbidden root refused, including via `root/sub/../sh` and via a symlink into the root (unix symlink test cfg(unix)); a missing file yields None; a valid file outside every root yields its canonical path; the first valid candidate wins. Use tempfile dirs; check Cargo.toml dev-deps for the existing temp-dir helper.
+- `contract_shell_lane_`: every select_shell rule above, including that Unix yields program exactly `sh` and label exactly `sh`.
+
+Run `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace posix_sh_resolution_` / `contract_shell_lane_`. If `rustup target list --installed` shows a Windows target, also try `cargo check -p kranz-engine --all-targets --target x86_64-pc-windows-gnu` (or -msvc). Report the outcome, but do not fight toolchain or C-compiler failures. Do not edit types.rs or events.rs.
+
+Done when:
+- `cargo test --workspace posix_sh_resolution_` runs at least one passing test covering bare-name refusal, relative-path refusal, planted-in-forbidden-root refusal (including `..` and symlink forms), missing-file None, and the canonical absolute path for a valid candidate
+- `cargo test --workspace contract_shell_lane_` runs at least one passing test covering every select_shell rule, including Unix => program `sh`, label `sh`, and Windows contained contract => Cmd
+- No existing behaviour changes: shell_argv and every GateSandbox arm are untouched, and the full workspace tests pass
+- The Windows candidate discovery never reads a child's PATH and never runs with the worktree as cwd
+
+### 1.2 Hand the command to cmd.exe unencoded on the uncontained and AppContainer paths
+
+Repo: Rust workspace at the repo root. Read docs/knowledge/validation/child-containment.md first: nothing may widen the sandbox, and wraps fail closed.
+
+FAULT: on Windows, `shell_argv` (crates/engine/src/command_exec.rs:408) returns ("cmd", ["/C", command]). The standard argument encoder (std/tokio Command) then writes the command as one quoted argument and turns each inner `"` into `\"`. cmd.exe does not treat `\"` as an escape, so `node -e "process.stdout.write('x')"` reaches node as a script that starts with a literal quote.
+
+The AppContainer gate path has the same fault in its own encoder. In crates/engine/src/appcontainer_windows.rs (a cfg(windows) module), GateSandbox::AppContainer (command_exec.rs ~638-663) calls `prepare_launch_in_context(context, inputs, &program, &args, env)`. That serializes a `LaunchPlan { args, .. }` (~line 116). The trusted helper then rebuilds the child command line with `command_line()` / `quote_arg()` (~3273-3321) before CreateProcessW.
+
+FIX, applying to EVERY cmd.exe shell launch (contract and repo lanes alike; this is a pure quoting bug fix): the child's command line must be `<cmd program> /S /C "<command verbatim>"`. With `/S`, cmd strips exactly the outermost pair of quotes and leaves everything inside untouched, so inner quotes survive. The command text gets no escaping at all.
+
+(1) Cross-platform pure builders, in command_exec.rs and NOT cfg-gated, so they are unit-tested on macOS:
+- `pub(crate) fn cmd_raw_tail(command: &str) -> String` returning `/S /C "<command>"`.
+- `pub(crate) fn cmd_raw_command_line(cmd_program: &str, command: &str) -> String` returning the program, quoted only if it contains whitespace or is empty (the same rule quote_arg uses), then a space, then cmd_raw_tail.
+
+(2) The uncontained Windows path: `run_shell_command_with_timeout_env`, GateSandbox::Disabled in `wrap_shell`, and `run_bounded_argv`. Spawn cmd with `raw_arg(cmd_raw_tail(command))` instead of `.args(["/C", command])`. tokio::process::Command exposes `raw_arg` on Windows; otherwise use `as_std_mut()` with `std::os::windows::process::CommandExt::raw_arg`. WrappedCommand (command_exec.rs ~503) needs an ADDITIVE way to carry this, e.g. a `raw_tail: Option<String>` field (always None off Windows), and the bounded runner must honour it. Keep the program resolution (`cmd`) as it is today.
+
+(3) The AppContainer path: add `#[serde(default)] raw_command_tail: Option<String>` to LaunchPlan, and leave PLAN_VERSION unchanged (the serde default keeps old plans readable). When it is Some, the helper builds the line as `quote_arg(executable, true)`, a space, then the tail verbatim, and `args` must be empty. Thread it through prepare_launch_in_context/prepare_launch_for_lease for gate launches only; agent-session launches stay exactly as they are. Leave `command_line()` itself and its test `command_line_leaves_cmd_switch_unquoted_and_quotes_command_tail` unchanged; add a sibling path instead. No change to ACLs, capabilities, roots, PATH or the profile.
+
+(4) Unix: shell_argv's non-Windows branch and the Seatbelt/Bubblewrap/Container arms stay byte-identical.
+
+(5) Existing Windows fixtures in crates/engine/src/test_shell.rs (`if exist X (exit 0) else (exit 1)`, `set K=V&& prog`, `echo x>f`) must still parse under `/S /C "..."`. Reason through each in your report.
+
+TESTS:
+(a) Cross-platform, in command_exec.rs tests, names starting `cmd_raw_tail_`: `prog -e "a 'b' c"` gives exactly `/S /C "prog -e "a 'b' c""`; the output never contains a backslash before a quote that the input lacked; a command starting with `"C:\\Program Files\\x.exe" -e "y"` is preserved inside the outer pair; a cmd program path with spaces is quoted.
+(b) cfg(unix) tests named starting `shell_argv_unix_`: GateSandbox::Disabled.wrap_shell(cmd) yields program `sh` and args exactly ["-c", cmd], and shell_argv(cmd) equals the same.
+(c) cfg(windows) tests with these EXACT names (CI wiring is a later feature):
+- `windows_contract_shell_cmd_keeps_inner_double_quotes`, in command_exec tests: run `node -e "process.stdout.write('KRANZ_QUOTES_OK')"` through the uncontained cmd path with a cleared env (copy how existing command_exec Windows tests build env), and assert exit 0 and the marker in the output.
+- `windows_contract_shell_appcontainer_cmd_keeps_inner_double_quotes`: the same command through a resolved GateSandbox::AppContainer posture. Copy how `windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed` (command_exec.rs) and the tests near command_exec.rs ~3029/~3432 resolve an AppContainer posture, and call `cleanup()` afterwards.
+These Windows tests must FAIL, not skip, if node is missing, because Windows CI has node.
+
+Run cargo fmt --all, clippy with -D warnings, and the workspace tests. If a Windows target is installed, try `cargo check -p kranz-engine --all-targets --target x86_64-pc-windows-gnu` and report the result; do not fight toolchain failures. Do not edit types.rs or events.rs.
+
+Done when:
+- `cargo test --workspace cmd_raw_tail_` runs at least one passing test showing `prog -e "a 'b' c"` becomes `/S /C "prog -e "a 'b' c""` with no inserted backslashes, plus the quoted-program-path case
+- `cargo test --workspace shell_argv_unix_` runs at least one passing cfg(unix) test showing Disabled reproduces program `sh` args [`-c`, command] exactly
+- cfg(windows) tests windows_contract_shell_cmd_keeps_inner_double_quotes and windows_contract_shell_appcontainer_cmd_keeps_inner_double_quotes exist with those exact names
+- LaunchPlan gains only a #[serde(default)] field, PLAN_VERSION is unchanged, and agent-session launches and command_line() are unchanged
+- No ACL, capability, root or profile change in appcontainer_windows.rs
+
+
+## Milestone 2 — Contract commands run under the resolved shell, the evidence says which, and Windows CI carries the receipts
+
+### 2.1 Route contract commands through the resolved contract shell and record the shell in evidence
+
+Repo: Rust workspace at the repo root. Read docs/knowledge/validation/child-containment.md and docs/knowledge/validation/gates.md first.
+
+PRIOR FEATURES PROVIDE:
+- crates/engine/src/contract_shell.rs: ShellKind {Sh, Cmd}; HostShell {kind, program} with label() (Unix label is exactly `sh`); ShellLane {Contract, Repo}; select_shell; posix_sh_resolution; and `resolve_contract_shell(lane, contained, forbidden_roots) -> HostShell` (the Windows AppContainer contract lane stays Cmd).
+- command_exec.rs: cmd_raw_tail / raw cmd launching on the uncontained and AppContainer paths.
+Read both before starting.
+
+THIS FEATURE:
+(1) In command_exec.rs, add `run_contract_command_sandboxed(cwd, command, env, sandbox, shell: &HostShell)` plus `_with_code` and `_blocking` variants, mirroring run_shell_command_sandboxed, run_shell_command_sandboxed_with_code and run_shell_command_sandboxed_blocking (~1201-1320). Wrap rules:
+- Disabled + Sh: program = shell.program, args ["-c", command]. On Unix that is exactly `sh -c <command>`, byte-identical.
+- Disabled + Cmd: the raw cmd path.
+- AppContainer + Cmd: the raw cmd path through prepare_launch_in_context.
+- AppContainer + Sh: pass the absolute sh with ["-c", command] through the normal encoded path; no production caller selects this yet.
+- Seatbelt, Bubblewrap and Container ignore the shell and stay byte-identical (/bin/sh -c).
+Keep gate_env_for_sandbox, the fail-closed wrap error and the timeout teardown exactly as they are.
+
+(2) Switch ONLY these Contract-lane callers:
+- the validation round, `run_contract_commands_for_validation` in crates/engine/src/orchestrator.rs (~5762-5794);
+- final-gate command assertions in crates/engine/src/orchestrator/finalization.rs (~216-247);
+- the approval contract lint in crates/engine/src/contract_lint.rs (`run_contract_lint_with_limits` ~313 and `containment_usable` ~240) and its caller in orchestrator.rs approval (~1440-1517).
+At each place the gate sandbox is resolved for these commands, resolve the HostShell ONCE with resolve_contract_shell(ShellLane::Contract, contained = posture is GateSandbox::AppContainer, forbidden_roots). The forbidden roots are: repo root, active root/worktree, mission dir, gate scratch/TMPDIR, and the sandbox write allowlist where SandboxInputs are available.
+Do NOT switch finalization.rs ~418 (pack gate declarations), orchestrator/external_gates.rs, workspace_gate.rs or merge gates. Those are the Repo lane and keep shell_argv/cmd on Windows.
+
+(3) Record the shell, without changing verdicts:
+- The validation-round line becomes `- [id] `cmd` → PASS (shell: <label>)`.
+- The final-gate failing finding evidence becomes `command failed (shell: <label>): <command>\n<output>`. It is still scrubbed, and the class stays `command-assertion`.
+- Emit one orchestrator decision per contract-command resolution in the validation round and the final gate, naming the label, using the existing emit_decision path.
+- The approval contract lint records its shell. Add a field to AssertionLint or ContractLintReport in contract_lint.rs, with `#[serde(default)]` if it is serialized, and render it in the plan.md lint section (find render_plan_markdown).
+types.rs and events.rs may only gain #[serde(default)] fields, and preferably are not touched at all.
+
+(4) Existing tests that assert exact rendered strings: update them to the new label only where the line format changed.
+
+TESTS:
+- Names starting `contract_shell_recorded_`, runnable on macOS: the validation-round rendering contains `(shell: sh)`; a failing final-gate command finding's evidence contains `shell: sh`; the plan.md lint rendering names the shell.
+- cfg(unix), names starting `shell_argv_unix_`: run_contract_command_sandboxed with GateSandbox::Disabled and the Unix contract shell builds exactly program `sh` args ["-c", cmd].
+- cfg(windows), EXACT names, in command_exec tests unless a better home exists. These must FAIL, not skip, when Git's sh cannot be resolved, because Windows CI always has Git; a missing sh is a real defect.
+  - `windows_contract_shell_sh_keeps_inner_double_quotes`: uncontained contract lane with sh resolved; `node -e "process.stdout.write('KRANZ_QUOTES_OK')"` exits 0 with the marker; the label names an absolute sh path.
+  - `windows_contract_shell_sh_sees_pinned_base_sha`: env containing KRANZ_BASE_SHA=deadbeefcafe; `test "$KRANZ_BASE_SHA" = deadbeefcafe` exits 0 under the resolved sh, and the same command under cmd does NOT exit 0.
+  - `windows_contract_shell_planted_sh_is_never_executed`: copy the current test executable as `sh.exe` into the command's cwd AND into a cwd subdirectory placed first on the child env PATH. Its main writes a marker file when an env var is set; follow test_shell.rs's sleep_fixture pattern of an #[ignore] fixture test. Run a contract command, then assert the marker is absent and the resolved label's path is outside the cwd.
+
+Run cargo fmt --all, clippy with -D warnings, and the workspace tests. If a Windows target is installed, try a `cargo check --target x86_64-pc-windows-gnu -p kranz-engine --all-targets` and report the result.
+
+Done when:
+- `cargo test --workspace contract_shell_recorded_` runs at least one passing test showing the shell label in the validation-round line, the final-gate failing finding evidence, and the plan.md lint rendering
+- `cargo test --workspace shell_argv_unix_` still passes and includes a test that the contract runner's Disabled wrap on Unix is exactly `sh -c <command>`
+- Only Contract-lane callers switch; merge gates, workspace hooks, external gates and pack gate declarations still use shell_argv
+- cfg(windows) tests windows_contract_shell_sh_keeps_inner_double_quotes, windows_contract_shell_sh_sees_pinned_base_sha and windows_contract_shell_planted_sh_is_never_executed exist with those exact names and fail (not skip) when sh is absent
+- Verdicts, finding classes and the fail-closed wrap error path are unchanged; full workspace tests pass
+
+### 2.2 Make Windows test fixtures follow their lane's shell
+
+Repo: Rust workspace at the repo root.
+
+CONTEXT: after the previous features, on a Windows host with Git for Windows (including CI's windows-latest and the 'stock-box' CI guard, which strips Git's usr/bin from PATH but cannot hide the absolute sh), UNCONTAINED validation-contract commands run under POSIX sh. These are validation rounds, final-gate command assertions and the approval lint (the lint is contained, so it stays cmd on Windows). Repo-lane commands stay on cmd: merge gates, workspace bootstrap/readiness/data hooks, external gates and pack gates. Selection lives in crates/engine/src/contract_shell.rs (select_shell/resolve_contract_shell); read it.
+
+Test fixtures written in cmd syntax for the Contract lane now break on Windows. Examples: crates/engine/src/test_shell.rs helpers (`if exist X (exit 0) else (exit 1)`, `set K=V&& prog`, `echo x>f`), and inline `cfg!(windows)` / `#[cfg(windows)]` command strings using `%VAR%`, `exit /b`, `if exist`. Starting points to audit: crates/engine/src/test_shell.rs and its users (contract_lint.rs, workspace_security_tests.rs, workspace_provider.rs); crates/engine/tests/mission_test.rs (~48, ~591, ~7990, ~11350); crates/engine/tests/worktree_isolation.rs (~34); and grep crates/ for `if exist`, `exit /b`, `%[A-Z_]+%`, `&& ` after `set`, `cfg!(windows)` near command strings.
+
+TASK: for every fixture command, determine which lane executes it, and in which posture (contained AppContainer vs uncontained), on Windows.
+- Contract lane, uncontained, Windows: must be POSIX sh syntax using ONLY sh builtins (`test`, `[`, `echo`, `printf`, `exit`, `:`, `cd`, redirections). There is no `sleep`, `true` or `false` binary on the stock-box path.
+- Repo lane, or contained contract lane: keep cmd syntax.
+Add lane-aware helpers to test_shell.rs, e.g. `pub(crate) mod contract { … }`, that choose the syntax from the same selection logic the engine uses (select_shell with the host's facts), and keep the existing helpers for the Repo lane. `sleep_millis` for the sh lane must keep using the copied test-binary timer (`KRANZ_TEST_SLEEP_MILLIS=N ./kranz-sleep-fixture.exe --ignored --exact test_shell::sleep_fixture --nocapture`), never PowerShell or ping. Integration tests under crates/engine/tests cannot see crate-private helpers; fix their inline strings directly, following the same rule.
+
+On Unix every helper must return EXACTLY today's strings. Add a cfg(unix) test named `contract_shell_lane_fixtures_unchanged_on_unix` asserting the contract helpers equal today's literal outputs.
+
+You cannot run Windows here, so be meticulous. In your report, include a table of every fixture you changed or deliberately left alone: file:line → lane → posture → shell → syntax used. Run cargo fmt --all, clippy with -D warnings and the full workspace tests. If a Windows target is installed, try `cargo check --tests --target x86_64-pc-windows-gnu -p kranz-engine` and report the result.
+
+Done when:
+- `cargo test --workspace contract_shell_lane_fixtures_unchanged_on_unix` passes (cfg(unix)) and asserts the contract-lane helpers return today's exact Unix strings
+- Every Windows fixture feeding an uncontained contract-lane command uses POSIX sh builtins only; every Repo-lane or contained fixture keeps cmd syntax
+- The worker report contains the per-fixture lane/posture/shell table
+- Full workspace tests pass on this host
+
+### 2.3 Windows CI receipts, including the contained-sh proof
+
+Repo: Rust workspace at the repo root; CI is .github/workflows/ci.yml. Read docs/knowledge/validation/child-containment.md: do NOT widen any sandbox.
+
+CONTEXT: the operator requires proof, on Windows, that Git's sh starts and runs a quoted command inside the AppContainer gate wrap before it can ever become the contained default. Until that proof exists, the contained contract path stays cmd (crates/engine/src/contract_shell.rs select_shell). This mission cannot run Windows. Your job is to write the receipt and wire every Windows test from this mission into CI by exact name, so the operator's CI run produces the evidence.
+
+(1) Write the cfg(windows) test `windows_contract_shell_appcontainer_sh_receipt`. Put it next to the other AppContainer gate tests: command_exec.rs tests near ~3029/~3432, or crates/cli/tests/appcontainer_production_test.rs (package `kranz`), whichever matches how a production AppContainer gate posture is resolved.
+- Resolve the AppContainer gate posture exactly as production does.
+- (a) ASSERT that the production contract-shell selection for this posture is ShellKind::Cmd, and that `node -e "process.stdout.write('KRANZ_QUOTES_OK')"` run through run_contract_command_sandboxed in that posture exits 0 with the marker.
+- (b) ATTEMPT Git's sh inside the SAME posture. Resolve it with posix_sh_resolution over git_for_windows_sh_candidates and the posture's forbidden roots, and run `printf '%s\n' "KRANZ_SH_CONTAINED_OK"` via a HostShell{kind: Sh, program: <abs sh>}. Do not add any read/write root, ACL, capability or PATH entry to make it work: whatever prepare_launch refuses, or however the child fails, IS the result.
+- Print exactly one line, `KRANZ_WINDOWS_SH_CONTAINED=pass` or `KRANZ_WINDOWS_SH_CONTAINED=fail: <one-line reason>`. Part (b) records and must not fail the test. Part (a) is asserted. Call cleanup() on the posture and assert it succeeds.
+
+(2) Edit .github/workflows/ci.yml (the `rust` job, windows-latest).
+- In the step 'Prove production Windows LPAC containment and gates', which runs after host preparation and has the `run_exact_test` helper, add run_exact_test invocations with `-- --exact --nocapture` and the correct package/target (`-p kranz-engine --lib` or `-p kranz --test appcontainer_production_test`) for `windows_contract_shell_appcontainer_cmd_keeps_inner_double_quotes` and `windows_contract_shell_appcontainer_sh_receipt`. After the receipt, `grep -q 'KRANZ_WINDOWS_SH_CONTAINED=' "$log"` and print the matching line, so it is visible in the job log.
+- Add the uncontained tests `windows_contract_shell_sh_keeps_inner_double_quotes`, `windows_contract_shell_cmd_keeps_inner_double_quotes`, `windows_contract_shell_sh_sees_pinned_base_sha` and `windows_contract_shell_planted_sh_is_never_executed`. Use either the 'Check Windows snapshots, ACL leases, and process cleanup' loop (which greps `test result: ok\. [1-9]`) or a new bash step with the same exit-code and anti-vacuity discipline.
+- Grep the repo to confirm which module each test landed in, and use that exact path in the `--exact` name.
+- Do not weaken any existing step, and keep the stock-box guard step as is.
+
+Run cargo fmt --all, clippy with -D warnings and the full workspace tests. If a Windows target is installed, try `cargo check --tests --target x86_64-pc-windows-gnu -p kranz-engine -p kranz` and report the result.
+
+Done when:
+- cfg(windows) test windows_contract_shell_appcontainer_sh_receipt exists, asserts the contained contract path is Cmd and runs the quoted node command, and prints exactly one `KRANZ_WINDOWS_SH_CONTAINED=` line without failing on the sh outcome
+- ci.yml runs all six windows_contract_shell_* tests by exact module path with exit-code and `test result: ok\. [1-9]` checks, and requires and prints the KRANZ_WINDOWS_SH_CONTAINED= marker
+- The receipt adds no sandbox root, ACL, capability or PATH entry
+- No existing CI step is removed or weakened; workspace fmt, clippy and tests pass
+
+
+## Milestone 3 — Approval flags contract commands the host shell cannot run, and the docs say which shell runs what
+
+### 3.1 The host-shell-syntax contract gate
+
+Repo: Rust workspace at the repo root. File: crates/engine/src/contract_gates.rs. Read its module docs: named deterministic gates, ADVISORY posture (they never refuse approval or add findings), and the conservative rule that a gate only fires on shapes it can fully account for. Gates today: vacuous-filter, wrong-polarity, passes-on-base and env-sensitive, registered in `register_contract_gates` (~133) and evaluated via the GatePipeline. A minimal shell lexer `lex()`/`segments()` (~782-912) gives each Word a text and a quote (None/Single/Double).
+
+ADD the gate `pub const HOST_SHELL_SYNTAX: &str = "host-shell-syntax";`, implemented as `struct HostShellSyntaxGate { checks: Vec<CommandCheck>, shell: crate::contract_shell::ShellKind, label: String }`. crates/engine/src/contract_shell.rs exists from an earlier feature, with ShellKind {Sh, Cmd} and HostShell::label(). GateKind::Deterministic. The artefact label is `contract gate host-shell-syntax (judged against <label>)`; use outcome_from_findings, or build the ArtefactRef with that label and the same findings/detail shape.
+
+Under ShellKind::Sh: always PASS with no findings.
+
+Under ShellKind::Cmd, produce one finding per (assertion, reason), formatted like the siblings: `[<id>] <reason>: `<command>``. Reasons, each firing only on the exact shape:
+- (1) `$NAME` or `${NAME}` expansion (a `$` followed by [A-Za-z_] or `{`) in a word not single-quoted. Reason: cmd.exe does not expand `$NAME`; the literal text reaches the program.
+- (2) `$(` or a backtick in a word not single-quoted (command substitution).
+- (3) any word whose quote is Quote::Single. Reason: cmd.exe treats `'` literally.
+- (4) a segment whose first word is exactly `!`, or starts with `!` (negation).
+- (5) a `;` operator word (cmd does not sequence on `;`).
+Double-quoted text, `&&`, `||`, `|`, `>` and `2>&1` are fine under cmd and must not fire. `node -e "console.log(1)"` must PASS under cmd.
+
+CHANGE `register_contract_gates` / `contract_gate_reports` to accept the shell. Add a parameter such as `shell: &crate::contract_shell::HostShell`, or a ShellKind plus label. Register HostShellSyntaxGate immediately after wrong-polarity, at both approval and the final gate, whenever command checks exist. Update every caller to compile:
+- orchestrator.rs ~1537 (approval);
+- orchestrator/finalization.rs ~475 (final gate);
+- pack.rs ~1288.
+Pass the HostShell the engine resolved for the Contract lane at that point. A later feature wires approval precisely, so for now pass `resolve_contract_shell(ShellLane::Contract, <posture contained?>, <roots>)` where available, else the Unix-default `sh` HostShell, with a short TODO-free comment explaining it. Update the module docs' gate list and the doc comment on contract_gate_reports (ticket order). Fix existing tests that assert report counts or order.
+
+TESTS, names starting `host_shell_syntax_`, runnable on macOS:
+- each of the five reasons FAILs under Cmd and the detail names the assertion id;
+- `node -e "process.stdout.write('x')"` and `cargo test --workspace foo 2>&1 | grep -qE 'test result: ok\. [1-9]'` → hmm, the latter contains a single-quoted word, so it FAILs under cmd; assert exactly that;
+- every gate command in .kranz/merge-gates.json (read the file in the test) PASSes under Cmd;
+- everything PASSes under Sh;
+- render_gate_verdicts output contains `host-shell-syntax: FAIL` and the id;
+- registration order is vacuous-filter, wrong-polarity, host-shell-syntax, (passes-on-base when lint is given), env-sensitive.
+
+Run cargo fmt --all, clippy with -D warnings and the full workspace tests.
+
+Done when:
+- `cargo test --workspace host_shell_syntax_` runs at least one passing test per reason class ($NAME/${NAME}, $( or backtick, single-quoted word, ! negation, ;) showing FAIL under Cmd with the assertion id in the detail
+- Under Cmd, double-quoted node -e one-liners and every .kranz/merge-gates.json command PASS; under Sh every command PASSes
+- The gate is registered right after wrong-polarity at both approval and final gate, is advisory (adds no findings, never refuses approval), and existing gate tests pass
+- Full workspace tests pass
+
+### 3.2 Wire the host shell into approval and the final gate, with an approval-level test
+
+Repo: Rust workspace at the repo root.
+
+CONTEXT: crates/engine/src/contract_gates.rs now has the advisory `host-shell-syntax` gate. register_contract_gates/contract_gate_reports take the host shell. crates/engine/src/contract_shell.rs has resolve_contract_shell(lane, contained, forbidden_roots) and select_shell(lane, &HostFacts).
+
+TASK:
+(1) At approval (crates/engine/src/orchestrator.rs ~1527-1543, the `contract_gate_reports(&plan.validation_contract, Some(&contract_lint_report), &self.paths.repo_root)` call), pass the HostShell that the mission's VALIDATION and FINAL-GATE contract commands will run under. That is NOT the approval lint's own shell: the lint is always contained (raised to fs) and therefore cmd on Windows. Determine `contained` from the mission's configured gate posture. Read how `self.gate_sandbox(..)` and `crate::command_exec::resolve_gate_sandbox` pick the posture from sandbox config: enforce off → Disabled (uncontained); enforce fs or fs+net on Windows → AppContainer. Do this without launching any process except the sh path probe inside resolve_contract_shell, and with the forbidden roots (repo root, mission dir, the future worktree path if known, scratch). If the posture cannot be resolved, use the conservative choice (Cmd on Windows) and note it in the gate label.
+
+(2) At the final gate (crates/engine/src/orchestrator/finalization.rs ~475), pass the same HostShell the final gate's command assertions actually used. That feature already resolves it when running contract commands, so reuse the value.
+
+(3) Test seam: approval must be testable on macOS with the shell forced to Cmd. Add a narrowly scoped, `#[cfg(test)]`-only override on MissionEngine (e.g. `contract_shell_override: Option<HostShell>`), or route through an injectable HostFacts. It must be impossible to set in non-test builds: no env var, no config key.
+
+(4) TESTS, lib-level (find existing approval tests in orchestrator test modules and reuse their harness), names starting `approval_host_shell_`:
+- `approval_host_shell_records_failing_gate_naming_assertion`: a plan whose contract has a command assertion id `a9` with command `test "$KRANZ_BASE_SHA" = x`. With the override forcing Cmd, approval SUCCEEDS (the gate is advisory), and both the approval decision detail and the committed plan.md contain `host-shell-syntax: FAIL` and `[a9]`.
+- `approval_host_shell_passes_under_sh`: the same plan with the default Unix shell records `host-shell-syntax: PASS`.
+
+Do not change approval blocking policy. types.rs and events.rs may only gain #[serde(default)] fields. Run cargo fmt --all, clippy with -D warnings and the full workspace tests. Integration tests in crates other than crates/engine may assert approval output (lesson m-bf1264), so run the whole workspace.
+
+Done when:
+- `cargo test --workspace approval_host_shell_` runs at least one passing test showing approval succeeds and records `host-shell-syntax: FAIL` naming `[a9]` in the decision and plan.md when the shell is forced to Cmd, and PASS under sh
+- The approval gate judges against the validation/final-gate posture's shell, not the contained lint's shell
+- The override exists only under #[cfg(test)], with no env var or config key
+- Approval blocking behaviour is unchanged; full workspace tests pass
+
+### 3.3 Document which shell runs contract commands and recheck the knowledge vault
+
+Repo: the repo root. The knowledge notes under docs/knowledge/ carry frontmatter (`freshness: check-on-touch`, `last_verified`, `verified_against`). `cargo run --locked --package kranz -- knowledge-refresh` fails when a cited file changed after a note's last_verified date without a recheck. Use `git log` and `git diff $KRANZ_BASE_SHA --stat` to see what this mission changed: crates/engine/src/command_exec.rs, contract_shell.rs (new), contract_gates.rs, contract_lint.rs, orchestrator.rs, orchestrator/finalization.rs, appcontainer_windows.rs, test_shell.rs, pack.rs, .github/workflows/ci.yml, tests.
+
+WRITE:
+(1) docs/knowledge/validation/child-containment.md: add a dated recheck line at the top, in the existing `Rechecked 2026-11-15 (UTC) against …` style. State that contract commands on Windows now run under Git for Windows' `usr\bin\sh.exe` when uncontained and it resolves outside every worker-writable root, and never by bare name from a child's PATH or cwd. The AppContainer contract path stays cmd.exe until the `KRANZ_WINDOWS_SH_CONTAINED=pass` CI receipt (test windows_contract_shell_appcontainer_sh_receipt) proves sh runs contained; nothing was widened to try. cmd.exe receives the command via `/S /C "<command>"` unencoded. Containment rules and the gate signal policy are unchanged. Add contract_shell.rs to verified_against.
+(2) docs/knowledge/validation/gates.md: a recheck line, plus a short section 'Which shell runs a contract command'. Include a table by platform and posture, and by contract vs repo lane (merge gates, workspace hooks, external and pack gates stay cmd on Windows). Explain how to read the `shell:` label in validation-round lines, final-gate findings and the plan.md lint section. Add `host-shell-syntax` to wherever the named contract gates are described: advisory, judged against the validation/final-gate posture's shell, and listing the classes it flags under cmd. Update last_verified and verified_against as needed.
+(3) docs/scoping/m7-windows-containment.md: a short note on the contained-sh receipt and its marker, and how a follow-up would switch the contained path once the receipt passes.
+(4) Run `cargo run --locked --package kranz -- knowledge-refresh` and add recheck lines to any OTHER note it reports stale because of this mission's files. Each recheck line says truthfully what changed and that the note's rules are otherwise unchanged.
+
+Do not edit crates/engine/src/prompts.rs. Plain, short sentences; match the existing tone.
+
+Done when:
+- `cargo run --locked --package kranz -- knowledge-refresh` exits 0
+- child-containment.md and gates.md state the platform/posture/lane shell table, that the AppContainer contract path stays cmd pending the KRANZ_WINDOWS_SH_CONTAINED receipt, how to read the shell: label, and the advisory host-shell-syntax gate
+- docs/scoping/m7-windows-containment.md notes the contained-sh receipt and marker
+- prompts.rs is unchanged

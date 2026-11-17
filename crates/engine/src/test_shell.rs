@@ -56,25 +56,66 @@ pub(crate) fn write_line(text: &str, path: &str) -> String {
     }
 }
 
-/// Block for at least `millis`, without relying on a `sleep` binary.
+/// Block for at least `millis` under the cmd-aware Repo-lane shell, without
+/// relying on a `sleep` binary (stock Windows ships none). Same
+/// copied-test-binary timer as [`contract::sleep_millis`], invoked with
+/// cmd's `set VAR=value&&` prefix and a `.\` relative path instead of sh's
+/// `VAR=value prog` and `./`.
 pub(crate) fn sleep_millis(cwd: &std::path::Path, millis: u64) -> String {
     if cfg!(windows) {
-        // Use this test binary as the timer: ping can return early and
-        // PowerShell exceeded the fixture's timeout in Windows CI.
-        // A relative executable name also avoids cmd's nested quote handling
-        // when the temporary directory or original binary path has spaces.
         std::fs::copy(
             std::env::current_exe().unwrap(),
             cwd.join("kranz-sleep-fixture.exe"),
         )
         .unwrap();
         format!(
-            "set KRANZ_TEST_SLEEP_MILLIS={millis}&& .\\kranz-sleep-fixture.exe --ignored --exact test_shell::sleep_fixture --nocapture"
+            "set KRANZ_TEST_SLEEP_MILLIS={millis}&&.\\kranz-sleep-fixture.exe --ignored --exact test_shell::sleep_fixture --nocapture"
         )
     } else {
         let seconds = millis as f64 / 1000.0;
         format!("sleep {seconds}")
     }
+}
+
+/// Contract-lane fixtures: the validation-contract commands (validation
+/// rounds, final-gate command assertions, the approval contract lint) that
+/// [`crate::contract_shell::select_shell`] resolves to POSIX `sh` — on Unix
+/// always, on Windows whenever the gate posture is uncontained (the common
+/// case; kranz requires Git, so its `sh.exe` is always available there).
+/// Unlike the top-level helpers in this module, these are NOT cmd-aware:
+/// they must use only `sh` builtins (`test`, `[`, `echo`, `printf`, `exit`,
+/// `:`, `cd`, redirections), because the stock-box Windows path strips
+/// Git's `usr/bin` from PATH and leaves no `sleep`, `true`, or `false`
+/// binary — only the absolute `sh` the engine discovered itself.
+pub(crate) mod contract {
+    /// Block for at least `millis`, without relying on a `sleep` binary.
+    pub(crate) fn sleep_millis(cwd: &std::path::Path, millis: u64) -> String {
+        if cfg!(windows) {
+            // Same copied-test-binary timer as the Repo lane's
+            // `sleep_millis`, but invoked with `sh`'s env-var-prefix syntax
+            // (`VAR=value prog`) and a `./` relative path instead of cmd's
+            // `set VAR=value&&` and `.\` — there is no `sleep` binary on the
+            // stock-box sh path.
+            std::fs::copy(
+                std::env::current_exe().unwrap(),
+                cwd.join("kranz-sleep-fixture.exe"),
+            )
+            .unwrap();
+            format!(
+                "KRANZ_TEST_SLEEP_MILLIS={millis} ./kranz-sleep-fixture.exe --ignored --exact test_shell::sleep_fixture --nocapture"
+            )
+        } else {
+            let seconds = millis as f64 / 1000.0;
+            format!("sleep {seconds}")
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn contract_shell_lane_fixtures_unchanged_on_unix() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(contract::sleep_millis(dir.path(), 1500), "sleep 1.5");
 }
 
 #[cfg(windows)]
@@ -87,4 +128,20 @@ fn sleep_fixture() {
         .expect("numeric timer duration");
     std::thread::sleep(std::time::Duration::from_millis(millis));
     println!("KRANZ_TEST_SLEEP_COMPLETED={millis}");
+}
+
+/// A planted-shell detection fixture for `command_exec`'s
+/// `windows_contract_shell_planted_sh_is_never_executed` test: a copy of this
+/// test executable is placed where a buggy `sh` resolution could pick it up
+/// (the command's cwd, and a cwd subdirectory placed first on PATH). If the
+/// resolved contract shell ever selected the planted copy and ran it with
+/// this selector, it would write the marker named by
+/// `KRANZ_TEST_PLANTED_SH_MARKER` — proof the planted binary executed.
+#[cfg(windows)]
+#[test]
+#[ignore = "planted-sh detection fixture, invoked by command_exec tests"]
+fn planted_sh_marker_fixture() {
+    if let Ok(marker) = std::env::var("KRANZ_TEST_PLANTED_SH_MARKER") {
+        std::fs::write(marker, b"planted-sh-executed").unwrap();
+    }
 }

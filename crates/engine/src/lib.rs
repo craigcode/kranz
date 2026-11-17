@@ -36,6 +36,7 @@ pub mod contract_controls;
 pub mod contract_gates;
 pub mod contract_health;
 pub mod contract_lint;
+pub(crate) mod contract_shell;
 pub mod contract_sweep;
 pub mod corpus_export;
 pub mod cost;

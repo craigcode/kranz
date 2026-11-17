@@ -205,7 +205,12 @@ jobs:
             appcontainer_windows::tests::suspended_child_is_reaped_when_setup_exits_before_job_assignment \
             appcontainer_windows::tests::recursive_grants_reserve_only_the_isolated_worktree_authority_namespace \
             agent_env::tests::sanitized_child_env_windows_redirects_profile_and_temp_to_scratch \
-            sandbox_container::tests::container_authority_directory_mask_covers_absent_and_future_tokens; do
+            sandbox_container::tests::container_authority_directory_mask_covers_absent_and_future_tokens \
+            command_exec::tests::windows_contract_shell_sh_keeps_inner_double_quotes \
+            command_exec::tests::windows_contract_shell_cmd_keeps_inner_double_quotes \
+            command_exec::tests::windows_contract_shell_sh_sees_pinned_base_sha \
+            command_exec::tests::windows_contract_shell_sh_finds_its_own_tools_off_path \
+            command_exec::tests::windows_contract_shell_planted_sh_is_never_executed; do
             log="$RUNNER_TEMP/kranz-windows-${name//::/-}.log"
             set +e
             cargo test -p kranz-engine --lib "$name" -- --exact --nocapture >"$log" 2>&1
@@ -277,6 +282,13 @@ jobs:
 
           gate_log="$RUNNER_TEMP/kranz-windows-appcontainer-gates.log"
           run_exact_test "$gate_log" cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_runs_normal_node_and_rust_gates_within_target -- --exact --nocapture
+          # The same self test checks the contract shell under the resolved
+          # posture: the contained lane stays cmd and keeps inner double
+          # quotes (required), and Git's sh is attempted and its outcome
+          # printed (recorded, never required). The contained lane's cmd
+          # default in crates/engine/src/contract_shell.rs is pinned on
+          # this line.
+          grep 'KRANZ_WINDOWS_SH_CONTAINED=' "$gate_log"
 
           session_log="$RUNNER_TEMP/kranz-windows-session-resolution.log"
           run_exact_test "$session_log" cargo test -p kranz-engine --lib sandbox::tests::windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed -- --exact

@@ -2,11 +2,12 @@
 title: Child containment (children are hostile by default)
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-15
+last_verified: 2026-11-17
 verified_against:
   - AGENTS.md
   - crates/engine/src/agent_env.rs
   - crates/engine/src/command_exec.rs
+  - crates/engine/src/contract_shell.rs
   - crates/engine/src/workspace_gate.rs
   - crates/engine/src/workspace_data.rs
   - crates/engine/src/workspace_provider.rs
@@ -15,6 +16,10 @@ verified_against:
   - crates/engine/src/validator_snapshot.rs
   - docs/acp-containment.md
 ---
+
+Rechecked 2026-11-17 (UTC) against a test move in `command_exec.rs`, `appcontainer_windows.rs` and `.github/workflows/ci.yml`: the contained contract-shell checks (the `cmd.exe` quoting check and the Git `sh` attempt that prints `KRANZ_WINDOWS_SH_CONTAINED=`) now run inside the CLI's AppContainer normal-gate self test, because the AppContainer launcher is the `kranz` binary itself. No shell selection, containment rule or gate behaviour changed.
+
+Rechecked 2026-11-16 (UTC) against the Windows contract-shell change in `command_exec.rs`, `contract_shell.rs` and `appcontainer_windows.rs`: on Windows an uncontained contract command now runs under Git for Windows' `usr\bin\sh.exe`, found from the engine's own Git installation, canonicalized, and refused if it lies inside any worker-writable root. It is never resolved by bare name from a child's `PATH` or working directory. The AppContainer contract path stays on `cmd.exe` until the CLI normal-gate self test that Windows CI runs prints `KRANZ_WINDOWS_SH_CONTAINED=pass`; no root, ACL grant, capability or profile rule was added to try it. `cmd.exe` receives the command as `/S /C "<command>"` with no escaping added. Containment rules and the gate signal policy are unchanged, and a wrap or resolution failure still fails closed. The shell table is in [gates.md](gates.md).
 
 Rechecked 2026-11-15 (UTC) against a test-only change in `command_exec.rs`: one gate test waits longer for its stub runtime to record its launch on a loaded host. No product code changed, and the containment rules here are unchanged.
 

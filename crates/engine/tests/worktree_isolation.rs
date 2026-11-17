@@ -47,6 +47,16 @@ fn file_exists_cmd(path: &str) -> String {
     }
 }
 
+/// Contract-lane variant of `file_exists_cmd`: validation-contract command
+/// assertions (final-gate) run under `sh` everywhere — uncontained Windows
+/// resolves a Git-for-Windows `sh.exe`, same as Unix — so these need only the
+/// POSIX spelling, never the cmd one. Integration tests cannot see
+/// `kranz_engine::test_shell`'s crate-private helpers, so this is a local
+/// copy rather than a re-export.
+fn file_exists_contract(path: &str) -> String {
+    format!("test -f {path}")
+}
+
 fn write_layer(dir: &tempfile::TempDir, name: &str, contents: &str) -> PathBuf {
     let path = dir.path().join(name);
     std::fs::write(&path, contents).expect("write layer");
@@ -61,22 +71,12 @@ fn git_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Native-shell assertion for the final-gate command environment. Contract
-/// commands run through `sh` on Unix and `cmd` on Windows, so the variable
-/// syntax must match the executor while asserting the same value everywhere.
-/// Compare in the shell instead of redirecting to a capture file: cmd's
-/// redirection parsing is sensitive to quoting and previously sent the test
-/// into the failure-conversion dialogue on Windows, where its success-only
-/// mock script correctly had no reply queued.
+/// Native-shell assertion for the final-gate command environment. Final-gate
+/// command assertions are Contract-lane: they run through `sh` on Unix and
+/// (uncontained, the default posture here) also `sh` on Windows via the
+/// discovered Git-for-Windows `sh.exe` — so one POSIX spelling covers both.
 fn gate_base_sha_assertion_command(expected: &str) -> String {
-    #[cfg(unix)]
-    {
-        format!("test \"$KRANZ_BASE_SHA\" = '{expected}'")
-    }
-    #[cfg(windows)]
-    {
-        format!("if \"%KRANZ_BASE_SHA%\"==\"{expected}\" (exit /b 0) else (exit /b 1)")
-    }
+    format!("test \"$KRANZ_BASE_SHA\" = '{expected}'")
 }
 
 /// Fresh repo on `main` with identity + one seed commit; returns the seed sha.
@@ -588,7 +588,7 @@ async fn workspace_gate_runs_bootstrap_in_the_integration_worktree() {
         id: "a-1".into(),
         statement: "the workspace marker exists".into(),
         check: AssertionCheck::Command,
-        command: Some(file_exists_cmd(".boot-marker")),
+        command: Some(file_exists_contract(".boot-marker")),
         negative_control: None,
         pty_script: None,
     }];

@@ -85,7 +85,7 @@ pub(crate) async fn run_observed(
     // Capture the client endpoint settings once for execution and cleanup.
     let env = runtime.client_env();
     let (code, mut output) =
-        run_bounded_argv(cwd, Path::new(runtime.binary()), &args, timeout, &env).await;
+        run_bounded_argv(cwd, Path::new(runtime.binary()), &args, timeout, &env, None).await;
     let absence = if code == Some(0) {
         wait_empty(cwd, runtime, &env, &label).await
     } else {
@@ -122,6 +122,7 @@ pub(crate) async fn remove_owned(
             ],
             Duration::from_secs(5),
             env,
+            None,
         )
         .await;
         let inspected = serde_json::from_str::<serde_json::Value>(&output).ok();
@@ -138,6 +139,7 @@ pub(crate) async fn remove_owned(
             &["rm".into(), "-f".into(), id],
             Duration::from_secs(5),
             env,
+            None,
         )
         .await;
         if code != Some(0) {
@@ -185,6 +187,7 @@ async fn inventory(
         ],
         Duration::from_secs(5),
         env,
+        None,
     )
     .await;
     if code != Some(0) {
@@ -312,6 +315,7 @@ async fn socket_denial_receipt_rejects_arbitrary_errors_and_unexpected_success()
         &["src/sandbox_container/socket_probe_test.py".into()],
         Duration::from_secs(10),
         &env,
+        None,
     )
     .await;
     assert_eq!(code, Some(0), "{output}");
