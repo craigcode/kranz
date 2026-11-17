@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-16
+last_verified: 2026-11-17
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-17 (UTC) against the temp-directory cleanup in `orchestrator.rs` and `event_log.rs`: the worker-auth preflight home is removed once its verdict is known, abandoning a mission removes its worktrees that hold only committed files, and `EventLog` can report that its acquire took an existing lock over. No term changed.
 
 Rechecked 2026-11-16 (UTC) against the Windows lock probe in `event_log.rs`. No term changed.
 

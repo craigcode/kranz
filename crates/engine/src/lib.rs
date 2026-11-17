@@ -91,6 +91,7 @@ pub mod sandbox;
 pub mod sandbox_container;
 pub mod sandbox_windows;
 pub mod scrub;
+pub mod session_scratch;
 pub mod sgian;
 pub mod sgian_terminal;
 pub mod signals;

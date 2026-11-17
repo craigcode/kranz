@@ -44,6 +44,8 @@ jobs:
         run: |
           python3 scripts/check-actions-allowlist.py --self-test
           python3 scripts/check-actions-allowlist.py
+      - name: Prove the test temp-directory leftover check
+        run: python3 scripts/check-test-temp-leftovers.py --self-test
       - name: Verify release workflow restores no cache
         run: |
           python3 scripts/check-release-workflow.py --self-test
@@ -346,12 +348,33 @@ jobs:
       # Windows because the POSIX guest-path and `/dev/null` authority-mask
       # contract does not hold there. It also omits `bwrap` (Linux-only) and
       # `sandbox-exec` (macOS-only).
-      - run: cargo test --workspace --no-fail-fast
+      #
+      # On Ubuntu the suite runs with a temp directory of its own, and the
+      # step fails if anything is left in it once every test has passed: a
+      # leftover is a file or folder some test created and did not remove,
+      # which on a developer's machine piles up in the system temp directory.
+      # The tests are built first so that only running them uses the
+      # directory. `bash -e` stops at a failing test, so the leftover check
+      # judges passing runs only; a failing test process may leave its
+      # directories. Windows runs the suite without this check: a failing
+      # test process there skips the exit hook that removes shared test
+      # directories (crates/engine/src/test_dirs.rs), and the check has not
+      # been proven on that platform.
+      - name: Run the workspace tests and require an empty temp directory
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
         env:
-          KRANZ_REQUIRED_CAPABILITIES: >-
-            ${{ matrix.os == 'ubuntu-latest'
-                && 'git,bwrap,container,grep'
-                || 'git' }}
+          KRANZ_REQUIRED_CAPABILITIES: git,bwrap,container,grep
+          KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+        run: |
+          cargo test --workspace --no-run
+          test_tmp="$(mktemp -d /tmp/kranz-test-tmp.XXXXXX)"
+          TMPDIR="$test_tmp" cargo test --workspace --no-fail-fast
+          python3 scripts/check-test-temp-leftovers.py "$test_tmp"
+      - run: cargo test --workspace --no-fail-fast
+        if: matrix.os == 'windows-latest'
+        env:
+          KRANZ_REQUIRED_CAPABILITIES: git
           KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
       - name: Require conclusive container access-denial receipts
         if: matrix.os == 'ubuntu-latest'
@@ -456,10 +479,21 @@ jobs:
       # runtimes, so `container` is omitted from KRANZ_REQUIRED_CAPABILITIES on
       # hosted macOS while the engine proves declared bind-mount roots at run
       # time on operator macOS hosts (`sandbox_container::mount_proof`).
-      - run: cargo test --workspace --no-fail-fast
+      #
+      # The suite runs with a temp directory of its own, and the step fails if
+      # anything is left in it once every test has passed (see the Ubuntu
+      # step above for why). The directory name is short because Unix socket
+      # paths under it have little room.
+      - name: Run the workspace tests and require an empty temp directory
+        shell: bash
         env:
           KRANZ_REQUIRED_CAPABILITIES: git,sandbox-exec,keychain
           KRANZ_SKIP_LOG: ${{ runner.temp }}/kranz-test-skips.log
+        run: |
+          cargo test --workspace --no-run
+          test_tmp="$(mktemp -d /tmp/kranz-test-tmp.XXXXXX)"
+          TMPDIR="$test_tmp" cargo test --workspace --no-fail-fast
+          python3 scripts/check-test-temp-leftovers.py "$test_tmp"
       - name: Check bounded ACP probe with a synthetic peer
         if: runner.os != 'Windows'
         shell: bash

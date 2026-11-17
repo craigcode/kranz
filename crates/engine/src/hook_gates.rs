@@ -120,8 +120,9 @@ const HOOK_TIMEOUT_SECS: u32 = 10;
 
 /// Max hook records folded into the event log per run. The record file is
 /// session-writable, so an unbounded fold would let a hostile or looping
-/// session flood the append-only log; the records beyond the cap stay in
-/// the scratch file and the truncation is logged.
+/// session flood the append-only log. The truncation is logged. Records
+/// beyond the cap are not kept: the scratch file goes with the session's
+/// scratch home when the session ends.
 pub const FOLD_CAP: usize = 64;
 
 /// Max chars kept on a folded record's subject / detail (the file is

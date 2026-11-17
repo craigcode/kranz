@@ -411,6 +411,29 @@ pub async fn run_session(
 /// not the single-writer log).
 pub async fn run_session_to(
     backend: &dyn AgentBackend,
+    spec: SessionSpec,
+    log: &mut LogTarget<'_>,
+    paths: &MissionPaths,
+    run_meta: RunMeta,
+    cancel: Option<Arc<Notify>>,
+) -> Result<RunOutcome> {
+    // Owns this session's scratch home. It is removed once the session body
+    // has returned, whatever it returned: by then the session object is gone
+    // (its process killed and reaped) and the hook records, the only thing
+    // the engine reads from the scratch home after the stream closes, are
+    // folded. Declared before the body's future so that a cancelled call
+    // drops the session first and the owner last; the drop removes the home
+    // too, without waiting for it.
+    let scratch = crate::session_scratch::SessionScratch::for_session(&spec.session_id);
+    let outcome = run_session_body(backend, spec, log, paths, run_meta, cancel).await;
+    scratch.remove().await;
+    outcome
+}
+
+/// The body of [`run_session_to`], which owns the session's scratch home
+/// around this call.
+async fn run_session_body(
+    backend: &dyn AgentBackend,
     mut spec: SessionSpec,
     log: &mut LogTarget<'_>,
     paths: &MissionPaths,
@@ -1160,7 +1183,7 @@ pub async fn run_worker_in(
     executor_route: Option<crate::types::ExecutorRoute>,
     standards_pin: Option<&crate::types::StandardsPin>,
 ) -> Result<RunOutcome> {
-    let (spec, run_meta, sgian) = build_worker_spec(
+    let (spec, run_meta, sgian, scratch) = build_worker_spec(
         cfg,
         &paths.repo_root,
         &paths.mission_id,
@@ -1183,6 +1206,9 @@ pub async fn run_worker_in(
     let mut target = LogTarget::Live(log);
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
     sgian.close().await;
+    // Already removed by the session run; this owner covered the time before
+    // the run began.
+    scratch.remove().await;
     outcome
 }
 
@@ -1267,7 +1293,7 @@ pub(crate) async fn run_worker_in_buffered_controlled(
     relay: Option<PermissionRelay>,
     cancel: Option<Arc<Notify>>,
 ) -> Result<(Vec<EventKind>, RunOutcome)> {
-    let (spec, run_meta, sgian) = build_worker_spec(
+    let (spec, run_meta, sgian, scratch) = build_worker_spec(
         cfg,
         &paths.repo_root,
         &paths.mission_id,
@@ -1298,6 +1324,9 @@ pub(crate) async fn run_worker_in_buffered_controlled(
     };
     let outcome = run_session_to(backend, spec, &mut target, paths, run_meta, cancel).await;
     sgian.close().await;
+    // Already removed by the session run; this owner covered the time before
+    // the run began.
+    scratch.remove().await;
     if matches!(target, LogTarget::Controlled { .. }) {
         if let Err(error) = &outcome {
             if matches!(target, LogTarget::Controlled { relayed: true, .. }) {
@@ -1471,7 +1500,12 @@ async fn build_worker_spec(
     touch_set: &[String],
     executor_route: Option<crate::types::ExecutorRoute>,
     standards_pin: Option<&crate::types::StandardsPin>,
-) -> Result<(SessionSpec, RunMeta, WorkerSgianLease)> {
+) -> Result<(
+    SessionSpec,
+    RunMeta,
+    WorkerSgianLease,
+    crate::session_scratch::SessionScratch,
+)> {
     let role = Role::Worker;
     let role_cfg = cfg.role(role);
 
@@ -1566,6 +1600,11 @@ async fn build_worker_spec(
         hook_status: None,
     };
     spec.env = contract_env(base_sha);
+    // The seeding below can put a copy of the credential file in this
+    // session's scratch home. The owner exists first, so the home is removed
+    // if a later step here refuses the session (an unresolvable sandbox, for
+    // one) or this future is cancelled before the session runs.
+    let scratch = crate::session_scratch::SessionScratch::for_session(&spec.session_id);
     let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let real_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
     seed_worker_env(
@@ -1670,7 +1709,7 @@ async fn build_worker_spec(
         prompt_hash: extended_prompt_hash.unwrap_or_else(|| prompts::hash(role)),
         executor_route,
     };
-    Ok((spec, run_meta, sgian))
+    Ok((spec, run_meta, sgian, scratch))
 }
 
 /// Run one validator session for a milestone (plan §4.4/§4.6).

@@ -23,11 +23,9 @@ fn licenses_travel_with_the_binary_outside_a_source_checkout() {
         .path()
         .join(if cfg!(windows) { "kranz.exe" } else { "kranz" });
     fs::copy(env!("CARGO_BIN_EXE_kranz"), &binary).unwrap();
-    let output = std::process::Command::new(&binary)
-        .arg("licenses")
-        .current_dir(dir.path())
-        .output()
-        .unwrap();
+    let mut command = std::process::Command::new(&binary);
+    command.arg("licenses").current_dir(dir.path());
+    let output = output_of_a_just_written_program(&mut command);
     assert!(
         output.status.success(),
         "{}",
@@ -51,6 +49,31 @@ fn licenses_travel_with_the_binary_outside_a_source_checkout() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Run `command`, whose program file this test has just written, and return
+/// its output.
+///
+/// On Unix the kernel refuses to execute a file that any process holds open
+/// for writing ("Text file busy"). This test closed its own handle, but a
+/// child that another test thread forked while the copy was in progress
+/// inherited that handle and holds it until it calls `exec`. That window is
+/// short, so the spawn is retried for up to a second on that one error. Any
+/// other error, and a busy file that stays busy, fails the test as before.
+fn output_of_a_just_written_program(command: &mut std::process::Command) -> std::process::Output {
+    const ATTEMPTS: u32 = 50;
+    for attempt in 1..=ATTEMPTS {
+        match command.output() {
+            Ok(output) => return output,
+            Err(error)
+                if attempt < ATTEMPTS && error.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("could not run {command:?}: {error}"),
+        }
+    }
+    unreachable!("the last attempt returns or panics")
+}
 
 fn event(seq: u64, mission_id: &str, kind: EventKind) -> Event {
     Event {
@@ -2564,6 +2587,97 @@ fn remove_missions_deletes_selected_and_keeps_index_and_others() {
     assert_eq!(
         remaining,
         vec!["index.md".to_string(), "m-planned".to_string()]
+    );
+}
+
+/// `kranz clean` deletes the only record that ties a mission to its leftover
+/// worktrees, so it removes the clean ones first and keeps, untouched, one
+/// that holds uncommitted work.
+#[test]
+fn remove_missions_removes_clean_worktrees_and_keeps_dirty_ones() {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = fs::canonicalize(tmp.path()).unwrap();
+    let repo = repo.as_path();
+    if !git(repo, &["init", "-b", "main"]).status.success() {
+        assert!(git(repo, &["init"]).status.success());
+    }
+    assert!(git(repo, &["config", "user.name", "kranz-test"])
+        .status
+        .success());
+    assert!(git(repo, &["config", "user.email", "test@kranz.local"])
+        .status
+        .success());
+    fs::write(repo.join("README.md"), "seed\n").unwrap();
+    fs::write(repo.join(".gitignore"), ".kranz/\n").unwrap();
+    assert!(git(repo, &["add", "-A"]).status.success());
+    assert!(git(repo, &["commit", "-m", "seed"]).status.success());
+
+    write_events(
+        repo,
+        "m-failed",
+        vec![
+            created_kind("g", "m-failed"),
+            EventKind::MissionFailed { reason: "x".into() },
+        ],
+    );
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    // Not canonicalized: on Windows that gives a verbatim path, which git
+    // cannot take as an argument.
+    let base = elsewhere.path().to_path_buf();
+    let integration_name = kranz_engine::orchestrator::mission_worktree_path(repo, "m-failed")
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let feature_name = integration_name.replace("_integration", "f-1-1");
+    let integration = base.join(&integration_name);
+    let dirty_feature = base.join(&feature_name);
+    for (path, branch) in [
+        (&integration, "kranz/mission-m-failed"),
+        (&dirty_feature, "kranz/wt/m-failed/f-1-1"),
+    ] {
+        let added = git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+    }
+    fs::write(dirty_feature.join("uncommitted.txt"), "only copy\n").unwrap();
+
+    let entries = commands::select_cleanable(repo, false);
+    let removed = commands::remove_missions(repo, &entries, false);
+    assert_eq!(removed, vec!["m-failed".to_string()]);
+
+    assert!(
+        !integration.exists(),
+        "the clean integration worktree is removed with its mission"
+    );
+    assert_eq!(
+        fs::read_to_string(dirty_feature.join("uncommitted.txt")).unwrap(),
+        "only copy\n",
+        "a worktree holding uncommitted work is kept"
+    );
+    let listed = String::from_utf8_lossy(&git(repo, &["worktree", "list"]).stdout).into_owned();
+    assert!(!listed.contains(&integration_name), "{listed}");
+    assert!(listed.contains(&feature_name), "{listed}");
+    let branches = String::from_utf8_lossy(&git(repo, &["branch", "--list"]).stdout).into_owned();
+    assert!(
+        branches.contains("kranz/mission-m-failed"),
+        "no branch is deleted: {branches}"
     );
 }
 

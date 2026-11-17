@@ -2008,6 +2008,28 @@ fn preflight_unauthenticated_script() -> MockScript {
     }
 }
 
+/// The preflight home a probe session ran in: the parent of its working
+/// directory. Asserts that it is a scratch home named for `mission_id`, with
+/// a suffix that keeps two engines holding the same mission id apart.
+fn preflight_home_of(probe: &kranz_engine::backend::SessionSpec, mission_id: &str) -> PathBuf {
+    let home = probe
+        .cwd
+        .parent()
+        .expect("the probe's working directory has a parent")
+        .to_path_buf();
+    let expected_prefix =
+        kranz_engine::backend_claude::scratch_home_root(&format!("preflight-{mission_id}-"));
+    let prefix = expected_prefix.file_name().unwrap().to_str().unwrap();
+    let name = home.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.starts_with(prefix) && name.len() > prefix.len(),
+        "the probe's working directory {} must be inside a preflight home named {prefix}<unique>",
+        probe.cwd.display()
+    );
+    assert_eq!(home.parent(), expected_prefix.parent());
+    home
+}
+
 /// Every `SessionSpec` in `specs` whose prompt is the auth-preflight probe
 /// (see `crate::auth_verify::probe_spec`): a single-shot "Reply with the
 /// single word: ack." prompt, distinguishable from every worker/orchestrator
@@ -2087,6 +2109,18 @@ async fn worker_auth_preflight_cached_once_per_mission() {
          how many workers spawn: {:?}",
         specs.iter().map(|s| &s.prompt).collect::<Vec<_>>()
     );
+    // The probe runs in a directory of its own inside the preflight home,
+    // not in the shared temp directory, and the whole preflight home, which
+    // held a copy of the credential file, is gone once the verdict is known.
+    let preflight_home = preflight_home_of(probes[0], engine.mission_id());
+    assert_ne!(probes[0].cwd, std::env::temp_dir());
+    if kranz_engine::session_scratch::REMOVES_SCRATCH_HOMES {
+        assert!(
+            !preflight_home.exists(),
+            "the preflight home {} must be removed after the verdict",
+            preflight_home.display()
+        );
+    }
 
     let workers = worker_specs(&specs);
     assert_eq!(
@@ -2101,6 +2135,15 @@ async fn worker_auth_preflight_cached_once_per_mission() {
              (CLAUDE_CONFIG_DIR deliberately unset — keychain OAuth poison): {:?}",
             spec.env
         );
+        // On both spawn paths a finished worker's scratch home is removed.
+        let home = kranz_engine::backend_claude::scratch_home_root(&spec.session_id);
+        if kranz_engine::session_scratch::REMOVES_SCRATCH_HOMES {
+            assert!(
+                !home.exists(),
+                "worker scratch home {} must be removed when its session ends",
+                home.display()
+            );
+        }
     }
 }
 
@@ -2156,6 +2199,16 @@ async fn worker_auth_both_spawn_paths_gated() {
             1,
             "exactly one preflight session per mission"
         );
+        // Whatever the verdict, the preflight home does not outlive it.
+        let preflight_home =
+            preflight_home_of(preflight_probe_specs(&specs)[0], engine.mission_id());
+        if kranz_engine::session_scratch::REMOVES_SCRATCH_HOMES {
+            assert!(
+                !preflight_home.exists(),
+                "the preflight home {} must be removed after the verdict",
+                preflight_home.display()
+            );
+        }
         let workers = worker_specs(&specs);
         assert_eq!(
             workers.len(),
@@ -2202,4 +2255,316 @@ async fn worker_auth_both_spawn_paths_gated() {
              HOME present={has_home}, CLAUDE_CONFIG_DIR present={has_config_dir}"
         );
     }
+}
+
+// -----------------------------------------------------------------------
+// Worktrees of a mission that will never run again.
+// -----------------------------------------------------------------------
+
+/// The directory name the engine gives a mission's worktree, with `suffix`
+/// in place of the integration worktree's `_integration`.
+fn mission_worktree_name(root: &std::path::Path, mission_id: &str, suffix: &str) -> String {
+    let integration = kranz_engine::orchestrator::mission_worktree_path(root, mission_id);
+    let name = integration.file_name().unwrap().to_str().unwrap();
+    name.strip_suffix("_integration")
+        .expect("the integration worktree name ends in _integration")
+        .to_string()
+        + suffix
+}
+
+/// Register a worktree of `root` at `base/<name>` on a new branch `branch`.
+fn add_test_worktree(
+    root: &std::path::Path,
+    base: &std::path::Path,
+    name: &str,
+    branch: &str,
+) -> PathBuf {
+    let path = base.join(name);
+    // The engine's own git calls ignore the machine's git configuration. A
+    // checkout that converted line endings under it would look modified to
+    // them, so this one converts nothing either.
+    raw_git(
+        root,
+        &[
+            "-c",
+            "core.autocrlf=false",
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            path.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    path
+}
+
+fn is_registered_worktree(root: &std::path::Path, path: &std::path::Path) -> bool {
+    let name = path.file_name().unwrap().to_str().unwrap();
+    raw_git(root, &["worktree", "list", "--porcelain"])
+        .lines()
+        .any(|line| line.starts_with("worktree ") && line.ends_with(name))
+}
+
+/// Abandoning a mission ends any chance of a resume, which was the only thing
+/// that cleared its leftover worktrees. Abandon removes the ones that hold
+/// only committed files, wherever their directory is; keeps one holding an
+/// untracked file and one holding only an ignored file; deletes no branch;
+/// and touches no other mission's worktree.
+#[tokio::test(flavor = "multi_thread")]
+async fn abandon_removes_clean_mission_worktrees_and_keeps_dirty_ones() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+    let engine = MissionEngine::create(backend, &root, GOAL, worktree_cfg()).expect("create");
+    let mission_id = engine.mission_id().to_string();
+    drop(engine);
+
+    // The worktrees live in a directory that is NOT the current temp
+    // directory, as they would after a run under a different TMPDIR: they
+    // are found by their registration in the repository.
+    let elsewhere = tempfile::tempdir().unwrap();
+    // Not canonicalized: on Windows that gives a verbatim path, which git
+    // cannot take as an argument.
+    let base = elsewhere.path().to_path_buf();
+    let name = |suffix: &str| mission_worktree_name(&root, &mission_id, suffix);
+
+    let integration = add_test_worktree(
+        &root,
+        &base,
+        &name("_integration"),
+        &format!("kranz/mission-{mission_id}"),
+    );
+    let clean_feature = add_test_worktree(
+        &root,
+        &base,
+        &name("f-1-1"),
+        &format!("kranz/wt/{mission_id}/f-1-1"),
+    );
+    let dirty_feature = add_test_worktree(
+        &root,
+        &base,
+        &name("f-1-2"),
+        &format!("kranz/wt/{mission_id}/f-1-2"),
+    );
+    std::fs::write(dirty_feature.join("uncommitted.txt"), "only copy\n").unwrap();
+    // A worktree whose only extra content is a file git ignores, such as
+    // build output or a local environment file. `git worktree remove` would
+    // delete it without complaint, so the engine checks for it first.
+    let ignored_feature = add_test_worktree(
+        &root,
+        &base,
+        &name("f-1-3"),
+        &format!("kranz/wt/{mission_id}/f-1-3"),
+    );
+    std::fs::write(ignored_feature.join(".gitignore"), "local.env\n").unwrap();
+    raw_git(&ignored_feature, &["add", ".gitignore"]);
+    raw_git(&ignored_feature, &["commit", "-m", "ignore local.env"]);
+    std::fs::write(ignored_feature.join("local.env"), "only copy\n").unwrap();
+    let pool_name = name("f-1-1-c0").replacen("kranz-wt-", "kranz-pool-", 1);
+    let pool = add_test_worktree(
+        &root,
+        &base,
+        &pool_name,
+        &format!("kranz/pool/{mission_id}/f-1-1-c0"),
+    );
+    // Another mission's worktree, and one that only looks like ours: it has
+    // our directory name but is not on one of this mission's branches.
+    let other_mission = add_test_worktree(
+        &root,
+        &base,
+        &mission_worktree_name(&root, "m-other1", "f-1-1"),
+        "kranz/wt/m-other1/f-1-1",
+    );
+    let lookalike = add_test_worktree(&root, &base, &name("f-9-9"), "somebody/elses-branch");
+
+    let cleanup = kranz_engine::mission_catalog::abandon_mission(
+        &root,
+        &mission_id,
+        "stop",
+        kranz_engine::event_log::LockForce::No,
+    )
+    .expect("abandon");
+
+    assert_eq!(cleanup.not_attempted, None, "{cleanup:?}");
+    assert_eq!(cleanup.removed.len(), 3, "{cleanup:?}");
+    assert_eq!(cleanup.kept.len(), 2, "{cleanup:?}");
+    for gone in [&integration, &clean_feature, &pool] {
+        assert!(!gone.exists(), "{} must be removed", gone.display());
+        assert!(
+            !is_registered_worktree(&root, gone),
+            "{} must no longer be registered",
+            gone.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(dirty_feature.join("uncommitted.txt")).unwrap(),
+        "only copy\n",
+        "a worktree holding uncommitted work is kept as it was"
+    );
+    assert!(is_registered_worktree(&root, &dirty_feature));
+    assert_eq!(
+        std::fs::read_to_string(ignored_feature.join("local.env")).unwrap(),
+        "only copy\n",
+        "a worktree holding an ignored file is kept as it was"
+    );
+    assert!(is_registered_worktree(&root, &ignored_feature));
+    for kept in [&other_mission, &lookalike] {
+        assert!(kept.is_dir(), "{} is not ours to remove", kept.display());
+        assert!(is_registered_worktree(&root, kept));
+    }
+    // No branch is deleted, so every commit stays reachable.
+    let branches = raw_git(&root, &["branch", "--list", "--format=%(refname:short)"]);
+    for branch in [
+        format!("kranz/wt/{mission_id}/f-1-1"),
+        format!("kranz/pool/{mission_id}/f-1-1-c0"),
+        format!("kranz/mission-{mission_id}"),
+    ] {
+        assert!(
+            branches.lines().any(|line| line == branch),
+            "branch {branch} must survive: {branches}"
+        );
+    }
+}
+
+/// When the mission lock has to be taken over, the engine that held it
+/// crashed or is still running, and a worker it started may be in a worktree
+/// at this moment. Abandon then records the event and removes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn abandon_that_takes_over_a_lock_leaves_every_worktree_alone() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let backend: Arc<dyn AgentBackend> = Arc::new(MockBackend::new());
+    let engine = MissionEngine::create(backend, &root, GOAL, worktree_cfg()).expect("create");
+    let mission_id = engine.mission_id().to_string();
+    drop(engine);
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let base = elsewhere.path().to_path_buf();
+    let clean_feature = add_test_worktree(
+        &root,
+        &base,
+        &mission_worktree_name(&root, &mission_id, "f-1-1"),
+        &format!("kranz/wt/{mission_id}/f-1-1"),
+    );
+    // A lock file an engine left behind. The most forceful tier takes it
+    // over whatever its holder's state is judged to be.
+    let paths = kranz_engine::paths::MissionPaths::new(&root, &mission_id);
+    std::fs::write(paths.lock_file(), format!("{}\n", std::process::id())).unwrap();
+
+    let cleanup = kranz_engine::mission_catalog::abandon_mission(
+        &root,
+        &mission_id,
+        "stop",
+        kranz_engine::event_log::LockForce::EvenIfLive,
+    )
+    .expect("abandon");
+
+    assert!(cleanup.not_attempted.is_some(), "{cleanup:?}");
+    assert!(cleanup.removed.is_empty() && cleanup.kept.is_empty());
+    assert!(clean_feature.is_dir(), "no worktree is removed");
+    assert!(is_registered_worktree(&root, &clean_feature));
+
+    // The lock was released in order by that abandon, so removing the
+    // mission afterwards may clear the worktree; with a lock file present
+    // again it may not.
+    std::fs::write(paths.lock_file(), format!("{}\n", std::process::id())).unwrap();
+    let cleanup =
+        kranz_engine::mission_catalog::remove_worktrees_of_terminal_mission(&root, &mission_id);
+    assert!(cleanup.not_attempted.is_some(), "{cleanup:?}");
+    assert!(clean_feature.is_dir());
+    std::fs::remove_file(paths.lock_file()).unwrap();
+    let cleanup =
+        kranz_engine::mission_catalog::remove_worktrees_of_terminal_mission(&root, &mission_id);
+    assert_eq!(cleanup.not_attempted, None);
+    assert_eq!(cleanup.removed.len(), 1, "{cleanup:?}");
+    assert!(!clean_feature.exists());
+}
+
+/// The integration worktree is taken only on the mission's own branch. A
+/// directory with its name on any other branch is not provably the
+/// mission's, so it is neither removed nor reported.
+#[test]
+fn an_integration_worktree_on_another_branch_is_left_alone() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let elsewhere = tempfile::tempdir().unwrap();
+    let base = elsewhere.path().to_path_buf();
+    let path = add_test_worktree(
+        &root,
+        &base,
+        &mission_worktree_name(&root, "m-abc123", "_integration"),
+        "somebody/elses-branch",
+    );
+
+    let cleanup = kranz_engine::orchestrator::remove_clean_mission_worktrees(&root, "m-abc123");
+
+    assert_eq!(cleanup, Default::default());
+    assert!(path.is_dir());
+}
+
+/// A worktree with no branch checked out could hold commits nothing else
+/// points at, so it is kept and reported even when its tree is clean.
+#[test]
+fn a_detached_mission_worktree_is_kept_and_reported() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let elsewhere = tempfile::tempdir().unwrap();
+    // Not canonicalized: on Windows that gives a verbatim path, which git
+    // cannot take as an argument.
+    let base = elsewhere.path().to_path_buf();
+    let path = base.join(mission_worktree_name(&root, "m-abc123", "_integration"));
+    raw_git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            path.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    let cleanup = kranz_engine::orchestrator::remove_clean_mission_worktrees(&root, "m-abc123");
+
+    assert!(cleanup.removed.is_empty(), "{cleanup:?}");
+    assert_eq!(cleanup.kept.len(), 1, "{cleanup:?}");
+    assert!(path.is_dir());
+}
+
+/// A registration whose directory is already gone is neither removed nor
+/// reported: there is nothing to remove and nothing to look at.
+#[test]
+fn a_registered_worktree_whose_directory_is_gone_is_skipped() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let elsewhere = tempfile::tempdir().unwrap();
+    // Not canonicalized: on Windows that gives a verbatim path, which git
+    // cannot take as an argument.
+    let base = elsewhere.path().to_path_buf();
+    let path = add_test_worktree(
+        &root,
+        &base,
+        &mission_worktree_name(&root, "m-abc123", "f-1-1"),
+        "kranz/wt/m-abc123/f-1-1",
+    );
+    std::fs::remove_dir_all(&path).unwrap();
+
+    let cleanup = kranz_engine::orchestrator::remove_clean_mission_worktrees(&root, "m-abc123");
+
+    assert_eq!(cleanup, Default::default());
+}
+
+/// The cleanup does nothing, and does not fail, outside a git repository.
+#[test]
+fn mission_worktree_cleanup_outside_a_repository_is_a_no_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let cleanup =
+        kranz_engine::orchestrator::remove_clean_mission_worktrees(dir.path(), "m-abc123");
+    assert_eq!(cleanup, Default::default());
 }

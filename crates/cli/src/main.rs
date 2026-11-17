@@ -120,7 +120,13 @@ fn main_inner() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    runtime.block_on(run_cli())
+    let code = runtime.block_on(run_cli());
+    // Dropping the runtime ends the git children it still owns. After that
+    // this process runs no more git, so its empty git config directory can
+    // go, where the engine judges that safe.
+    drop(runtime);
+    kranz_engine::git_ops::release_empty_global_config();
+    code
 }
 
 async fn run_cli() -> ExitCode {

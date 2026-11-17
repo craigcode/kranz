@@ -9,11 +9,11 @@
 use crate::error::{EngineError, Result};
 use crate::event_log::{EventLog, LockForce};
 use crate::events::EventKind;
-use crate::orchestrator::canonical_root;
+use crate::orchestrator::{canonical_root, MissionWorktreeCleanup};
 use crate::paths::MissionPaths;
 use crate::reducer;
 use crate::types::MissionStatus;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Remove a single mission's line from the missions catalog (deletion
@@ -130,13 +130,20 @@ pub fn mark_mission_index_report(existing: &str, mission_id: &str) -> String {
 /// is reconciled exactly as the run/drain paths do — Abandoned maps to ticket
 /// `failed`, so a direct abandon cannot leave the ticket stuck in `running`.
 /// The reconcile is best-effort: a reconcile error is logged, never fails the
-/// abandon. The lock is released on drop.
+/// abandon. Last, while the lock is still held, the mission's worktrees are
+/// removed where they hold nothing but committed files (see
+/// [`crate::orchestrator::remove_clean_mission_worktrees`]); any other is
+/// kept and logged with its path. This step is skipped when the lock was
+/// taken over from an engine that had not released it, by force or because
+/// its holder was found dead: a worker that engine started may still be
+/// running in one of the worktrees. The returned value says what was done.
+/// The lock is released on drop.
 pub fn abandon_mission(
     repo_root: impl Into<PathBuf>,
     mission_id: &str,
     reason: &str,
     force: LockForce,
-) -> Result<()> {
+) -> Result<MissionWorktreeCleanup> {
     let repo_root = canonical_root(repo_root.into());
     let paths = MissionPaths::new(&repo_root, mission_id);
 
@@ -184,8 +191,85 @@ pub fn abandon_mission(
             "abandon: failed to reconcile the linked ticket"
         );
     }
+    // The mission is terminal and its lock is held, so no engine will start
+    // work in its worktrees again. That says nothing about work already
+    // started: if the lock had to be taken over, the engine that held it
+    // crashed or is still running, and a worker of its may be in a worktree
+    // right now. Only a lock created afresh shows the last engine shut down
+    // in order, which ends its workers first.
+    let cleanup = if log.replaced_an_existing_lock() {
+        MissionWorktreeCleanup {
+            not_attempted: Some(
+                "the mission lock was taken over from an engine that had not released it, \
+                 so a worker it started may still be using a worktree"
+                    .to_string(),
+            ),
+            ..Default::default()
+        }
+    } else {
+        crate::orchestrator::remove_clean_mission_worktrees(&repo_root, mission_id)
+    };
+    log_worktree_cleanup("abandon", mission_id, &cleanup);
     // `log` drops here: buffer flushed, lock released.
-    Ok(())
+    Ok(cleanup)
+}
+
+/// Remove the worktrees of a terminal mission whose directory is about to be
+/// deleted (`kranz clean` and the server's delete route), keeping any that
+/// hold a file that is in no commit.
+///
+/// The mission directory is the only record that ties these worktrees to the
+/// mission, so they are dealt with before it goes. Nothing is attempted
+/// while a lock file is present: the caller has already refused a live
+/// holder, so a lock file here was left by an engine that crashed, and a
+/// worker that engine started may still be running in a worktree.
+pub fn remove_worktrees_of_terminal_mission(
+    repo_root: &Path,
+    mission_id: &str,
+) -> MissionWorktreeCleanup {
+    let paths = MissionPaths::new(repo_root, mission_id);
+    let cleanup = if std::fs::symlink_metadata(paths.lock_file()).is_ok() {
+        MissionWorktreeCleanup {
+            not_attempted: Some(
+                "a lock file left by an engine that did not shut down is present, so a \
+                 worker it started may still be using a worktree"
+                    .to_string(),
+            ),
+            ..Default::default()
+        }
+    } else {
+        crate::orchestrator::remove_clean_mission_worktrees(repo_root, mission_id)
+    };
+    log_worktree_cleanup("delete", mission_id, &cleanup);
+    cleanup
+}
+
+fn log_worktree_cleanup(action: &str, mission_id: &str, cleanup: &MissionWorktreeCleanup) {
+    for path in &cleanup.removed {
+        tracing::info!(
+            mission_id,
+            action,
+            path = %path.display(),
+            "removed a mission worktree that held only committed files"
+        );
+    }
+    for (path, reason) in &cleanup.kept {
+        tracing::warn!(
+            mission_id,
+            action,
+            path = %path.display(),
+            reason = %reason.trim(),
+            "kept a mission worktree"
+        );
+    }
+    if let Some(reason) = &cleanup.not_attempted {
+        tracing::warn!(
+            mission_id,
+            action,
+            reason = %reason,
+            "left the mission's worktrees alone"
+        );
+    }
 }
 
 /// Terminal mission statuses (no further work will ever run against them).

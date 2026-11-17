@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-16
+last_verified: 2026-11-17
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,8 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-17 (UTC) against the temp-directory cleanup: on Unix `runner::run_session_to` owns the session's scratch home through `session_scratch::SessionScratch` and removes it after the hook records are folded, on every return path, and the worker spec builder owns it from before it is seeded, so a worker refused before its session starts leaves none; the decompose planner, the read-back reviewer, `ask` and the worker-auth preflight do the same, and the preflight probe now runs in a directory inside its own home, whose name ends in a UUID. The removal runs on the runtime's blocking pool. Nothing is removed on Windows. The `kranz` binary releases its empty git config directory after the runtime is dropped (`main.rs`, `git_ops::release_empty_global_config`). Abandon, `kranz clean` and the server's delete route remove a mission's worktrees that hold only committed files; see "Resumability" below. `EventLog::replaced_an_existing_lock` reports whether an acquire took an existing lock file over. Pipeline stages, event kinds and their order are unchanged. The long-lived orchestrator session's scratch home is still not removed.
 
 Rechecked 2026-11-16 (UTC) against the Windows first-run fixes: the event-log lock now probes its holder on Windows (`OpenProcess`, with the process creation time as the identity token) and serializes a steal under a named mutex, so a dead holder is taken over there as on Unix. `kranz exec` checks the AppContainer host preparation before it creates a mission and prints its stdout line with status `ERROR` when the run errors. The review packet JSON gains `schemaVersion`, `missionStatus` and `nativeChecks`. The queue change is a comment. The pipeline and the single-writer rule are unchanged.
 
@@ -377,7 +379,19 @@ re-snapshots. The integration worktree is retained, including its index and
 uncommitted repair files. Setup verifies that the path is a registered worktree
 of this repository on the expected mission branch before reusing it; an
 unexpected path or branch is refused without deleting evidence. Errors also
-retain the integration worktree for recovery. No
+retain the integration worktree for recovery. Abandoning a mission
+(`mission_catalog::abandon_mission`) or removing its directory (`kranz clean`
+and the server's delete route, through
+`mission_catalog::remove_worktrees_of_terminal_mission`) ends any chance of
+that resume, so both reach `orchestrator::remove_clean_mission_worktrees`:
+every worktree registered in the repository under this mission's directory
+name and on one of its branches is removed if `git status --porcelain
+--ignored` prints nothing in it, with `git worktree remove` without `--force`,
+so one that holds a modified, untracked or ignored file is kept and reported,
+and no branch is deleted. Neither path removes anything when the last engine
+did not release the mission lock (abandon took the lock over, or a lock file
+is still present at delete), because a worker of that engine may still be
+running in a worktree. No
 agent session starts here — sessions are lazy. Because state is a pure fold, a
 killed engine loses nothing durable: the run loop's status/feature checks pick
 up exactly where the log left off. Guard this: `dry_run_revised_plan` validates

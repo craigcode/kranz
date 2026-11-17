@@ -318,6 +318,117 @@ create their fixtures under `TMPDIR`, not under the scratch root, so running
 them with `container` in `KRANZ_REQUIRED_CAPABILITIES` still needs a shared
 temp dir. `KRANZ_SCRATCH_ROOT` fixes missions, not fixtures.
 
+## Operator note: what Kranz puts in the temp directory, and when it goes
+
+Four kinds of directory that Kranz creates under the system temp directory
+(or under `KRANZ_SCRATCH_ROOT` for the first two) can outlive the step that
+made them, and are described here. Kranz also makes short-lived directories
+there that the step that made them removes when it finishes:
+`kranz-merge-<uuid>` (a merge worktree), `kranz-gate-<uuid>` and
+`kranz-controls-<uuid>` (gate and contract-control scratch),
+`kranz-acp-owned-*` and `kranz-acp-profile-*` (ACP worker state), and
+`kranz-mount-proof-*` and `kranz-mount-ledger-*` (the container mount check).
+After a crash you may find one of those too. Nothing in them is needed once no
+`kranz` process is running.
+
+| Directory | What it is | When Kranz removes it |
+| --- | --- | --- |
+| `kranz-worker-home-<session id>` | One session's scratch root: its `HOME`, temp directory, a copy of the Cargo registry cache and its hook files. The `HOME` can hold a copy of the agent CLI's credential file. On macOS it holds a symbolic link to your real `~/Library/Keychains`. | On macOS and Linux, when the session ends, whether it passed, failed, was cancelled or was refused before it started. This covers worker and validator sessions, the decompose planner, the contract read-back reviewer and `ask`. On Windows it is not removed. |
+| `kranz-worker-home-preflight-<mission id>-<uuid>` | The home used once per mission to test that a relocated worker can authenticate. Also holds a credential copy. | On macOS and Linux, as soon as the test has a verdict. On Windows it is not removed. |
+| `kranz-gitconfig-<uuid>` | An empty directory with one empty file, which `kranz` points git's user configuration at. One per `kranz` process that runs git. | When the `kranz` process exits normally, if the temp directory is private to you (see below). |
+| `kranz-wt-*`, `kranz-pool-*` | Git worktrees for a mission: one per parallel feature or candidate, and one integration worktree per mission. | Feature and candidate worktrees after each batch. The integration worktree when a run ends with the mission Complete or Failed. For a mission you abandon, see the paragraph on `kranz abandon` below: its worktrees go only if they hold nothing but committed files. |
+
+These things are left on purpose or cannot be helped:
+
+- **A shared temp directory.** Where other users can create files in the temp
+  directory, as in a default Linux `/tmp`, Kranz empties a finished session's
+  scratch root but leaves the empty directory, and leaves its
+  `kranz-gitconfig-*` directory alone. Removing either would free a name
+  another local user could take, and a background process the session or git
+  left running would then read that user's files. The per-user temp directory
+  on macOS is private, so both are removed there. To get the same on Linux,
+  run `kranz` with `TMPDIR` (and `KRANZ_SCRATCH_ROOT`, if you set it) naming
+  a directory that you own and that neither your group nor other users can
+  write: mode `0700` or `0755`. A directory of mode `0775` counts as shared
+  even when the group is your own, which is what a umask of `002` gives a
+  directory you create; run `chmod go-w` on it. When Kranz takes the shared
+  path it says so once per process in its log, at info level.
+- **Windows.** No scratch root and no `kranz-gitconfig-*` directory is
+  removed on Windows. Kranz has no way there to remove a directory tree that
+  is safe against a process swapping part of it for a link during the
+  removal, and it cannot check who owns the temp directory.
+- **Time taken.** A scratch root holds a copy of the Cargo registry cache,
+  so removing it can take a noticeable time. The removal runs on a background
+  thread and does not hold up other sessions or `kranz serve` requests. A run
+  waits for its own session's removal before it reports the session finished.
+- **The orchestrator's own session.** The scratch home of the long-lived
+  orchestrator session is not removed yet. There is one per orchestrator
+  start, not one per worker.
+- **A killed process.** A `kranz` process that is killed or crashes removes
+  nothing. A mission's feature and candidate worktrees are then cleared by the
+  next `kranz run` of that mission, but only those under the temp directory
+  that run uses: worktrees made under a different `TMPDIR` are not found by
+  it.
+- **Merge worktrees.** `kranz merge` starts by removing every registered
+  `kranz-merge-*` worktree of the repository, without checking whether
+  another `kranz merge` is using one. Do not run two merges in one repository
+  at the same time.
+
+A mission that stops Blocked or Paused keeps its integration worktree so the
+repair in it can be resumed, and a worktree whose inspection failed is kept
+for you to look at. `kranz abandon` and `kranz clean` (and the abandon and
+delete actions of `kranz serve`) end any chance of a resume, so they remove
+the mission's worktrees, wherever their directories are, under these rules:
+
+- A worktree is removed only if it holds nothing but committed files. One
+  with a modified file, an untracked file, or a file git ignores (build
+  output, a local environment file, a log) is kept, and the commands print
+  its path and the reason.
+- A worktree is taken only if it is registered in the repository, carries the
+  mission's name, and has one of the mission's own branches checked out.
+- No branch is deleted, so every commit stays reachable.
+- Nothing is removed when the engine that last ran the mission did not shut
+  down in order: when `kranz abandon` had to take the mission lock over (a
+  crashed engine's stale lock, `--force-lock`, or
+  `--dangerously-steal-live-lock`), or when `kranz clean` finds a lock file
+  still present. A worker that engine started may still be running in a
+  worktree. The commands say so. Once you know no such process is left, a
+  later `kranz clean` of the mission removes them.
+
+### Removing directories left by earlier versions
+
+Versions before this change removed none of the first three kinds, so a
+machine that ran many missions can hold thousands of them. Kranz does not
+delete these for you: an old directory carries no record of the process that
+made it, and its age does not show that the process is gone. A hosted
+orchestrator session can sit idle for days, and `kranz serve` can run for
+weeks.
+
+To remove them yourself:
+
+1. Stop every `kranz` process you own (`serve`, `run`, `work`, `exec`) and
+   wait for their agent sessions to exit.
+2. List what is there. Look in `$TMPDIR` (or `/tmp` when it is unset) and in
+   `KRANZ_SCRATCH_ROOT` if you use it:
+
+   ```bash
+   find "${TMPDIR:-/tmp}" -maxdepth 1 -user "$(id -un)" \
+     \( -name 'kranz-worker-home-*' -o -name 'kranz-gitconfig-*' \) -print
+   ```
+
+3. Read the list. Remove only directories you own that are on it, with a
+   tool that does not follow symbolic links. `rm -rf` does not follow them:
+   it removes the `Library/Keychains` link in a scratch home and leaves your
+   real keychain directory alone. Do not use a tool that copies or
+   "resolves" links first.
+
+The `kranz-worker-home-*` directories are the ones that matter: each can hold
+a copy of your agent CLI credential file. Kranz creates them readable by
+their owner only. If the temp directory is one other users can read, check
+the permissions of the listed directories before you remove them (`ls -ld`).
+If any is readable by group or others, treat that credential as exposed and
+sign in again.
+
 ## Open questions
 
 1. **Resolved 2026-07-06** — minimal file/dir set the `claude` CLI needs to

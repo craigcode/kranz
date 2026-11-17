@@ -42,6 +42,18 @@ npm run check-embedded
 npm run lint
 ```
 
+Tests must not leave files or folders in the temp directory. Own a per-test
+directory with `tempfile::TempDir`, and register one that a whole test binary
+shares with `kranz_engine::test_dirs`. CI runs the suite with a temp directory
+of its own on Linux and macOS and fails if anything is left in it. To check
+locally:
+
+```sh
+dir="$(mktemp -d /tmp/kranz-test-tmp.XXXXXX)"
+TMPDIR="$dir" cargo test --workspace --no-fail-fast \
+  && python3 scripts/check-test-temp-leftovers.py "$dir"
+```
+
 Run `cargo deny check` and the repository's secret/domain scans when changing
 dependencies, release automation, authentication, sandboxing, or fixtures.
 

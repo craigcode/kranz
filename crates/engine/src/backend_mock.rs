@@ -410,7 +410,13 @@ pub struct MockBackend {
     /// Count of sessions started, observable by parked rendezvous sessions
     /// (see [`MockScript::hold_result_until_started`]).
     started_count: watch::Sender<usize>,
+    /// Called with each spec as its session starts; see
+    /// [`MockBackend::observe_start`].
+    start_observer: Mutex<Option<StartObserver>>,
 }
+
+/// A callback run inside [`MockBackend::start`] with the spec being started.
+type StartObserver = Box<dyn Fn(&SessionSpec) + Send + Sync>;
 
 impl Default for MockBackend {
     fn default() -> Self {
@@ -419,6 +425,7 @@ impl Default for MockBackend {
             started_specs: Mutex::new(Vec::new()),
             injected: Arc::new(Mutex::new(Vec::new())),
             started_count: watch::channel(0).0,
+            start_observer: Mutex::new(None),
         }
     }
 }
@@ -442,6 +449,18 @@ impl MockBackend {
             .lock()
             .expect("mock scripts lock")
             .push_back(script);
+    }
+
+    /// Run `observer` with each spec as its session starts, replacing any
+    /// earlier observer.
+    ///
+    /// This is the point where a real agent process would begin: the engine
+    /// has seeded the session's scratch home and written its hook files, and
+    /// has not yet removed them, which it does when the session ends. A test
+    /// that asserts on those files, or that plays the part of the session by
+    /// writing into them, does it here.
+    pub fn observe_start(&self, observer: impl Fn(&SessionSpec) + Send + Sync + 'static) {
+        *self.start_observer.lock().expect("mock observer lock") = Some(Box::new(observer));
     }
 
     /// Clones of every spec passed to `start()`, in start order.
@@ -582,6 +601,14 @@ impl AgentBackend for MockBackend {
             .session_id
             .clone()
             .unwrap_or_else(|| spec.session_id.clone());
+        if let Some(observer) = self
+            .start_observer
+            .lock()
+            .expect("mock observer lock")
+            .as_ref()
+        {
+            observer(&spec);
+        }
         self.started_specs
             .lock()
             .expect("mock specs lock")

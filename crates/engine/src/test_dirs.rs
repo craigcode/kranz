@@ -97,13 +97,15 @@ pub(crate) fn register(dir: &Path) {
 /// Remove the engine's per-process empty git config when this process exits.
 ///
 /// Every hardened git call points git's user scope at one empty file in a
-/// randomly named directory that the engine keeps until the process ends and
-/// never removes. A test binary whose tests run engine git calls this once,
+/// randomly named directory that the engine keeps until the process ends.
+/// Only the `kranz` binary removes it, on its way out (see
+/// [`crate::git_ops::release_empty_global_config`]); a test binary has no
+/// such exit path. A test binary whose tests run engine git calls this once,
 /// from the helper that builds its repository. It creates the file if no git
 /// call has yet, so the order does not matter.
 ///
-/// Test binaries only. A real process must keep that file for as long as any
-/// git child it started can still read the path.
+/// Test binaries only. This removes the directory wherever it is, without
+/// the check the binary makes that no other user could take the freed name.
 pub fn remove_git_config_at_exit() {
     static CONFIG: Once = Once::new();
     CONFIG.call_once(|| {
