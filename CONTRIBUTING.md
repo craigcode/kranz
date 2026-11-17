@@ -73,10 +73,21 @@ By submitting a contribution you agree to the following terms.
   users under the Apache License 2.0, including its patent grant, as set out
   in section 5 of that license.
 - **Sign-off.** Every commit you submit carries a `Signed-off-by:` line with
-  your real name and email (`git commit -s`). The line certifies the
+  your real name and the commit's author or committer email address, in the
+  trailer lines that end the message (`git commit -s` writes it). The line
+  certifies the
   [Developer Certificate of Origin 1.1](https://developercertificate.org/):
   you wrote the change, or otherwise have the right to submit it under the
-  project license. Pull requests with unsigned commits are not merged.
+  project license. A merge needs the line only when it carries a change of
+  its own, such as a resolved conflict. CI checks this on every pull request
+  (`scripts/check-commit-signoff.py`), and pull requests with unsigned
+  commits are not merged.
+  Pull requests opened by the repository owner or by Dependabot are exempt:
+  the owner holds the copyright, and the project's own automation commits
+  under the owner's pull requests. The exemption follows who opened the pull
+  request, not who made a commit. The owner therefore signs off any commit
+  pushed to a contributor's pull request, and checks by hand the sign-off of
+  another person's commit carried in a pull request the owner opens.
 - **Relicensing.** You keep the copyright in your contribution. You also
   grant Craig Martin, the project's copyright holder, and any successors and
   assigns, a perpetual, worldwide, non-exclusive, royalty-free, irrevocable
