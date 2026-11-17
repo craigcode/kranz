@@ -46,6 +46,8 @@ jobs:
           python3 scripts/check-actions-allowlist.py
       - name: Prove the test temp-directory leftover check
         run: python3 scripts/check-test-temp-leftovers.py --self-test
+      - name: Prove the npm advisory check
+        run: python3 scripts/check-npm-audit.py --self-test
       - name: Verify release workflow restores no cache
         run: |
           python3 scripts/check-release-workflow.py --self-test
@@ -888,8 +890,9 @@ jobs:
           cache-dependency-path: apps/dashboard/package-lock.json
       - run: npm ci
         working-directory: apps/dashboard
-      - run: npm audit --audit-level=high
-        working-directory: apps/dashboard
+      # High and critical advisories fail, except the dated waivers listed
+      # in the script. Waivers never cover a dependency that ships.
+      - run: python3 scripts/check-npm-audit.py apps/dashboard
       # `tsc -b` (build mode): tsconfig.json is solution-style (files: [] +
       # project references), so plain `tsc --noEmit` would check ZERO files.
       - run: npx tsc -b
@@ -916,8 +919,9 @@ jobs:
           cache-dependency-path: apps/even-g2/package-lock.json
       - run: npm ci
         working-directory: apps/even-g2
-      - run: npm audit --audit-level=high
-        working-directory: apps/even-g2
+      # High and critical advisories fail, except the dated waivers listed
+      # in the script. Waivers never cover a dependency that ships.
+      - run: python3 scripts/check-npm-audit.py apps/even-g2
       - run: npm run test
         working-directory: apps/even-g2
       - run: npm run pack
