@@ -3,8 +3,9 @@
 if not __debug__:
     raise SystemExit("ACP proof checks require assertions; disable PYTHONOPTIMIZE and -O")
 
-import json, os, pathlib, subprocess, tempfile, sys
+import atexit, json, os, pathlib, shutil, subprocess, tempfile, sys
 root=pathlib.Path(tempfile.mkdtemp(prefix='kranz-acp-probe-proof-'))
+atexit.register(shutil.rmtree, root, ignore_errors=True)
 (root/'peer.py').write_text('''import json,os,sys
 from pathlib import Path
 assert 'KRANZ_PROBE_UNRELATED_SECRET' not in os.environ

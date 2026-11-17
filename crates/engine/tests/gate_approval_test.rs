@@ -16,6 +16,7 @@ use std::sync::Arc;
 const IMAGE: &str =
     "python@sha256:540c7d91f98ff6880174c40e99067bf5941eb54d818a7a5e094d188b196a934d";
 fn git(root: &Path, args: &[&str]) -> String {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     let output = std::process::Command::new("git")
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())

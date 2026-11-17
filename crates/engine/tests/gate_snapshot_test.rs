@@ -4,6 +4,7 @@ use kranz_engine::git_ops::GitRepo;
 use std::path::Path;
 
 fn git(root: &Path, args: &[&str]) {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     let output = std::process::Command::new("git")
         .args([
             "-c",

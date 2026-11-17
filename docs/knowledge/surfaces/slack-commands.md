@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-14
+last_verified: 2026-11-16
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -17,6 +17,8 @@ verified_against:
   - crates/engine/src/planning.rs
   - 'command: cargo test -p kranz-slack'
 ---
+
+Rechecked 2026-11-16 (UTC) against the test temp-directory cleanup: only the test modules of `catalog.rs`, `bridge.rs` and `host.rs` changed, so that their temp directories are removed when the test or the test process ends. Commands, routing and authorization are unchanged.
 
 Rechecked 2026-11-14 (UTC) against the grant decision binding fixes: a grant card's Approve and Deny buttons carry the sequence number and kind of the request the card was posted for. A click for a replaced request, or on a card posted before this change, is refused as superseded and queues nothing. Action ids, identity capture and the allowlist are unchanged.
 

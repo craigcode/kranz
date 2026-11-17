@@ -24,6 +24,7 @@ fn isolate_home() {
         let home =
             std::env::temp_dir().join(format!("kranz-hooks-test-home-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&home);
+        kranz_engine::test_dirs::remove_dir_at_exit(&home);
         std::env::set_var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }, &home);
     });
 }

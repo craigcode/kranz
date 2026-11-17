@@ -109,6 +109,7 @@ fn worker_report_json() -> serde_json::Value {
 }
 
 fn session_spec(prompt: PromptMode) -> SessionSpec {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     SessionSpec {
         cwd: std::env::temp_dir(),
         prompt,
@@ -1217,6 +1218,7 @@ fn parse_validator_report_fallbacks() {
 
 #[tokio::test]
 async fn run_worker_builds_spec_and_uses_report_result() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1314,6 +1316,7 @@ async fn run_worker_builds_spec_and_uses_report_result() {
 
 #[tokio::test]
 async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1380,6 +1383,7 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn run_worker_routes_macos_fs_net_through_egress_proxy() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1445,6 +1449,7 @@ async fn run_worker_routes_macos_fs_net_through_egress_proxy() {
 
 #[tokio::test]
 async fn run_validator_builds_spec_permissions_and_parses_report() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1547,6 +1552,7 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
 /// the worker says it ran these, and is told they are not permitted.
 #[tokio::test]
 async fn worker_reported_commands_never_become_validator_allow_rules() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1614,6 +1620,7 @@ async fn worker_reported_commands_never_become_validator_allow_rules() {
 /// grants it: provenance is what changed, not the grant path.
 #[tokio::test]
 async fn granted_commands_still_allow_even_when_the_worker_reported_them() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1687,6 +1694,7 @@ async fn run_validator_rejects_non_validator_roles() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn run_validator_routes_macos_fs_net_through_egress_proxy() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -1810,6 +1818,7 @@ fn validator_command_patterns_cover_natural_variations() {
 /// RunOutcome matches the live path.
 #[tokio::test]
 async fn run_worker_in_buffered_collects_kinds_without_touching_the_log() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let log = seeded_log(&p);
@@ -2261,6 +2270,7 @@ async fn run_session_fs_net_proxy_start_failure_fails_closed_before_spawn() {
 /// the authoritative layer).
 #[tokio::test]
 async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -2361,6 +2371,7 @@ async fn hook_gate_projection_worker_run_projects_hook_settings_and_spec_file() 
 /// backends without hook support behave (they ignore settings_json).
 #[tokio::test]
 async fn hook_gate_projection_empty_touch_set_leaves_worker_spec_unchanged() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -2494,6 +2505,7 @@ async fn hook_gate_projection_records_fold_into_the_log_before_worker_completed(
 /// also keep firing untouched.
 #[tokio::test]
 async fn hook_gate_projection_bypassed_failure_still_caught_by_the_sweep() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     // A real repo so the scripted commit lands; `.kranz/` ignored so the
@@ -2705,6 +2717,7 @@ fn spawned_prompt_hash(p: &MissionPaths) -> String {
 
 #[tokio::test]
 async fn flight_rules_projection_worker_prompt_projects_implementation_stage_only() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -2785,6 +2798,7 @@ async fn flight_rules_projection_worker_prompt_projects_implementation_stage_onl
 
 #[tokio::test]
 async fn flight_rules_projection_validator_prompts_project_validation_stage_only() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     for (role, surface) in [
         (Role::ValidatorScrutiny, "validator-scrutiny projection"),
         (Role::ValidatorFunctional, "validator-functional projection"),
@@ -2856,6 +2870,7 @@ async fn flight_rules_projection_validator_prompts_project_validation_stage_only
 
 #[tokio::test]
 async fn flight_rules_projection_no_pin_keeps_prompt_and_hash_byte_identical() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let p = paths(dir.path());
     let mut log = seeded_log(&p);
@@ -2911,6 +2926,7 @@ async fn flight_rules_projection_no_pin_keeps_prompt_and_hash_byte_identical() {
 #[cfg(unix)]
 #[tokio::test]
 async fn run_worker_issues_and_revokes_a_sgian_credential() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     // This test changes process-wide binary selection. Keep every other
     // worker fixture in the workspace outside that environment.
     const MARKER: &str = "KRANZ_SGIAN_RUNNER_FIXTURE";

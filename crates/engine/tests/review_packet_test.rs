@@ -17,6 +17,7 @@ fn id(s: &str) -> Id {
     Id::try_from(s.to_string()).unwrap()
 }
 fn git(root: &Path, args: &[&str]) {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     let out = std::process::Command::new("git")
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())

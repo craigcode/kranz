@@ -96,6 +96,7 @@ static ENV_ISOLATION: Once = Once::new();
 /// never leak into the throwaway repos.
 fn isolate_git_env() {
     ENV_ISOLATION.call_once(|| {
+        kranz_engine::test_dirs::isolate_worker_scratch();
         let missing = std::env::temp_dir().join(format!(
             "kranz-mission-test-no-config-{}",
             std::process::id()
@@ -8286,6 +8287,7 @@ async fn gate_result_events_record_the_final_gate_ladder() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn approve_plan_requires_considered_alternatives_for_large_scope() {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     let (_dir, root) = init_repo();
     let backend = Arc::new(MockBackend::new());
     let cfg = MissionConfig {
@@ -8306,6 +8308,7 @@ async fn approve_plan_requires_considered_alternatives_for_large_scope() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn approve_plan_persists_considered_alternatives_when_required() {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     let (_dir, root) = init_repo();
     let backend = Arc::new(MockBackend::new());
     let cfg = MissionConfig {
@@ -9951,6 +9954,15 @@ async fn resume_does_not_sweep_worktrees_while_lock_is_live() {
     let repo = GitRepo::open(&root).unwrap();
     let branch = format!("kranz/wt/{mission_id}/f-1-1");
     let wt_path = std::env::temp_dir().join(format!("kranz-wt-{mission_id}-f-1-1"));
+    // The worktree sits outside the repo's `TempDir`; remove it even when an
+    // assertion below fails before the cleanup at the end.
+    struct RemoveDir(PathBuf);
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _wt_guard = RemoveDir(wt_path.clone());
     let head = repo.head_sha().unwrap();
     repo.add_worktree(&wt_path, &branch, &head).unwrap();
 

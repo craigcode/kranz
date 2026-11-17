@@ -24,6 +24,7 @@ use tokio::time::timeout;
 const BLOCK_PROOF: Duration = Duration::from_millis(100);
 
 fn spec(session_id: &str, prompt: PromptMode, writable: bool) -> SessionSpec {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     SessionSpec {
         cwd: std::env::temp_dir(),
         prompt,
@@ -423,6 +424,7 @@ fn feature() -> Feature {
 
 #[tokio::test]
 async fn worker_session_carries_configured_tools_onto_the_spec() {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
     let dir = tempfile::tempdir().unwrap();
     let p = MissionPaths::new(dir.path(), "m-test");
     let mut log = EventLog::acquire(&p, "m-test", Duration::from_millis(0), LockForce::No).unwrap();

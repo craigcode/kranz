@@ -4196,6 +4196,7 @@ mod tests {
     /// `run_mission_loop_with_backend`.
     #[tokio::test]
     async fn reconcile_on_terminal_after_cli_run_marks_ticket_done() {
+        kranz_engine::test_dirs::isolate_worker_scratch();
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_path_buf();
         let status = std::process::Command::new("git")

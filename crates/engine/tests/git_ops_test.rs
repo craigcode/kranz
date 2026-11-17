@@ -20,6 +20,7 @@ static ENV_ISOLATION: Once = Once::new();
 /// are written exactly once for the whole test process.
 fn isolate_git_env() {
     ENV_ISOLATION.call_once(|| {
+        kranz_engine::test_dirs::remove_git_config_at_exit();
         let missing = std::env::temp_dir().join(format!(
             "kranz-git-ops-test-no-config-{}",
             std::process::id()
@@ -2133,6 +2134,7 @@ fn hardened_local_git_drops_ambient_authority() {
     use std::os::unix::fs::PermissionsExt as _;
     const CHILD_ROOT: &str = "KRANZ_GIT_ENV_FIXTURE_ROOT";
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
+        kranz_engine::test_dirs::remove_git_config_at_exit();
         let repo = GitRepo::open(PathBuf::from(root)).unwrap();
         assert!(repo.is_clean().unwrap());
         repo.resolved_identity().unwrap();
