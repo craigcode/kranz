@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-16
+last_verified: 2026-11-17
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -63,6 +63,8 @@ verified_against:
   - docs/tickets.md
   - crates/engine/src/git_ops.rs
 ---
+
+Rechecked 2026-11-17 (UTC) against a test move in `command_exec.rs`, `appcontainer_windows.rs` and `.github/workflows/ci.yml`: the contained contract-shell checks (the `cmd.exe` quoting check and the Git `sh` attempt that prints `KRANZ_WINDOWS_SH_CONTAINED=`) now run inside the CLI's AppContainer normal-gate self test, because the AppContainer launcher is the `kranz` binary itself. No shell selection, containment rule or gate behaviour changed.
 
 Rechecked 2026-11-16 (UTC) against the Windows contract-shell change: on Windows an uncontained contract command runs under Git for Windows' POSIX `sh` when it resolves outside every worker-writable root, and under `cmd.exe` otherwise. `cmd.exe` now receives the command text unencoded. Validation-round lines, final-gate command findings and the plan.md lint section carry a `shell:` label, and a fifth named contract gate, `host-shell-syntax`, is advisory. See "Which shell runs a contract command" below. Unix behaviour, gate commands and verdict rules are unchanged.
 
