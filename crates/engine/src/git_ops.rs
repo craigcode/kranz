@@ -2231,6 +2231,74 @@ impl GitRepo {
             .collect())
     }
 
+    /// Remove the worktree at `path` only if it holds nothing but committed
+    /// files.
+    ///
+    /// Two checks. First `git status --porcelain --ignored` is run in the
+    /// worktree, and any line it prints keeps the worktree: a modified
+    /// tracked file, an untracked file, or a file git ignores (build output,
+    /// a local environment file, a log), none of which exists anywhere else.
+    /// Then `git worktree remove <path>` runs without `--force`, so git
+    /// itself refuses a worktree that is locked or that gained a modified or
+    /// untracked file since the first check. Only an ignored file created in
+    /// that short interval can be lost. The worktree's branch is not touched.
+    ///
+    /// `Ok(None)` means the worktree was removed. `Ok(Some(reason))` means
+    /// it was left exactly as it was.
+    pub fn remove_worktree_if_clean(&self, path: &Path) -> Result<Option<String>> {
+        let status = GitRepo::open(path)?.probe(&["status", "--porcelain", "--ignored"])?;
+        if !status.status.success() {
+            return Ok(Some(failure_detail(&status)));
+        }
+        let holds = status
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .count();
+        if holds > 0 {
+            return Ok(Some(format!(
+                "it holds {holds} modified, untracked or ignored path(s) that are in no commit"
+            )));
+        }
+        let args: Vec<OsString> = vec![
+            "worktree".into(),
+            "remove".into(),
+            git_path_arg(path).into_os_string(),
+        ];
+        let out = self.probe_os(&args)?;
+        if out.status.success() {
+            Ok(None)
+        } else {
+            Ok(Some(failure_detail(&out)))
+        }
+    }
+
+    /// Every registered worktree with the branch it has checked out
+    /// (`git worktree list --porcelain`), the primary working tree included.
+    /// The branch is the short name (`refs/heads/` removed), or `None` for a
+    /// detached or bare entry.
+    pub fn list_worktree_branches(&self) -> Result<Vec<(String, Option<String>)>> {
+        let out = self.run(&["worktree", "list", "--porcelain"])?;
+        let mut entries: Vec<(String, Option<String>)> = Vec::new();
+        for line in out.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(path) = line.strip_prefix("worktree ") {
+                entries.push((path.trim().to_string(), None));
+            } else if let Some(branch) = line.strip_prefix("branch ") {
+                if let Some(entry) = entries.last_mut() {
+                    let branch = branch.trim();
+                    entry.1 = Some(
+                        branch
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(branch)
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     /// Absolute paths of every registered worktree (`git worktree list`),
     /// including the primary working tree. Used by cleanup to detect leaks.
     pub fn list_worktrees(&self) -> Result<Vec<String>> {

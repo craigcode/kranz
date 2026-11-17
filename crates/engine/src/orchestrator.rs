@@ -8265,6 +8265,112 @@ fn repo_worktree_namespace(repo_root: &std::path::Path) -> String {
         .collect()
 }
 
+/// What [`remove_clean_mission_worktrees`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MissionWorktreeCleanup {
+    /// Worktree directories that were removed.
+    pub removed: Vec<PathBuf>,
+    /// Worktree directories left in place, each with the reason.
+    pub kept: Vec<(PathBuf, String)>,
+    /// Set when no worktree was looked at, with the reason. `removed` and
+    /// `kept` are then empty, and the mission may still have worktrees.
+    pub not_attempted: Option<String>,
+}
+
+/// Remove the worktrees of a mission that will never run again, keeping any
+/// that hold uncommitted work.
+///
+/// A mission's worktrees are normally removed by the engine that runs it.
+/// Three kinds outlive that engine: the integration worktree of a mission
+/// that stopped Blocked or Paused, which is kept on purpose so its repair can
+/// be resumed; a per-feature or candidate worktree kept after a failed
+/// inspection; and whatever a crashed engine left mid-batch. Only a resume
+/// of the same mission clears those. Abandoning the mission, or removing its
+/// directory with `kranz clean`, ends any chance of a resume, so those two
+/// paths call this.
+///
+/// The caller must know that no engine is running the mission and that no
+/// process an engine started can still be working in its worktrees. Holding
+/// the mission lock is not enough when the lock was taken over from an
+/// engine that never released it; the two callers in
+/// [`crate::mission_catalog`] check that and are the ones to use.
+///
+/// A worktree is considered only when all of these hold:
+/// - it is registered in this repository (`git worktree list`), wherever its
+///   directory is, so a run under a different temp directory is still found;
+/// - its directory carries this repository's namespace and this mission's id
+///   in the name the engine gives it;
+/// - it has one of this mission's branches checked out: `kranz/mission-<id>`
+///   for the integration worktree, `kranz/wt/<mission>/...` for a
+///   per-feature worktree, `kranz/pool/<mission>/...` for a candidate.
+///
+/// It is then removed through [`GitRepo::remove_worktree_if_clean`], which
+/// keeps, and reports, a worktree holding a modified, untracked or ignored
+/// file, or one that is locked. No branch is deleted: every commit the
+/// worktree made stays reachable. Best effort: a git failure is reported in
+/// `kept`, never raised.
+pub fn remove_clean_mission_worktrees(
+    repo_root: &std::path::Path,
+    mission_id: &str,
+) -> MissionWorktreeCleanup {
+    let mut cleanup = MissionWorktreeCleanup::default();
+    let Ok(repo) = GitRepo::open(repo_root) else {
+        return cleanup;
+    };
+    let Ok(entries) = repo.list_worktree_branches() else {
+        return cleanup;
+    };
+    let namespace = repo_worktree_namespace(repo_root);
+    let integration_name = format!("kranz-wt-{namespace}-{mission_id}-_integration");
+    let feature_prefix = format!("kranz-wt-{namespace}-{mission_id}-");
+    let pool_prefix = format!("kranz-pool-{namespace}-{mission_id}-");
+    let integration_branch = format!("kranz/mission-{mission_id}");
+    let feature_branch_prefix = format!("kranz/wt/{mission_id}/");
+    let pool_branch_prefix = format!("kranz/pool/{mission_id}/");
+    for (listed, branch) in entries {
+        let path = PathBuf::from(&listed);
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        // `Ok` holds the exact branch required, `Err` the required prefix.
+        let required_branch = if name == integration_name {
+            Ok(&integration_branch)
+        } else if name.starts_with(&feature_prefix) {
+            Err(&feature_branch_prefix)
+        } else if name.starts_with(&pool_prefix) {
+            Err(&pool_branch_prefix)
+        } else {
+            continue;
+        };
+        if !path.exists() {
+            // Registered, but its directory is already gone: nothing to
+            // remove, and `git worktree prune` drops the registration.
+            continue;
+        }
+        let Some(branch) = branch else {
+            cleanup
+                .kept
+                .push((path, "no branch is checked out in it".to_string()));
+            continue;
+        };
+        let on_a_mission_branch = match required_branch {
+            Ok(exact) => branch == *exact,
+            Err(prefix) => branch.starts_with(prefix.as_str()),
+        };
+        if !on_a_mission_branch {
+            // Named like this mission's worktree but on another branch: not
+            // provably ours, so not ours to remove or to report.
+            continue;
+        }
+        match repo.remove_worktree_if_clean(&path) {
+            Ok(None) => cleanup.removed.push(path),
+            Ok(Some(reason)) => cleanup.kept.push((path, reason)),
+            Err(error) => cleanup.kept.push((path, error.to_string())),
+        }
+    }
+    cleanup
+}
+
 /// Pre-M8 worktree locations, retained only so crash recovery can reap a
 /// worktree left behind by an older kranz process after an upgrade.
 fn legacy_parallel_worktree_path(mission_id: &str, feature_id: &str) -> PathBuf {

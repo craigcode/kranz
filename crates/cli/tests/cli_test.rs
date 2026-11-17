@@ -2567,6 +2567,97 @@ fn remove_missions_deletes_selected_and_keeps_index_and_others() {
     );
 }
 
+/// `kranz clean` deletes the only record that ties a mission to its leftover
+/// worktrees, so it removes the clean ones first and keeps, untouched, one
+/// that holds uncommitted work.
+#[test]
+fn remove_missions_removes_clean_worktrees_and_keeps_dirty_ones() {
+    kranz_engine::test_dirs::remove_git_config_at_exit();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = fs::canonicalize(tmp.path()).unwrap();
+    let repo = repo.as_path();
+    if !git(repo, &["init", "-b", "main"]).status.success() {
+        assert!(git(repo, &["init"]).status.success());
+    }
+    assert!(git(repo, &["config", "user.name", "kranz-test"])
+        .status
+        .success());
+    assert!(git(repo, &["config", "user.email", "test@kranz.local"])
+        .status
+        .success());
+    fs::write(repo.join("README.md"), "seed\n").unwrap();
+    fs::write(repo.join(".gitignore"), ".kranz/\n").unwrap();
+    assert!(git(repo, &["add", "-A"]).status.success());
+    assert!(git(repo, &["commit", "-m", "seed"]).status.success());
+
+    write_events(
+        repo,
+        "m-failed",
+        vec![
+            created_kind("g", "m-failed"),
+            EventKind::MissionFailed { reason: "x".into() },
+        ],
+    );
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    // Not canonicalized: on Windows that gives a verbatim path, which git
+    // cannot take as an argument.
+    let base = elsewhere.path().to_path_buf();
+    let integration_name = kranz_engine::orchestrator::mission_worktree_path(repo, "m-failed")
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let feature_name = integration_name.replace("_integration", "f-1-1");
+    let integration = base.join(&integration_name);
+    let dirty_feature = base.join(&feature_name);
+    for (path, branch) in [
+        (&integration, "kranz/mission-m-failed"),
+        (&dirty_feature, "kranz/wt/m-failed/f-1-1"),
+    ] {
+        let added = git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                path.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+    }
+    fs::write(dirty_feature.join("uncommitted.txt"), "only copy\n").unwrap();
+
+    let entries = commands::select_cleanable(repo, false);
+    let removed = commands::remove_missions(repo, &entries, false);
+    assert_eq!(removed, vec!["m-failed".to_string()]);
+
+    assert!(
+        !integration.exists(),
+        "the clean integration worktree is removed with its mission"
+    );
+    assert_eq!(
+        fs::read_to_string(dirty_feature.join("uncommitted.txt")).unwrap(),
+        "only copy\n",
+        "a worktree holding uncommitted work is kept"
+    );
+    let listed = String::from_utf8_lossy(&git(repo, &["worktree", "list"]).stdout).into_owned();
+    assert!(!listed.contains(&integration_name), "{listed}");
+    assert!(listed.contains(&feature_name), "{listed}");
+    let branches = String::from_utf8_lossy(&git(repo, &["branch", "--list"]).stdout).into_owned();
+    assert!(
+        branches.contains("kranz/mission-m-failed"),
+        "no branch is deleted: {branches}"
+    );
+}
+
 #[test]
 fn clean_prunes_missions_index() {
     let tmp = tempfile::tempdir().unwrap();
