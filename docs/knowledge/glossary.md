@@ -25,6 +25,8 @@ verified_against:
 
 Rechecked 2026-11-17 (UTC) against the grant wait and stall record in `types.rs` and `orchestrator.rs`. A respawn still re-runs a failed worker; the first run per feature that ends with its command moved to the background is not counted against `maxRespawns`. No term changed.
 
+Rechecked 2026-11-17 (UTC) against the temp-directory cleanup in `orchestrator.rs` and `event_log.rs`: the worker-auth preflight home is removed once its verdict is known, abandoning a mission removes its worktrees that hold only committed files, and `EventLog` can report that its acquire took an existing lock over. No term changed.
+
 Rechecked 2026-11-16 (UTC) against the Windows lock probe in `event_log.rs`. No term changed.
 
 Rechecked 2026-11-15 (UTC) against a test-only change in `control.rs` and `container_egress.rs`: two unit tests no longer depend on the scratch directory sitting outside a mission directory, so they pass under the contract gate's `TMPDIR`. No behaviour described here changed.

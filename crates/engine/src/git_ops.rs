@@ -160,19 +160,77 @@ struct ConfiguredDrivers {
 /// cannot null the user scope would silently read whatever `~/.gitconfig`
 /// arms, which is the surface this exists to close.
 ///
-/// Residual: the directory outlives the process (a static has no `Drop`), so
-/// a long-running host accumulates one empty 4KB directory per kranz process.
-/// Cheap, and the alternative — a predictable reusable path — trades that for
-/// a pre-seating race.
+/// Lifetime: a static has no `Drop`, so nothing in the engine removes the
+/// directory. The `kranz` binary calls [`release_empty_global_config`] as it
+/// exits, which removes it where that is safe and leaves it elsewhere; see
+/// that function for the rule and for what still accumulates. The
+/// alternative, a predictable reusable path, trades the leftover for a
+/// pre-seating race.
 pub(crate) fn empty_global_config_path() -> Result<&'static Path> {
-    static PATH: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
-        std::sync::OnceLock::new();
-    match PATH.get_or_init(create_empty_global_config) {
+    match EMPTY_GLOBAL_CONFIG.get_or_init(create_empty_global_config) {
         Ok(path) => Ok(path.as_path()),
         Err(detail) => Err(EngineError::Git(format!(
             "refusing to run git without a neutralized user config: {detail}"
         ))),
     }
+}
+
+/// The per-process empty user config, once a hardened invocation has needed
+/// it. See [`empty_global_config_path`].
+static EMPTY_GLOBAL_CONFIG: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
+    std::sync::OnceLock::new();
+
+/// Remove this process's empty git config directory, where that is safe.
+///
+/// For a process that is about to exit and will run no more git commands. It
+/// is a no-op when no hardened git call created the directory.
+///
+/// The directory is removed only when the temp directory that holds it is
+/// private to the calling user (owned by them, with no group or other write
+/// permission), as the per-user temp directory on macOS is. A git child that
+/// outlives this process, such as a detached `git gc`, can still read the
+/// path afterwards. Git treats a missing user config file as an empty one, so
+/// that child loses nothing; and in a private directory no other user can
+/// create a file at the freed name for it to read.
+///
+/// In a temp directory other users can write, such as a default Linux `/tmp`,
+/// the name would be free for another user to take, and a config file there
+/// can name commands for git to run. The directory is left in place there, as
+/// it is on platforms where the owner cannot be checked (Windows). Such a
+/// host still accumulates one empty directory per `kranz` process, and so
+/// does any host when a process is killed.
+///
+/// Only the two paths this process created are touched, and only while the
+/// directory still holds exactly the one empty file: nothing is removed
+/// recursively or by pattern.
+pub fn release_empty_global_config() {
+    if let Some(Ok(config)) = EMPTY_GLOBAL_CONFIG.get() {
+        remove_empty_global_config_if_private(config);
+    }
+}
+
+/// Remove `config` and its directory under the rule documented on
+/// [`release_empty_global_config`]. Returns whether the directory is gone.
+fn remove_empty_global_config_if_private(config: &Path) -> bool {
+    let Some(dir) = config.parent() else {
+        return false;
+    };
+    let Some(temp) = dir.parent() else {
+        return false;
+    };
+    if !crate::session_scratch::dir_is_private_to_this_user(temp) {
+        return false;
+    }
+    // Both must be exactly what this process made: a real directory holding
+    // one empty regular file. Anything else is left for a person to look at.
+    let is_real_dir = std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.file_type().is_dir());
+    let is_empty_file = std::fs::symlink_metadata(config)
+        .is_ok_and(|meta| meta.file_type().is_file() && meta.len() == 0);
+    let holds_one_entry = std::fs::read_dir(dir).is_ok_and(|entries| entries.count() == 1);
+    if !(is_real_dir && is_empty_file && holds_one_entry) {
+        return false;
+    }
+    std::fs::remove_file(config).is_ok() && std::fs::remove_dir(dir).is_ok()
 }
 
 fn create_empty_global_config() -> std::result::Result<PathBuf, String> {
@@ -192,6 +250,9 @@ fn create_empty_global_config() -> std::result::Result<PathBuf, String> {
     builder
         .create(&dir)
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    // This crate's unit tests have no shared setup to register it from.
+    #[cfg(test)]
+    crate::test_dirs::register(&dir);
     let path = dir.join("gitconfig");
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -2170,6 +2231,77 @@ impl GitRepo {
             .collect())
     }
 
+    /// Remove the worktree at `path` only if it holds nothing but committed
+    /// files.
+    ///
+    /// Two checks. First `git status --porcelain --ignored` is run in the
+    /// worktree, and any line it prints keeps the worktree: a modified
+    /// tracked file, an untracked file, or a file git ignores (build output,
+    /// a local environment file, a log), none of which exists anywhere else.
+    /// Then `git worktree remove <path>` runs without `--force`, so git
+    /// itself refuses a worktree that is locked or that gained a modified or
+    /// untracked file since the first check. Only an ignored file created in
+    /// that short interval can be lost. The worktree's branch is not touched.
+    ///
+    /// `Ok(None)` means the worktree was removed. `Ok(Some(reason))` means
+    /// it was left exactly as it was.
+    pub fn remove_worktree_if_clean(&self, path: &Path) -> Result<Option<String>> {
+        let status = GitRepo::open(path)?.probe(&["status", "--porcelain", "--ignored"])?;
+        if !status.status.success() {
+            return Ok(Some(failure_detail(&status)));
+        }
+        let held: Vec<&[u8]> = status
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .collect();
+        if let Some(first) = held.first() {
+            let holds = held.len();
+            let first = String::from_utf8_lossy(first);
+            return Ok(Some(format!(
+                "it holds {holds} modified, untracked or ignored path(s) that are in no commit; the first is `{}`",
+                first.trim_end_matches('\r')
+            )));
+        }
+        let args: Vec<OsString> = vec![
+            "worktree".into(),
+            "remove".into(),
+            git_path_arg(path).into_os_string(),
+        ];
+        let out = self.probe_os(&args)?;
+        if out.status.success() {
+            Ok(None)
+        } else {
+            Ok(Some(failure_detail(&out)))
+        }
+    }
+
+    /// Every registered worktree with the branch it has checked out
+    /// (`git worktree list --porcelain`), the primary working tree included.
+    /// The branch is the short name (`refs/heads/` removed), or `None` for a
+    /// detached or bare entry.
+    pub fn list_worktree_branches(&self) -> Result<Vec<(String, Option<String>)>> {
+        let out = self.run(&["worktree", "list", "--porcelain"])?;
+        let mut entries: Vec<(String, Option<String>)> = Vec::new();
+        for line in out.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(path) = line.strip_prefix("worktree ") {
+                entries.push((path.trim().to_string(), None));
+            } else if let Some(branch) = line.strip_prefix("branch ") {
+                if let Some(entry) = entries.last_mut() {
+                    let branch = branch.trim();
+                    entry.1 = Some(
+                        branch
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(branch)
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     /// Absolute paths of every registered worktree (`git worktree list`),
     /// including the primary working tree. Used by cleanup to detect leaks.
     pub fn list_worktrees(&self) -> Result<Vec<String>> {
@@ -3217,6 +3349,102 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    /// A stand-in for the directory `create_empty_global_config` makes,
+    /// inside `temp`.
+    #[cfg(unix)]
+    fn neutral_config_in(temp: &Path) -> PathBuf {
+        let dir = temp.join("kranz-gitconfig-test");
+        std::fs::create_dir(&dir).unwrap();
+        let config = dir.join("gitconfig");
+        std::fs::write(&config, "").unwrap();
+        config
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_empty_global_config_is_removed_from_a_private_temp_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = neutral_config_in(temp.path());
+        assert!(remove_empty_global_config_if_private(&config));
+        assert!(!config.parent().unwrap().exists());
+        // A second call finds nothing and removes nothing.
+        assert!(!remove_empty_global_config_if_private(&config));
+    }
+
+    /// Another user could take the freed name in a directory they can write,
+    /// so there the directory stays.
+    #[cfg(unix)]
+    #[test]
+    fn the_empty_global_config_is_kept_in_a_shared_temp_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let outer = tempfile::tempdir().unwrap();
+        let shared = outer.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let config = neutral_config_in(&shared);
+        assert!(!remove_empty_global_config_if_private(&config));
+        assert!(config.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_directory_holding_anything_unexpected_is_kept() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = neutral_config_in(temp.path());
+        let extra = config.parent().unwrap().join("extra");
+        std::fs::write(&extra, "x").unwrap();
+        assert!(!remove_empty_global_config_if_private(&config));
+        assert!(config.is_file() && extra.is_file());
+
+        std::fs::remove_file(&extra).unwrap();
+        std::fs::write(&config, "[user]\n\tname = x\n").unwrap();
+        assert!(!remove_empty_global_config_if_private(&config));
+        assert!(config.is_file(), "a config file with content is not ours");
+    }
+
+    /// Removing the file at exit is only harmless if a git child that still
+    /// has the path in its environment reads a missing file as an empty one.
+    #[test]
+    fn git_reads_a_missing_global_config_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        init_test_repo(dir.path());
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[kranztest]\n\tmarker = from-home\n",
+        )
+        .unwrap();
+        let missing = home.path().join("removed").join("gitconfig");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", &missing)
+                .output()
+                .unwrap()
+        };
+        let status = git(&["status", "--porcelain"]);
+        assert!(
+            status.status.success(),
+            "git status must succeed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let marker = git(&["config", "--get", "kranztest.marker"]);
+        assert_eq!(
+            marker.status.code(),
+            Some(1),
+            "the key is unset, not an error: {}",
+            String::from_utf8_lossy(&marker.stderr)
+        );
+        assert!(
+            marker.stdout.is_empty(),
+            "the user config in HOME is not read"
+        );
     }
 
     /// Audit F-10: the neutralization segment covers the keys that matter on

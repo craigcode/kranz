@@ -12,6 +12,8 @@ verified_against:
 
 Rechecked 2026-11-17 (UTC) against the invariants note's grant wait and stall record recheck: no lesson changed.
 
+Rechecked 2026-11-17 (UTC) against the invariants note's temp-directory cleanup recheck: no lesson changed.
+
 Rechecked 2026-11-16 (UTC) against the invariants note's Windows first-run recheck: no lesson changed.
 
 Rechecked 2026-11-15 (UTC) against the invariants note's test-only recheck: no lesson changed.

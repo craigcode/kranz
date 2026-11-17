@@ -183,6 +183,7 @@ static ENV_ISOLATION: std::sync::Once = std::sync::Once::new();
 /// never leak into the throwaway repos.
 fn isolate_git_env() {
     ENV_ISOLATION.call_once(|| {
+        kranz_engine::test_dirs::remove_git_config_at_exit();
         let missing = std::env::temp_dir().join(format!(
             "kranz-server-test-no-config-{}",
             std::process::id()

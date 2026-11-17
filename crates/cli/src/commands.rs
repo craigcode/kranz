@@ -2293,19 +2293,47 @@ pub fn cmd_abandon(
     force_lock: LockForce,
 ) -> Result<()> {
     require_mission(repo, mission_id)?;
-    mission_catalog::abandon_mission(repo, mission_id, reason, force_lock).map_err(|e| {
-        if matches!(e, kranz_engine::error::EngineError::LockHeld(_)) {
-            anyhow!(
-                "cannot abandon mission '{mission_id}' — an engine still holds its lock. \
+    let worktrees = mission_catalog::abandon_mission(repo, mission_id, reason, force_lock)
+        .map_err(|e| {
+            if matches!(e, kranz_engine::error::EngineError::LockHeld(_)) {
+                anyhow!(
+                    "cannot abandon mission '{mission_id}' — an engine still holds its lock. \
                  Stop the running `kranz run` first. If the holder is a crashed leftover, \
                  pass --force-lock (steals unless the holder is provably alive); a provably \
                  LIVE holder that you have verified to be a zombie or foreign process \
                  additionally requires --dangerously-steal-live-lock.\n  (underlying: {e})"
-            )
-        } else {
-            anyhow::Error::new(e).context(format!("abandoning mission '{mission_id}'"))
+                )
+            } else {
+                anyhow::Error::new(e).context(format!("abandoning mission '{mission_id}'"))
+            }
+        })?;
+    report_worktree_cleanup(mission_id, &worktrees, true);
+    Ok(())
+}
+
+/// Tell the operator what happened to a mission's worktrees: the removed
+/// ones on stdout when `show_removed`, the kept ones and a skipped cleanup
+/// on stderr always.
+fn report_worktree_cleanup(
+    mission_id: &str,
+    cleanup: &kranz_engine::orchestrator::MissionWorktreeCleanup,
+    show_removed: bool,
+) {
+    if show_removed {
+        for path in &cleanup.removed {
+            println!("removed worktree {}", path.display());
         }
-    })
+    }
+    for (path, reason) in &cleanup.kept {
+        eprintln!(
+            "kranz: kept worktree {} of {mission_id}: {}",
+            path.display(),
+            reason.trim()
+        );
+    }
+    if let Some(reason) = &cleanup.not_attempted {
+        eprintln!("kranz: left the worktrees of {mission_id} in place: {reason}");
+    }
 }
 
 /// One mission the cleaner would remove, resolved to a printable row.
@@ -2365,10 +2393,11 @@ pub fn render_clean_listing(entries: &[CleanEntry]) -> String {
 }
 
 /// `kranz clean [--yes] [--all]`: list cleanable mission directories, confirm
-/// (unless `--yes`), then `remove_dir_all` each. Only mission directories are
-/// removed — branches and tags are never touched, and each removed mission's
-/// own `missions/index.md` line is pruned while every other line is left
-/// intact.
+/// (unless `--yes`), then `remove_dir_all` each. Before a mission directory
+/// goes, that mission's leftover worktrees are removed where they hold only
+/// committed files. Branches and tags are never touched, and each removed
+/// mission's own `missions/index.md` line is pruned while every other line is
+/// left intact.
 fn cmd_clean(repo: &Path, yes: bool, all: bool) -> Result<i32> {
     let entries = select_cleanable(repo, all);
     if entries.is_empty() {
@@ -2404,9 +2433,11 @@ fn cmd_clean(repo: &Path, yes: bool, all: bool) -> Result<i32> {
 
 /// `remove_dir_all` each entry's `.kranz/missions/<id>` directory, then prune
 /// that mission's own line from `missions/index.md` (never a git branch/tag,
-/// never any other mission's index line). Returns the ids actually removed;
-/// `verbose` echoes each removal. Removal failures are reported on stderr and
-/// skipped, never aborting the batch.
+/// never any other mission's index line). Before the directory goes, the
+/// mission's leftover worktrees are removed where they hold only committed
+/// files (see [`mission_catalog::remove_worktrees_of_terminal_mission`]).
+/// Returns the ids actually removed; `verbose` echoes each removal. Removal
+/// failures are reported on stderr and skipped, never aborting the batch.
 pub fn remove_missions(repo: &Path, entries: &[CleanEntry], verbose: bool) -> Vec<String> {
     let mut removed = Vec::new();
     for e in entries {
@@ -2420,6 +2451,11 @@ pub fn remove_missions(repo: &Path, entries: &[CleanEntry], verbose: bool) -> Ve
             eprintln!("kranz: skipping {} — became live since listing", e.id);
             continue;
         }
+        // The mission directory is the only record that ties this mission's
+        // worktrees to it, so they are dealt with first. A worktree holding
+        // anything that is in no commit is kept and named.
+        let worktrees = mission_catalog::remove_worktrees_of_terminal_mission(repo, &e.id);
+        report_worktree_cleanup(&e.id, &worktrees, verbose);
         let dir = paths.mission_dir();
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {
@@ -4198,6 +4234,7 @@ mod tests {
     /// `run_mission_loop_with_backend`.
     #[tokio::test]
     async fn reconcile_on_terminal_after_cli_run_marks_ticket_done() {
+        kranz_engine::test_dirs::isolate_worker_scratch();
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_path_buf();
         let status = std::process::Command::new("git")

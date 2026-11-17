@@ -38,6 +38,7 @@ fn write_peer(dir: &Path, name: &str, body: &str) -> PathBuf {
 }
 
 fn spec(dir: &Path, session_id: &str, writable: bool, disallowed: &[&str]) -> SessionSpec {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     SessionSpec {
         cwd: dir.to_path_buf(),
         prompt: PromptMode::SingleShot("do the thing".to_string()),
@@ -509,6 +510,7 @@ async fn backend_acp_torn_final_line_is_retained_as_a_failed_protocol_receipt() 
 /// makes the NEXT acquire clean).
 #[tokio::test]
 async fn backend_acp_peer_death_mid_run_leaves_a_resumable_event_log() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let paths = MissionPaths::new(dir.path(), "m-acp-test");
     let mut log = EventLog::acquire(
@@ -709,6 +711,7 @@ async fn backend_acp_acp_stop_reason_absent_fails_honestly() {
 /// complete naturally.
 #[tokio::test]
 async fn backend_acp_acp_stop_reason_truncated_turn_validator_cannot_pass() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let paths = MissionPaths::new(dir.path(), "m-acp-stop");
     let mut log = EventLog::acquire(
@@ -1103,6 +1106,7 @@ async fn acp_compat_v1_permission_requires_identity_and_a_valid_once_option() {
 
 #[tokio::test]
 async fn acp_compat_v1_actual_worker_runner_parses_report_from_a_persistent_adapter() {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     let dir = tempfile::tempdir().unwrap();
     let paths = MissionPaths::new(dir.path(), "m-acp-report");
     let mut log = EventLog::acquire(&paths, "m-acp-report", Duration::ZERO, LockForce::No).unwrap();

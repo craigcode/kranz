@@ -999,6 +999,7 @@ mod tests {
     /// `run_and_reconcile`.
     #[tokio::test]
     async fn reconcile_on_terminal_after_cli_exec_marks_ticket_done() {
+        kranz_engine::test_dirs::isolate_worker_scratch();
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().to_path_buf();
         let status = std::process::Command::new("git")

@@ -38,6 +38,7 @@ fn parse_fixture() -> Vec<AgentEvent> {
 }
 
 fn base_spec(prompt: PromptMode) -> SessionSpec {
+    kranz_engine::test_dirs::isolate_worker_scratch();
     SessionSpec {
         cwd: std::env::temp_dir(),
         prompt,
@@ -1406,6 +1407,8 @@ mod sandbox_wrap {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn sandbox_wrap_macos_start_confines_spawned_process() {
+        // Before the scratch path below is computed: this moves the root.
+        kranz_engine::test_dirs::isolate_worker_scratch();
         if !sandbox_exec_can_apply() {
             return;
         }

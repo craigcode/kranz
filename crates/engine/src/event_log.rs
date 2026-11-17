@@ -456,6 +456,18 @@ fn open_read_at(dir: &Dir, name: &str) -> std::io::Result<File> {
 }
 
 impl EventLog {
+    /// Whether acquiring this log replaced a lock file that already existed,
+    /// under any [`LockForce`] tier, rather than creating the lock afresh.
+    ///
+    /// A replaced lock means an earlier engine did not release it: it
+    /// crashed, or it is still running and was overridden. Either way
+    /// processes it started may still be alive, so a caller about to delete
+    /// something those processes could be using should not. (A lock that
+    /// its holder released at the very moment of the takeover also counts.)
+    pub fn replaced_an_existing_lock(&self) -> bool {
+        self.lock_generation > 0
+    }
+
     /// Acquire the single-writer lock for a mission and open its event log.
     ///
     /// Creates the mission directory tree (mission dir, `runs/`, `control/`)
