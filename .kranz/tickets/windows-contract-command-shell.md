@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Mission m-2a80fd delivered milestones 1 and 2 and was abandoned while blocked; milestone 3 was finished by hand on the same branch.
 title: Run contract commands on Windows the way the planner writes them
 priority: 1
 schedule: once

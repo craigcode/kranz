@@ -236,6 +236,18 @@ pub fn render_plan_markdown(
             );
         }
         let _ = writeln!(md, "{}\n", contract_lint.summary());
+        let mut shells: Vec<&str> = contract_lint
+            .results
+            .iter()
+            // A command that never ran has no shell to name.
+            .filter(|r| r.outcome != contract_lint::AssertionLintOutcome::NotLinted)
+            .map(|r| r.shell_label.as_str())
+            .collect();
+        shells.sort_unstable();
+        shells.dedup();
+        if !shells.is_empty() {
+            let _ = writeln!(md, "Lint commands ran under shell: {}\n", shells.join(", "));
+        }
         // Named contract-validation gates (contract-validation-gates): the
         // defect classes behind the lint, each verdict carrying its class
         // name. Same advisory posture as the lint.
@@ -1187,5 +1199,87 @@ mod tests {
         // Empty sources section is omitted; the blank fact is skipped.
         assert!(!md.contains("## External sources"));
         assert!(!md.contains("-  \n"));
+    }
+
+    fn sample_mission() -> Mission {
+        Mission {
+            id: "m-test".into(),
+            goal: "ship it".into(),
+            validation_contract: vec![],
+            milestones: vec![],
+            status: MissionStatus::Approved,
+            created_at: chrono::Utc::now(),
+            base_branch: "main".into(),
+            base_sha: Some("abc".into()),
+            mission_branch: "kranz/mission-m-test".into(),
+            command_grants: vec![],
+            touch_set: vec![],
+            deny_exceptions: vec![],
+            egress_grants: vec![],
+            executor_route: None,
+            standards_manifest: None,
+            reviewer_independence: None,
+        }
+    }
+
+    fn sample_plan_for_lint() -> Plan {
+        Plan {
+            goal: "ship it".into(),
+            validation_contract: vec![],
+            milestones: vec![],
+            considered_alternatives: None,
+            command_grants: vec![],
+            touch_set: vec![],
+            standards_manifest: None,
+            reviewer_independence: None,
+        }
+    }
+
+    fn sample_estimate() -> cost::CostEstimate {
+        cost::CostEstimate {
+            worker_runs: 1.0,
+            validator_runs: 1.0,
+            low_usd: 1.0,
+            expected_usd: 2.0,
+            high_usd: 3.0,
+            shape: cost::MissionShape::Unknown,
+            confidence: cost::Confidence::High,
+        }
+    }
+
+    #[test]
+    fn contract_shell_recorded_in_plan_md_lint_section() {
+        let plan = sample_plan_for_lint();
+        let mission = sample_mission();
+        let estimate = sample_estimate();
+        let lint = contract_lint::ContractLintReport {
+            results: vec![contract_lint::AssertionLint {
+                id: "a1".into(),
+                command: "exit 0".into(),
+                outcome: contract_lint::AssertionLintOutcome::FailedOnBase,
+                output_tail: String::new(),
+                shell_label: "sh".into(),
+            }],
+            tree_clean_at_base: true,
+        };
+        let md = render_plan_markdown(&plan, &mission, &estimate, None, None, 0, &lint, &[], &[]);
+        assert!(md.contains("shell: sh"), "{md}");
+
+        let empty_lint = contract_lint::ContractLintReport {
+            results: vec![],
+            tree_clean_at_base: true,
+        };
+        let md_empty = render_plan_markdown(
+            &plan,
+            &mission,
+            &estimate,
+            None,
+            None,
+            0,
+            &empty_lint,
+            &[],
+            &[],
+        );
+        assert!(!md_empty.contains("shell:"), "{md_empty}");
     }
 }

@@ -27,6 +27,14 @@
 //!   (`! grep -q pattern <path>`) or a neutralized one
 //!   (`grep -q ... || true`) whose target path does not exist in the tree
 //!   being checked. Deterministic: check the path's existence.
+//! - **`host-shell-syntax`** — a command written in syntax the shell that
+//!   will run it does not honor. Judged against the shell the mission's
+//!   validation and final-gate contract commands run under
+//!   ([`crate::contract_shell`]): under POSIX `sh` it always passes; under
+//!   `cmd.exe` it names `$NAME` expansion, command substitution,
+//!   single-quoted arguments, a leading `!` negation and `;` sequencing.
+//!   The Windows field report behind it: a contract authored in POSIX
+//!   syntax failed every check under `cmd` with the work already correct.
 //! - **`passes-on-base`** — the existing `PassedOnBase` lint class,
 //!   graduated: a command assertion that already exits zero on the untouched
 //!   base tree (a correctly-scoped "the work landed" assertion must FAIL
@@ -61,6 +69,7 @@
 //! not depend on `MissionEngine`, so it is unit-testable in isolation.
 
 use crate::contract_lint::{AssertionLint, AssertionLintOutcome, ContractLintReport};
+use crate::contract_shell::{HostShell, ShellKind};
 use crate::gate::{
     ArtefactRef, Gate, GateKind, GateOutcome, GatePipeline, GateReport, GateVerdict,
 };
@@ -70,6 +79,7 @@ use std::path::{Path, PathBuf};
 /// Defect-class names — the gate identities carried into every verdict.
 pub const VACUOUS_FILTER: &str = "vacuous-filter";
 pub const WRONG_POLARITY: &str = "wrong-polarity";
+pub const HOST_SHELL_SYNTAX: &str = "host-shell-syntax";
 pub const PASSES_ON_BASE: &str = "passes-on-base";
 pub const ENV_SENSITIVE: &str = "env-sensitive";
 
@@ -97,24 +107,27 @@ fn command_checks(contract: &[Assertion]) -> Vec<CommandCheck> {
 
 /// Build and evaluate the contract-gate pipeline, returning one
 /// [`GateReport`] per registered gate in ticket order (vacuous-filter,
-/// wrong-polarity, passes-on-base, env-sensitive).
+/// wrong-polarity, host-shell-syntax, passes-on-base, env-sensitive).
 ///
 /// `lint` is the approval-time base-tree lint report when it exists
 /// (approve time); the `passes-on-base` gate is only registered then — at
 /// the final gate the work has landed, so passing on base is expected and
 /// the class is meaningless. `tree_root` is the tree the path-existence and
 /// filter-collision checks run against (the repo root at approve time, the
-/// active root at the final gate).
+/// active root at the final gate). `shell` is the shell the mission's
+/// validation and final-gate contract commands run under — the
+/// `host-shell-syntax` gate judges against it.
 ///
 /// Returns an empty vec when the contract has no command assertions —
 /// mirroring [`ContractLintReport::is_empty`], so callers surface nothing.
-pub fn contract_gate_reports(
+pub(crate) fn contract_gate_reports(
     contract: &[Assertion],
     lint: Option<&ContractLintReport>,
     tree_root: &Path,
+    shell: &HostShell,
 ) -> Vec<GateReport> {
     let mut pipeline = GatePipeline::new();
-    register_contract_gates(&mut pipeline, contract, lint, tree_root);
+    register_contract_gates(&mut pipeline, contract, lint, tree_root, shell);
     pipeline.evaluate()
 }
 
@@ -128,13 +141,14 @@ pub fn contract_gate_reports(
 /// pack can add to the floor but never precede or displace it.
 ///
 /// Registers nothing when the contract has no command assertions (the same
-/// emptiness rule as [`contract_gate_reports`]). `lint` and `tree_root`
-/// carry the same meaning as there.
-pub fn register_contract_gates(
+/// emptiness rule as [`contract_gate_reports`]). `lint`, `tree_root` and
+/// `shell` carry the same meaning as there.
+pub(crate) fn register_contract_gates(
     pipeline: &mut GatePipeline,
     contract: &[Assertion],
     lint: Option<&ContractLintReport>,
     tree_root: &Path,
+    shell: &HostShell,
 ) {
     let checks = command_checks(contract);
     if checks.is_empty() {
@@ -154,6 +168,11 @@ pub fn register_contract_gates(
         .register(Box::new(WrongPolarityGate {
             checks: checks.clone(),
             tree_root: tree_root.to_path_buf(),
+        }))
+        .register(Box::new(HostShellSyntaxGate {
+            checks: checks.clone(),
+            shell: shell.kind,
+            label: shell.label(),
         }));
     if let Some(lint) = lint {
         pipeline.register(Box::new(PassesOnBaseGate {
@@ -626,6 +645,101 @@ fn wrong_polarity_findings(checks: &[CommandCheck], tree_root: &Path) -> Vec<Str
 }
 
 // ---------------------------------------------------------------------------
+// host-shell-syntax
+// ---------------------------------------------------------------------------
+
+/// The `host-shell-syntax` gate: command text the shell that will run it
+/// does not honor (see the module docs). `shell` is the kind judged
+/// against; `label` is its [`HostShell::label`], carried into the artefact
+/// so the verdict says which shell it was judged for.
+struct HostShellSyntaxGate {
+    checks: Vec<CommandCheck>,
+    shell: ShellKind,
+    label: String,
+}
+
+impl Gate for HostShellSyntaxGate {
+    fn name(&self) -> &str {
+        HOST_SHELL_SYNTAX
+    }
+    fn kind(&self) -> GateKind {
+        GateKind::Deterministic
+    }
+    fn evaluate(&self) -> GateOutcome {
+        let findings = match self.shell {
+            // Contract commands are authored in POSIX syntax (the planner
+            // prompt and the docs both use it), so `sh` honors all of it.
+            ShellKind::Sh => Vec::new(),
+            ShellKind::Cmd => cmd_syntax_findings(&self.checks),
+        };
+        let artefact = ArtefactRef::new(format!(
+            "contract gate {HOST_SHELL_SYNTAX} (judged against {})",
+            self.label
+        ));
+        if findings.is_empty() {
+            GateOutcome::pass(artefact)
+        } else {
+            GateOutcome::fail(artefact.with_detail(findings.join("\n")))
+        }
+    }
+}
+
+/// Per-assertion findings for POSIX syntax `cmd.exe` does not honor. One
+/// finding per (assertion, reason); each reason fires only on its exact
+/// shape. Double-quoted text, `&&`, `||`, `|` and redirections mean the same
+/// under `cmd` and never fire.
+fn cmd_syntax_findings(checks: &[CommandCheck]) -> Vec<String> {
+    let mut findings = Vec::new();
+    for check in checks {
+        let words = lex(&check.command);
+        let mut reasons: Vec<&str> = Vec::new();
+        let expanding = || words.iter().filter(|w| w.quote != Quote::Single);
+        if expanding().any(|w| has_dollar_name(&w.text)) {
+            reasons.push(
+                "uses `$NAME` expansion (cmd.exe does not expand it; the literal text reaches the program)",
+            );
+        }
+        if expanding().any(|w| w.text.contains("$(") || w.text.contains('`')) {
+            reasons.push("uses `$(...)` or backtick command substitution (cmd.exe has none)");
+        }
+        if words.iter().any(|w| w.quote == Quote::Single) {
+            reasons.push("single-quotes an argument (cmd.exe treats `'` as a literal character)");
+        }
+        if segments(&words).iter().any(|segment| {
+            segment
+                .words
+                .first()
+                .is_some_and(|w| w.quote == Quote::None && w.text.starts_with('!'))
+        }) {
+            reasons.push("negates with a leading `!` (cmd.exe has no command negation)");
+        }
+        if words
+            .iter()
+            .any(|w| w.quote == Quote::None && w.text == ";")
+        {
+            reasons.push("sequences commands with `;` (cmd.exe does not sequence on `;`)");
+        }
+        for reason in reasons {
+            findings.push(format!("[{}] {reason}: `{}`", check.id, check.command));
+        }
+    }
+    findings
+}
+
+/// Whether `text` contains a `$` that starts a POSIX parameter expansion:
+/// `$NAME` (a letter or underscore follows) or `${`. A bare `$`, `$1`, or a
+/// regex anchor like `^0$` is not one.
+fn has_dollar_name(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(i, b)| {
+        *b == b'$'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|next| next.is_ascii_alphabetic() || *next == b'_' || *next == b'{')
+    })
+}
+
+// ---------------------------------------------------------------------------
 // passes-on-base
 // ---------------------------------------------------------------------------
 
@@ -1082,6 +1196,7 @@ mod tests {
             command: command.to_string(),
             outcome,
             output_tail: String::new(),
+            shell_label: "sh".to_string(),
         }
     }
 
@@ -1264,8 +1379,13 @@ mod tests {
             )],
             tree_clean_at_base: true,
         };
-        let reports = contract_gate_reports(&contract, Some(&lint), &workspace_root());
-        assert_eq!(reports.len(), 4, "{reports:?}");
+        let reports = contract_gate_reports(
+            &contract,
+            Some(&lint),
+            &workspace_root(),
+            &HostShell::bare_sh(),
+        );
+        assert_eq!(reports.len(), 5, "{reports:?}");
         for report in reports {
             if report.name == VACUOUS_FILTER {
                 assert!(report.outcome.score.is_some(), "the scored gate scores");
@@ -1401,9 +1521,142 @@ mod tests {
         assert!(findings.is_empty(), "{findings:?}");
     }
 
+    // ---- host-shell-syntax ----------------------------------------------
+
+    fn cmd_findings(command: &str) -> Vec<String> {
+        cmd_syntax_findings(&[check("a7", command)])
+    }
+
+    #[test]
+    fn host_shell_syntax_flags_dollar_name_expansion_under_cmd() {
+        for command in [
+            r#"test "$KRANZ_BASE_SHA" = x"#,
+            "git diff --quiet ${KRANZ_BASE_SHA} -- src",
+        ] {
+            let findings = cmd_findings(command);
+            assert_eq!(findings.len(), 1, "{command}: {findings:?}");
+            assert!(findings[0].starts_with("[a7] "), "{findings:?}");
+            assert!(findings[0].contains("`$NAME` expansion"), "{findings:?}");
+        }
+        // A regex anchor and a positional parameter are not `$NAME`.
+        assert!(cmd_findings(r#"grep -q "^0$" out.txt"#).is_empty());
+        assert!(cmd_findings("echo $1").is_empty());
+    }
+
+    #[test]
+    fn host_shell_syntax_flags_command_substitution_under_cmd() {
+        for command in [
+            "test -n $(git rev-parse HEAD)",
+            "test -n `git rev-parse HEAD`",
+        ] {
+            let findings = cmd_findings(command);
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.starts_with("[a7] ") && f.contains("command substitution")),
+                "{command}: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_shell_syntax_flags_single_quoted_argument_under_cmd() {
+        // The anti-vacuity form itself single-quotes its pattern, so it is
+        // flagged for a cmd host: exactly the report this gate exists for.
+        let findings =
+            cmd_findings("cargo test --workspace foo 2>&1 | grep -qE 'test result: ok\\. [1-9]'");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].starts_with("[a7] "), "{findings:?}");
+        assert!(findings[0].contains("single-quotes"), "{findings:?}");
+    }
+
+    #[test]
+    fn host_shell_syntax_flags_leading_negation_under_cmd() {
+        for command in [
+            "! grep -q foo src/lib.rs",
+            "cargo build && ! grep -q foo out.txt",
+        ] {
+            let findings = cmd_findings(command);
+            assert_eq!(findings.len(), 1, "{command}: {findings:?}");
+            assert!(findings[0].starts_with("[a7] "), "{findings:?}");
+            assert!(findings[0].contains("leading `!`"), "{findings:?}");
+        }
+    }
+
+    #[test]
+    fn host_shell_syntax_flags_semicolon_sequencing_under_cmd() {
+        let findings = cmd_findings("cargo build; cargo test");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].starts_with("[a7] "), "{findings:?}");
+        assert!(findings[0].contains("`;`"), "{findings:?}");
+        // A quoted `;` is program text, not sequencing.
+        assert!(cmd_findings(r#"node -e "a();b()""#).is_empty());
+    }
+
+    #[test]
+    fn host_shell_syntax_passes_double_quoted_one_liners_and_merge_gates_under_cmd() {
+        for command in [
+            r#"node -e "process.stdout.write('x')""#,
+            r#"node --input-type=module -e "console.log(1)""#,
+            "npm test",
+            "cargo build --workspace && cargo test --workspace 2>&1 | findstr ok || exit 1",
+        ] {
+            assert!(cmd_findings(command).is_empty(), "{command}");
+        }
+        let root = workspace_root();
+        let bytes = std::fs::read(root.join(crate::merge_gate::MERGE_GATES_PATH))
+            .expect("repo merge-gates.json readable");
+        let suite = crate::merge_gate::parse_gate_suite(&bytes).expect("suite parses");
+        assert!(!suite.gates.is_empty());
+        for gate in &suite.gates {
+            assert!(cmd_findings(&gate.command).is_empty(), "{}", gate.command);
+        }
+    }
+
+    #[test]
+    fn host_shell_syntax_passes_everything_under_sh_and_renders_fail_under_cmd() {
+        let contract = vec![
+            command_assertion("a9", r#"test "$KRANZ_BASE_SHA" = x"#),
+            command_assertion("a10", "! grep -q 'x' $(pwd)/f; true"),
+        ];
+        let root = workspace_root();
+
+        let reports = contract_gate_reports(&contract, None, &root, &HostShell::bare_sh());
+        let gate = reports
+            .iter()
+            .find(|r| r.name == HOST_SHELL_SYNTAX)
+            .expect("registered");
+        assert!(gate.outcome.passed(), "{gate:?}");
+        assert!(
+            gate.outcome
+                .artefact
+                .reference
+                .contains("judged against sh"),
+            "{gate:?}"
+        );
+
+        let reports = contract_gate_reports(&contract, None, &root, &HostShell::cmd());
+        let gate = reports
+            .iter()
+            .find(|r| r.name == HOST_SHELL_SYNTAX)
+            .expect("registered");
+        assert!(!gate.outcome.passed(), "{gate:?}");
+        assert!(
+            gate.outcome
+                .artefact
+                .reference
+                .contains("judged against cmd"),
+            "{gate:?}"
+        );
+        let rendered = render_gate_verdicts(&reports);
+        assert!(rendered.contains("host-shell-syntax: FAIL"), "{rendered}");
+        assert!(rendered.contains("[a9] "), "{rendered}");
+        assert!(rendered.contains("[a10] "), "{rendered}");
+    }
+
     // ---- pipeline + regression ------------------------------------------
 
-    /// The pipeline registers the four gates in ticket order (passes-on-base
+    /// The pipeline registers the gates in ticket order (passes-on-base
     /// only with a lint report), each report carries its defect-class name,
     /// and the rendered verdict block names the failed classes.
     #[test]
@@ -1422,13 +1675,19 @@ mod tests {
             ],
             tree_clean_at_base: true,
         };
-        let reports = contract_gate_reports(&contract, Some(&lint), &workspace_root());
+        let reports = contract_gate_reports(
+            &contract,
+            Some(&lint),
+            &workspace_root(),
+            &HostShell::bare_sh(),
+        );
         let names: Vec<&str> = reports.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 VACUOUS_FILTER,
                 WRONG_POLARITY,
+                HOST_SHELL_SYNTAX,
                 PASSES_ON_BASE,
                 ENV_SENSITIVE
             ]
@@ -1446,12 +1705,23 @@ mod tests {
 
         // Without a lint report (the final-gate surface) passes-on-base is
         // not registered.
-        let reports = contract_gate_reports(&contract, None, &workspace_root());
+        let reports =
+            contract_gate_reports(&contract, None, &workspace_root(), &HostShell::bare_sh());
         let names: Vec<&str> = reports.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec![VACUOUS_FILTER, WRONG_POLARITY, ENV_SENSITIVE]);
+        assert_eq!(
+            names,
+            vec![
+                VACUOUS_FILTER,
+                WRONG_POLARITY,
+                HOST_SHELL_SYNTAX,
+                ENV_SENSITIVE
+            ]
+        );
 
         // No command assertions → no gates, mirroring the lint's is_empty.
-        assert!(contract_gate_reports(&[], None, &workspace_root()).is_empty());
+        assert!(
+            contract_gate_reports(&[], None, &workspace_root(), &HostShell::bare_sh()).is_empty()
+        );
     }
 
     /// Regression: the repo's own `.kranz/merge-gates.json` commands are
@@ -1468,8 +1738,8 @@ mod tests {
             .enumerate()
             .map(|(i, g)| command_assertion(&format!("g{}", i + 1), &g.command))
             .collect();
-        let reports = contract_gate_reports(&contract, None, &root);
-        assert_eq!(reports.len(), 3, "{reports:?}");
+        let reports = contract_gate_reports(&contract, None, &root, &HostShell::bare_sh());
+        assert_eq!(reports.len(), 4, "{reports:?}");
         let failed = failed_gate_names(&reports);
         assert!(
             failed.is_empty(),
@@ -1496,7 +1766,7 @@ mod tests {
                 "test -z \"$GH_TOKEN\" && env | grep -c hunter2-lint | grep -q '^0$'",
             ),
         ];
-        let reports = contract_gate_reports(&contract, None, &root);
+        let reports = contract_gate_reports(&contract, None, &root, &HostShell::bare_sh());
         let failed = failed_gate_names(&reports);
         assert!(
             failed.is_empty(),

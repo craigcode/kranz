@@ -394,6 +394,12 @@ async fn run_shell_command_with_timeout_env(
 ) -> (Option<i32>, String) {
     let (program, args) = shell_argv(command);
     let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        let _ = args;
+        apply_raw_tail(&mut cmd, &cmd_raw_tail(command));
+    }
+    #[cfg(not(windows))]
     cmd.args(args);
     if clear_env {
         cmd.env_clear();
@@ -422,6 +428,26 @@ fn shell_argv(command: &str) -> (std::path::PathBuf, Vec<String>) {
     }
 }
 
+/// The exact cmd.exe command-tail text for an uncontained Windows launch:
+/// `/S /C "<command verbatim>"`. With `/S`, cmd strips exactly the outermost
+/// pair of quotes and leaves everything inside untouched — the command text
+/// gets no escaping at all, unlike the one-quoted-argument encoding
+/// std/tokio `Command::args` would otherwise apply (which turns inner `"`
+/// into `\"`, breaking commands like `node -e "..."`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn cmd_raw_tail(command: &str) -> String {
+    format!("/S /C \"{command}\"")
+}
+
+/// Hand `tail` to the child's command line completely unencoded — the
+/// Windows counterpart to `.args(..)` for the `/S /C "<command>"` tail,
+/// which must reach cmd.exe byte-for-byte (no quote escaping at all).
+#[cfg(windows)]
+fn apply_raw_tail(cmd: &mut tokio::process::Command, tail: &str) {
+    use std::os::windows::process::CommandExt;
+    cmd.as_std_mut().raw_arg(tail);
+}
+
 /// Bounded run of an arbitrary program argv with the same pipe-draining /
 /// process-tree-kill discipline as contract shell commands — the sandbox
 /// preflight probe (`sandbox-exec -f <profile> /bin/sh -c <command>`) runs
@@ -435,9 +461,20 @@ pub(crate) async fn run_bounded_argv(
     args: &[String],
     timeout: Duration,
     env: &HashMap<String, String>,
+    raw_tail: Option<&str>,
 ) -> (Option<i32>, String) {
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args);
+    #[cfg(windows)]
+    if let Some(tail) = raw_tail {
+        apply_raw_tail(&mut cmd, tail);
+    } else {
+        cmd.args(args);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = raw_tail;
+        cmd.args(args);
+    }
     cmd.env_clear();
     run_command_bounded(configure_bounded_child(cmd, cwd, env), timeout).await
 }
@@ -513,6 +550,12 @@ pub(crate) struct WrappedCommand {
     /// failure (the runtime already reaped the container, an unsupported
     /// `rm -f`) is ignored, and `--rm` still reaps every normal exit.
     pub timeout_teardown: Option<(std::path::PathBuf, Vec<String>)>,
+    /// The cmd.exe raw command-tail (`/S /C "<command>"`) for the uncontained
+    /// Windows [`GateSandbox::Disabled`] arm, handed to the child unencoded
+    /// instead of `args`. Always `None` off Windows and for every other arm
+    /// (AppContainer/Seatbelt/Bubblewrap/Container keep running through
+    /// `args` exactly as before).
+    pub raw_tail: Option<String>,
     /// Retains ownership of the resolved posture's disposable profile and
     /// no-follow DACL handles through the wrapper process. Callers still must
     /// await/reap the command before explicitly cleaning the posture. Absent
@@ -548,6 +591,7 @@ impl GateSandbox {
                     ],
                 )?,
                 timeout_teardown: None,
+                raw_tail: None,
                 #[cfg(windows)]
                 _appcontainer_context: None,
             }),
@@ -598,11 +642,21 @@ impl GateSandbox {
     ) -> crate::error::Result<WrappedCommand> {
         match self {
             GateSandbox::Disabled => {
-                let (program, args) = shell_argv(command);
+                #[cfg(windows)]
+                let (program, args, raw_tail) = {
+                    let (program, _args) = shell_argv(command);
+                    (program, Vec::new(), Some(cmd_raw_tail(command)))
+                };
+                #[cfg(not(windows))]
+                let (program, args, raw_tail) = {
+                    let (program, args) = shell_argv(command);
+                    (program, args, None)
+                };
                 Ok(WrappedCommand {
                     program,
                     args,
                     timeout_teardown: None,
+                    raw_tail,
                     #[cfg(windows)]
                     _appcontainer_context: None,
                 })
@@ -617,6 +671,7 @@ impl GateSandbox {
                     program,
                     args,
                     timeout_teardown: None,
+                    raw_tail: None,
                     #[cfg(windows)]
                     _appcontainer_context: None,
                 })
@@ -631,6 +686,7 @@ impl GateSandbox {
                     program: std::path::PathBuf::from("bwrap"),
                     args,
                     timeout_teardown: None,
+                    raw_tail: None,
                     #[cfg(windows)]
                     _appcontainer_context: None,
                 })
@@ -642,14 +698,21 @@ impl GateSandbox {
             } => {
                 #[cfg(windows)]
                 {
-                    let (program, args) = shell_argv(command);
+                    let (program, _args) = shell_argv(command);
+                    let raw_tail = cmd_raw_tail(command);
                     let prepared = crate::appcontainer_windows::prepare_launch_in_context(
-                        context, inputs, &program, &args, env,
+                        context,
+                        inputs,
+                        &program,
+                        &[],
+                        env,
+                        Some(&raw_tail),
                     )?;
                     Ok(WrappedCommand {
                         program: prepared.program,
                         args: prepared.args,
                         timeout_teardown: None,
+                        raw_tail: None,
                         _appcontainer_context: Some(context.clone()),
                     })
                 }
@@ -676,10 +739,75 @@ impl GateSandbox {
                         std::path::PathBuf::from(spec.runtime.binary()),
                         vec!["rm".to_string(), "-f".to_string(), name],
                     )),
+                    raw_tail: None,
                     #[cfg(windows)]
                     _appcontainer_context: None,
                 })
             }
+        }
+    }
+
+    /// [`Self::wrap_shell`], made aware of a resolved [`crate::contract_shell::HostShell`]
+    /// (contract-lane callers only — validation round, final gate, approval
+    /// contract lint). Only `Disabled` and `AppContainer` branch on the
+    /// shell: `Seatbelt`/`Bubblewrap`/`Container` ignore it and stay
+    /// byte-identical to [`Self::wrap_shell`] (`/bin/sh -c` as always).
+    ///
+    /// - `Disabled` + `Sh`: `program = shell.program`, `args = ["-c",
+    ///   command]` — on Unix that is exactly `sh -c <command>`,
+    ///   byte-identical to today. The resolved Windows `sh.exe` is a real
+    ///   argv-parsing program (standard C runtime quoting), so it goes
+    ///   through the normal `.args()` encoding rather than the raw cmd tail.
+    /// - `Disabled` + `Cmd`: the existing raw-cmd-tail path.
+    /// - `AppContainer` + `Cmd`: the existing raw-cmd-tail path through
+    ///   `prepare_launch_in_context`.
+    /// - `AppContainer` + `Sh`: the absolute `sh` with `["-c", command]`
+    ///   through `prepare_launch_in_context`'s normal encoded path (no
+    ///   `raw_command_tail`); no production caller selects this yet (the
+    ///   Windows AppContainer contract lane stays `Cmd` —
+    ///   [`crate::contract_shell::resolve_contract_shell`]).
+    pub(crate) fn wrap_contract_shell(
+        &self,
+        command: &str,
+        env: &HashMap<String, String>,
+        shell: &crate::contract_shell::HostShell,
+    ) -> crate::error::Result<WrappedCommand> {
+        use crate::contract_shell::ShellKind;
+        match (self, shell.kind) {
+            (GateSandbox::Disabled, ShellKind::Sh) => Ok(WrappedCommand {
+                program: shell.program.clone(),
+                args: vec!["-c".to_string(), command.to_string()],
+                timeout_teardown: None,
+                raw_tail: None,
+                #[cfg(windows)]
+                _appcontainer_context: None,
+            }),
+            #[cfg(windows)]
+            (GateSandbox::AppContainer { inputs, context }, ShellKind::Sh) => {
+                let prepared = crate::appcontainer_windows::prepare_launch_in_context(
+                    context,
+                    inputs,
+                    &shell.program,
+                    &["-c".to_string(), command.to_string()],
+                    env,
+                    None,
+                )?;
+                Ok(WrappedCommand {
+                    program: prepared.program,
+                    args: prepared.args,
+                    timeout_teardown: None,
+                    raw_tail: None,
+                    _appcontainer_context: Some(context.clone()),
+                })
+            }
+            #[cfg(not(windows))]
+            (GateSandbox::AppContainer { .. }, ShellKind::Sh) => {
+                let _ = (command, env);
+                Err(crate::error::EngineError::Backend(
+                    "AppContainer gate wrapper is unavailable on this host".to_string(),
+                ))
+            }
+            _ => self.wrap_shell(command, env),
         }
     }
 }
@@ -1238,13 +1366,27 @@ pub(crate) async fn run_shell_command_sandboxed_with_code(
         GateSandbox::Container { spec, .. } => spec.runtime.client_env(),
         _ => env,
     };
-    let (code, output) =
-        run_bounded_argv(cwd, &wrapped.program, &wrapped.args, timeout, &client_env).await;
+    let (code, output) = run_bounded_argv(
+        cwd,
+        &wrapped.program,
+        &wrapped.args,
+        timeout,
+        &client_env,
+        wrapped.raw_tail.as_deref(),
+    )
+    .await;
     if code.is_none() {
         if let Some((program, args)) = wrapped.timeout_teardown {
             // Reuse the exact client context that started this container.
-            let _ =
-                run_bounded_argv(cwd, &program, &args, Duration::from_secs(30), &client_env).await;
+            let _ = run_bounded_argv(
+                cwd,
+                &program,
+                &args,
+                Duration::from_secs(30),
+                &client_env,
+                None,
+            )
+            .await;
         }
     }
     (code, output)
@@ -1278,21 +1420,139 @@ pub(crate) fn run_bounded_gate_command_resolved_with_code(
     ))
 }
 
-/// Synchronous bridge for gate execution from approval-time code that runs
-/// inside an ambient Tokio runtime. The actual bounded/sandboxed executor is
-/// async; attempting to build and `block_on` a second runtime on the caller's
-/// runtime thread panics. A scoped OS thread owns the short-lived runtime,
-/// while borrowed cwd/env/sandbox inputs remain valid until it joins.
+/// [`run_shell_command_sandboxed`], routed through the resolved contract
+/// [`crate::contract_shell::HostShell`] instead of [`shell_argv`]'s fixed
+/// `cmd`/`sh` choice. Contract-lane callers only (validation round, final
+/// gate, approval contract lint) — merge gates and every other caller keep
+/// using [`run_shell_command_sandboxed`].
+pub(crate) async fn run_contract_command_sandboxed(
+    cwd: &std::path::Path,
+    command: &str,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+    shell: &crate::contract_shell::HostShell,
+) -> (bool, String) {
+    let (code, output) = run_contract_command_sandboxed_with_code(
+        cwd,
+        command,
+        COMMAND_TIMEOUT,
+        env,
+        sandbox,
+        shell,
+    )
+    .await;
+    (code == Some(0), output)
+}
+
+/// Let an uncontained Windows contract `sh` find the POSIX tools it ships
+/// with. A default Git for Windows install puts only `Git\cmd` on `PATH`,
+/// so `grep`, `head` and the rest of `usr\bin` are missing from a contract
+/// command's environment even though the shell beside them was resolved.
+/// The resolved shell's own directory is APPENDED to `PATH`: tools already
+/// on the path keep winning (Git's `usr\bin` also carries a `link.exe` that
+/// must not shadow the MSVC linker), and only the gaps are filled.
 ///
-/// `Some(code)` means the command reached an exit status; `None` covers
-/// spawn/wrap failures, timeout/tree kill, signal termination, or runtime
-/// setup failure. The output always carries the bounded diagnostic tail.
-pub(crate) fn run_shell_command_sandboxed_blocking(
+/// The directory is the one [`crate::contract_shell::posix_sh_resolution`]
+/// already proved lies outside every worker-writable root. Uncontained
+/// only: the contained postures get no extra path entry. A no-op off
+/// Windows, where the shell is the bare `sh`.
+fn contract_shell_env(
+    mut env: HashMap<String, String>,
+    sandbox: &GateSandbox,
+    shell: &crate::contract_shell::HostShell,
+    windows: bool,
+) -> HashMap<String, String> {
+    if !windows
+        || !matches!(sandbox, GateSandbox::Disabled)
+        || shell.kind != crate::contract_shell::ShellKind::Sh
+        || !shell.program.is_absolute()
+    {
+        return env;
+    }
+    let Some(dir) = shell.program.parent() else {
+        return env;
+    };
+    let dir = dir.display().to_string();
+    let key = env
+        .keys()
+        .find(|key| key.eq_ignore_ascii_case("PATH"))
+        .cloned()
+        .unwrap_or_else(|| "PATH".to_string());
+    let path = match env.get(&key) {
+        Some(existing) if !existing.is_empty() => format!("{existing};{dir}"),
+        _ => dir,
+    };
+    env.insert(key, path);
+    env
+}
+
+/// [`run_contract_command_sandboxed`] with an explicit timeout and the real
+/// exit code, mirroring [`run_shell_command_sandboxed_with_code`].
+pub(crate) async fn run_contract_command_sandboxed_with_code(
     cwd: &std::path::Path,
     command: &str,
     timeout: Duration,
     env: &HashMap<String, String>,
     sandbox: &GateSandbox,
+    shell: &crate::contract_shell::HostShell,
+) -> (Option<i32>, String) {
+    let env = contract_shell_env(
+        gate_env_for_sandbox(env, sandbox),
+        sandbox,
+        shell,
+        cfg!(windows),
+    );
+    let wrapped = match sandbox.wrap_contract_shell(command, &env, shell) {
+        Ok(wrapped) => wrapped,
+        Err(error) => {
+            return (
+                None,
+                format!("gate sandbox wrap failed closed (the command did not run): {error}"),
+            )
+        }
+    };
+    let client_env = match sandbox {
+        GateSandbox::Container { spec, .. } => spec.runtime.client_env(),
+        _ => env,
+    };
+    let (code, output) = run_bounded_argv(
+        cwd,
+        &wrapped.program,
+        &wrapped.args,
+        timeout,
+        &client_env,
+        wrapped.raw_tail.as_deref(),
+    )
+    .await;
+    if code.is_none() {
+        if let Some((program, args)) = wrapped.timeout_teardown {
+            let _ = run_bounded_argv(
+                cwd,
+                &program,
+                &args,
+                Duration::from_secs(30),
+                &client_env,
+                None,
+            )
+            .await;
+        }
+    }
+    (code, output)
+}
+
+/// Synchronous bridge for contract-lane gate execution from approval-time
+/// code that runs inside an ambient Tokio runtime. The actual
+/// bounded/sandboxed executor is async; attempting to build and `block_on` a
+/// second runtime on the caller's runtime thread panics. A scoped OS thread
+/// owns the short-lived runtime, while borrowed cwd/env/sandbox inputs
+/// remain valid until it joins.
+pub(crate) fn run_contract_command_sandboxed_blocking(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+    shell: &crate::contract_shell::HostShell,
 ) -> (Option<i32>, String) {
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| {
@@ -1308,8 +1568,8 @@ pub(crate) fn run_shell_command_sandboxed_blocking(
                     )
                 }
             };
-            runtime.block_on(run_shell_command_sandboxed_with_code(
-                cwd, command, timeout, env, sandbox,
+            runtime.block_on(run_contract_command_sandboxed_with_code(
+                cwd, command, timeout, env, sandbox, shell,
             ))
         });
         worker.join().unwrap_or_else(|_| {
@@ -2024,6 +2284,317 @@ mod tests {
     use crate::runner;
 
     #[test]
+    fn cmd_raw_tail_keeps_inner_quotes_verbatim_with_no_escaping() {
+        let command = r#"prog -e "a 'b' c""#;
+        let tail = cmd_raw_tail(command);
+        assert_eq!(tail, r#"/S /C "prog -e "a 'b' c"""#);
+        // No backslash-before-quote the input didn't already have.
+        assert!(!tail.contains('\\'));
+    }
+
+    #[test]
+    fn cmd_raw_tail_preserves_a_quoted_program_path_verbatim() {
+        let command = r#""C:\Program Files\x.exe" -e "y""#;
+        let tail = cmd_raw_tail(command);
+        assert_eq!(tail, format!("/S /C \"{command}\""));
+        assert!(tail.contains(command));
+    }
+
+    #[test]
+    fn contract_shell_env_appends_the_resolved_sh_directory_only_when_uncontained_on_windows() {
+        let sh = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: if cfg!(windows) {
+                std::path::PathBuf::from(r"C:\Program Files\Git\usr\bin\sh.exe")
+            } else {
+                std::path::PathBuf::from("/opt/git/usr/bin/sh")
+            },
+        };
+        let dir = sh.program.parent().unwrap().display().to_string();
+        let env = HashMap::from([("Path".to_string(), "first".to_string())]);
+
+        // Windows, uncontained, resolved sh: appended under the existing key.
+        let out = contract_shell_env(env.clone(), &GateSandbox::Disabled, &sh, true);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out["Path"], format!("first;{dir}"));
+        // No PATH at all: the directory becomes the path.
+        let out = contract_shell_env(HashMap::new(), &GateSandbox::Disabled, &sh, true);
+        assert_eq!(out["PATH"], dir);
+
+        // Off Windows, under cmd, and for the bare `sh`: untouched.
+        assert_eq!(
+            contract_shell_env(env.clone(), &GateSandbox::Disabled, &sh, false),
+            env
+        );
+        let cmd = crate::contract_shell::HostShell::cmd();
+        assert_eq!(
+            contract_shell_env(env.clone(), &GateSandbox::Disabled, &cmd, true),
+            env
+        );
+        let bare = crate::contract_shell::HostShell::bare_sh();
+        assert_eq!(
+            contract_shell_env(env.clone(), &GateSandbox::Disabled, &bare, true),
+            env
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_argv_unix_matches_sh_dash_c() {
+        assert_eq!(
+            shell_argv("echo hi"),
+            (
+                std::path::PathBuf::from("sh"),
+                vec!["-c".to_string(), "echo hi".to_string()]
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_argv_unix_disabled_wrap_shell_yields_sh_dash_c_and_no_raw_tail() {
+        let wrapped = GateSandbox::Disabled
+            .wrap_shell("echo hi", &HashMap::new())
+            .unwrap();
+        assert_eq!(wrapped.program, std::path::PathBuf::from("sh"));
+        assert_eq!(wrapped.args, vec!["-c".to_string(), "echo hi".to_string()]);
+        assert_eq!(wrapped.raw_tail, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_argv_unix_contract_runner_disabled_wrap_matches_sh_dash_c() {
+        let shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("sh"),
+        };
+        let wrapped = GateSandbox::Disabled
+            .wrap_contract_shell("echo hi", &HashMap::new(), &shell)
+            .unwrap();
+        assert_eq!(wrapped.program, std::path::PathBuf::from("sh"));
+        assert_eq!(wrapped.args, vec!["-c".to_string(), "echo hi".to_string()]);
+        assert_eq!(wrapped.raw_tail, None);
+
+        // And end-to-end through the real runner, byte-identical to the
+        // pre-existing shell_argv-based path.
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let (ok, output) = run_contract_command_sandboxed(
+            dir.path(),
+            "echo hi",
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert!(ok, "{output}");
+        assert!(output.contains("hi"), "{output}");
+    }
+
+    /// Resolve the uncontained Windows contract shell, asserting a real
+    /// Git-for-Windows `sh.exe` was found: Windows CI always carries Git, so
+    /// a missing `sh` here is a real defect, never a reason to skip.
+    #[cfg(windows)]
+    fn resolved_uncontained_contract_sh(
+        forbidden_roots: &[std::path::PathBuf],
+    ) -> crate::contract_shell::HostShell {
+        let shell = crate::contract_shell::resolve_contract_shell(
+            crate::contract_shell::ShellLane::Contract,
+            false,
+            forbidden_roots,
+        );
+        assert_eq!(
+            shell.kind,
+            crate::contract_shell::ShellKind::Sh,
+            "Windows CI always has Git; a Git-for-Windows sh.exe must resolve \
+             (got label: {})",
+            shell.label()
+        );
+        assert!(
+            shell.program.is_absolute(),
+            "the resolved sh must be an absolute path: {}",
+            shell.program.display()
+        );
+        shell
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_sh_keeps_inner_double_quotes() {
+        let shell = resolved_uncontained_contract_sh(&[]);
+        assert!(
+            shell.label().starts_with("sh ("),
+            "the label must name the resolved absolute sh path: {}",
+            shell.label()
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let env = sanitized_gate_env();
+        assert!(env.contains_key("PATH"), "contract env must carry PATH");
+        let (code, output) = run_contract_command_sandboxed_with_code(
+            dir.path(),
+            r#"node -e "process.stdout.write('KRANZ_QUOTES_OK')""#,
+            Duration::from_secs(30),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(0),
+            "node must exit 0 under the resolved sh: {output}"
+        );
+        assert!(
+            output.contains("KRANZ_QUOTES_OK"),
+            "expected the marker to survive the resolved sh's quoting: {output}"
+        );
+    }
+
+    /// A default Git for Windows install leaves `usr\bin` off `PATH`. The
+    /// contract shell must still find the tools it ships with, or the
+    /// anti-vacuity `| grep -qE ...` form fails on a stock host.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_sh_finds_its_own_tools_off_path() {
+        let shell = resolved_uncontained_contract_sh(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = sanitized_gate_env();
+        let system_root = std::env::var("SystemRoot").expect("SystemRoot is set on Windows");
+        env.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+        env.insert("PATH".to_string(), format!(r"{system_root}\System32"));
+        let (code, output) = run_contract_command_sandboxed_with_code(
+            dir.path(),
+            "printf 'KRANZ_TOOLS\\n' | grep -qE 'KRANZ_[A-Z]+'",
+            Duration::from_secs(30),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(0),
+            "grep must resolve from the contract shell's own directory: {output}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_sh_sees_pinned_base_sha() {
+        let shell = resolved_uncontained_contract_sh(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = sanitized_gate_env();
+        env.insert("KRANZ_BASE_SHA".to_string(), "deadbeefcafe".to_string());
+
+        let (sh_code, sh_output) = run_contract_command_sandboxed_with_code(
+            dir.path(),
+            r#"test "$KRANZ_BASE_SHA" = deadbeefcafe"#,
+            Duration::from_secs(30),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(
+            sh_code,
+            Some(0),
+            "the resolved sh must see the pinned KRANZ_BASE_SHA: {sh_output}"
+        );
+
+        let cmd_shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Cmd,
+            program: std::path::PathBuf::from("cmd"),
+        };
+        let (cmd_code, cmd_output) = run_contract_command_sandboxed_with_code(
+            dir.path(),
+            r#"test "$KRANZ_BASE_SHA" = deadbeefcafe"#,
+            Duration::from_secs(30),
+            &env,
+            &GateSandbox::Disabled,
+            &cmd_shell,
+        )
+        .await;
+        assert_ne!(
+            cmd_code,
+            Some(0),
+            "cmd.exe must NOT parse POSIX `test` syntax the same way: {cmd_output}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_planted_sh_is_never_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("kranz-planted-sh-marker.txt");
+        let test_exe = std::env::current_exe().unwrap();
+
+        // Plant a fake sh.exe directly in the command's cwd…
+        std::fs::copy(&test_exe, dir.path().join("sh.exe")).unwrap();
+        // …and in a cwd subdirectory placed first on the child's PATH.
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::copy(&test_exe, bin_dir.join("sh.exe")).unwrap();
+
+        let shell = resolved_uncontained_contract_sh(&[]);
+        assert!(
+            !shell.program.starts_with(dir.path()),
+            "the resolved shell must never be the planted copy: {}",
+            shell.program.display()
+        );
+
+        let mut env = sanitized_gate_env();
+        let existing_path = env.get("PATH").cloned().unwrap_or_default();
+        env.insert(
+            "PATH".to_string(),
+            format!("{};{existing_path}", bin_dir.display()),
+        );
+        env.insert(
+            "KRANZ_TEST_PLANTED_SH_MARKER".to_string(),
+            marker.display().to_string(),
+        );
+
+        let (code, output) = run_contract_command_sandboxed_with_code(
+            dir.path(),
+            "exit 0",
+            Duration::from_secs(30),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(
+            code,
+            Some(0),
+            "the resolved (real) sh must still run the command: {output}"
+        );
+        assert!(
+            !marker.exists(),
+            "the planted sh.exe (cwd or cwd-first PATH) must never execute"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_contract_shell_cmd_keeps_inner_double_quotes() {
+        let env = sanitized_gate_env();
+        assert!(env.contains_key("PATH"), "contract env must carry PATH");
+        let dir = tempfile::tempdir().unwrap();
+        let (code, output) = run_shell_command_with_timeout_env(
+            dir.path(),
+            r#"node -e "process.stdout.write('KRANZ_QUOTES_OK')""#,
+            Duration::from_secs(30),
+            &env,
+            true,
+        )
+        .await;
+        assert_eq!(code, Some(0), "node must exit 0: {output}");
+        assert!(
+            output.contains("KRANZ_QUOTES_OK"),
+            "expected the marker to survive cmd.exe's quoting: {output}"
+        );
+    }
+
+    #[test]
     fn control_wrapper_keeps_scratch_mounts_and_positional_snapshot_cwd() {
         let root = tempfile::tempdir().unwrap();
         let scratch = root.path().join("scratch");
@@ -2670,6 +3241,7 @@ esac
                 &["-c".to_string(), script],
                 Duration::from_millis(500),
                 &env,
+                None,
             ),
         )
         .await
@@ -2714,6 +3286,7 @@ esac
             &["-c".to_string(), big.to_string()],
             Duration::from_secs(10),
             &env,
+            None,
         )
         .await;
 
@@ -2735,6 +3308,7 @@ esac
             &["-c".to_string(), "exit 3".to_string()],
             Duration::from_secs(10),
             &env,
+            None,
         )
         .await;
         assert_eq!(code, Some(3), "{output}");
@@ -4617,6 +5191,7 @@ esac
                 &["info".into()],
                 Duration::from_secs(5),
                 &runtime.client_env(),
+                None,
             )
             .await
             .0 == Some(0)

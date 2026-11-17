@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-16
+last_verified: 2026-11-17
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -38,6 +38,8 @@ verified_against:
   - crates/engine/src/orchestrator.rs
   - crates/engine/src/orchestrator/finalization.rs
   - crates/engine/src/command_exec.rs
+  - crates/engine/src/contract_shell.rs
+  - crates/engine/src/contract_gates.rs
   - crates/engine/src/contract_controls.rs
   - crates/engine/src/contract_controls/pair.rs
   - crates/engine/src/contract_controls/readback.rs
@@ -61,6 +63,10 @@ verified_against:
   - docs/tickets.md
   - crates/engine/src/git_ops.rs
 ---
+
+Rechecked 2026-11-17 (UTC) against a test move in `command_exec.rs`, `appcontainer_windows.rs` and `.github/workflows/ci.yml`: the contained contract-shell checks (the `cmd.exe` quoting check and the Git `sh` attempt that prints `KRANZ_WINDOWS_SH_CONTAINED=`) now run inside the CLI's AppContainer normal-gate self test, because the AppContainer launcher is the `kranz` binary itself. No shell selection, containment rule or gate behaviour changed.
+
+Rechecked 2026-11-16 (UTC) against the Windows contract-shell change: on Windows an uncontained contract command runs under Git for Windows' POSIX `sh` when it resolves outside every worker-writable root, and under `cmd.exe` otherwise. `cmd.exe` now receives the command text unencoded. Validation-round lines, final-gate command findings and the plan.md lint section carry a `shell:` label, and a fifth named contract gate, `host-shell-syntax`, is advisory. See "Which shell runs a contract command" below. Unix behaviour, gate commands and verdict rules are unchanged.
 
 Rechecked 2026-11-16 (UTC) against the Windows first-run fixes: the review packet JSON gains `schemaVersion`, `missionStatus` and `nativeChecks`, which list recorded native gate results as data and still do not claim a current pass. The event-log change is the Windows lock probe. No gate, verdict or consent rule changed.
 
@@ -312,6 +318,69 @@ cargo test --workspace <filter> 2>&1 | grep -qE 'test result: ok\. [1-9]'
 
 The `[1-9]` forces at least one passing test. Before shipping the filter, also
 confirm it does not collide with a pre-existing test name.
+
+## Which shell runs a contract command
+
+A contract `command` assertion runs under one shell per platform and gate
+posture. Repo-authored commands (merge gates, workspace bootstrap, readiness
+and data hooks, external gates, pack and standards gates) are a separate lane
+and keep the platform's default shell.
+
+| Platform | Gate posture | Contract commands | Repo-authored commands |
+| --- | --- | --- | --- |
+| macOS, Linux | any | `sh -c` | `sh -c` |
+| Windows | uncontained (`enforce: off`), Git's `sh` resolves | Git for Windows `usr\bin\sh.exe -c` | `cmd /S /C` |
+| Windows | uncontained, no usable `sh` | `cmd /S /C` | `cmd /S /C` |
+| Windows | AppContainer (`fs`, `fs+net`) | `cmd /S /C` | `cmd /S /C` |
+
+The Windows `sh` is found from the engine's own Git installation
+(`git --exec-path`, then `%ProgramFiles%\Git`). It is never looked up by bare
+name on a child's `PATH` or working directory. The path is canonicalized and
+refused if it lies inside the repository, the worktree, the mission directory,
+the contract scratch, the temp directory or any sandbox write root
+(`contract_shell.rs`).
+
+The AppContainer contract path stays on `cmd.exe`. The CLI's AppContainer
+normal-gate self test, which Windows CI runs, checks that path keeps inner
+double quotes, then tries Git's `sh` inside the unchanged AppContainer wrap
+and prints `KRANZ_WINDOWS_SH_CONTAINED=pass` or
+`KRANZ_WINDOWS_SH_CONTAINED=fail: <reason>` on stderr. The check lives in the
+self test because the AppContainer launcher is the `kranz` binary itself. The contained path can move to
+`sh` only after that line reads `pass`, as a separate change.
+
+`cmd.exe` receives the command as `/S /C "<command>"` with no escaping added,
+so inner double quotes reach the program as written.
+
+**Reading the `shell:` label.** The evidence names the shell that ran each
+contract command:
+
+- a validation-round line ends `(shell: <label>)`;
+- a failing final-gate command finding starts `command failed (shell: <label>)`;
+- the plan.md contract-lint section names the shell the approval lint used.
+
+The label is `sh` on Unix, `sh (<absolute path>)` for a resolved Windows `sh`,
+and `cmd` for `cmd.exe`. A failure labelled `cmd` on a command written in
+POSIX syntax points at the contract, not at the work.
+
+**The `host-shell-syntax` gate.** The named contract gates
+(`contract_gates.rs`) are `vacuous-filter`, `wrong-polarity`,
+`host-shell-syntax`, `passes-on-base` (approval only) and `env-sensitive`.
+All are advisory: they record a verdict in the approval decision, in plan.md
+and at the final gate, and never refuse approval or add findings.
+`host-shell-syntax` is judged against the shell the mission's validation and
+final-gate commands will run under, which is not always the shell the approval
+lint used. Under `sh` it always passes. Under `cmd` it fails and names the
+assertion for each of these shapes:
+
+- `$NAME` or `${NAME}` expansion outside single quotes;
+- `$(...)` or backtick command substitution;
+- a single-quoted argument;
+- a leading `!` negation;
+- `;` sequencing.
+
+The anti-vacuity form above single-quotes its grep pattern, so it is flagged
+on a Windows host that resolves to `cmd`. Install Git for Windows, or write
+the check with double quotes only.
 
 ## Runtime-gated tests: skip loudly, fail where required
 

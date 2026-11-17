@@ -1498,6 +1498,7 @@ mod tests {
                     &["info".into()],
                     std::time::Duration::from_secs(5),
                     &runtime.client_env(),
+                    None,
                 ));
             if probe.0 == Some(0) {
                 return Some(runtime);
@@ -1655,6 +1656,7 @@ mod tests {
                 &args,
                 std::time::Duration::from_secs(30),
                 &client_env,
+                None,
             ));
         assert_eq!(code, Some(0), "{output}");
         assert!(
@@ -1722,6 +1724,7 @@ mod tests {
                 &isolated_args,
                 std::time::Duration::from_secs(30),
                 &client_env,
+                None,
             ));
         assert_eq!(iso_code, Some(0), "{iso_output}");
         assert!(
