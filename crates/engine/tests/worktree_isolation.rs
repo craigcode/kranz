@@ -2280,9 +2280,14 @@ fn add_test_worktree(
     branch: &str,
 ) -> PathBuf {
     let path = base.join(name);
+    // The engine's own git calls ignore the machine's git configuration. A
+    // checkout that converted line endings under it would look modified to
+    // them, so this one converts nothing either.
     raw_git(
         root,
         &[
+            "-c",
+            "core.autocrlf=false",
             "worktree",
             "add",
             "-b",

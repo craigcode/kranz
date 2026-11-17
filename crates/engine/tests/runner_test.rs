@@ -61,8 +61,7 @@ fn assert_scratch_home_removed(scratch_root: &std::path::Path) {
     if kranz_engine::session_scratch::REMOVES_SCRATCH_HOMES {
         assert!(
             !scratch_root.exists(),
-            "the scratch home {} must be removed when its session ends",
-            scratch_root.display()
+            "the scratch home must be removed when its session ends"
         );
     } else {
         let _ = std::fs::remove_dir_all(scratch_root);

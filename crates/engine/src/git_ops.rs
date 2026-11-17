@@ -2250,14 +2250,17 @@ impl GitRepo {
         if !status.status.success() {
             return Ok(Some(failure_detail(&status)));
         }
-        let holds = status
+        let held: Vec<&[u8]> = status
             .stdout
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
-            .count();
-        if holds > 0 {
+            .collect();
+        if let Some(first) = held.first() {
+            let holds = held.len();
+            let first = String::from_utf8_lossy(first);
             return Ok(Some(format!(
-                "it holds {holds} modified, untracked or ignored path(s) that are in no commit"
+                "it holds {holds} modified, untracked or ignored path(s) that are in no commit; the first is `{}`",
+                first.trim_end_matches('\r')
             )));
         }
         let args: Vec<OsString> = vec![
