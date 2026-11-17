@@ -1108,6 +1108,26 @@ pub fn contract_env(base_sha: Option<&str>) -> HashMap<String, String> {
     env
 }
 
+/// Set the agent CLI's foreground shell-command limit on a worker or
+/// validator session from config `agentCommandTimeoutSecs` (ticket
+/// `worker-long-command-stall`, decision D-A). These are the Claude CLI's
+/// variables: `BASH_DEFAULT_TIMEOUT_MS` is the limit a command gets when the
+/// model names none, and the CLI moves a command that outlasts it to the
+/// background; `BASH_MAX_TIMEOUT_MS` is the most the model may ask for. Both
+/// carry the same value so the model cannot ask for less room than the
+/// operator configured and then lose the command. `0` sets neither.
+fn apply_agent_command_timeout(cfg: &MissionConfig, env: &mut HashMap<String, String>) {
+    let secs = cfg
+        .agent_command_timeout_secs
+        .unwrap_or(crate::types::DEFAULT_AGENT_COMMAND_TIMEOUT_SECS);
+    if secs == 0 {
+        return;
+    }
+    let millis = secs.saturating_mul(1000).to_string();
+    env.insert("BASH_DEFAULT_TIMEOUT_MS".to_string(), millis.clone());
+    env.insert("BASH_MAX_TIMEOUT_MS".to_string(), millis);
+}
+
 /// Run one worker session for a feature (plan §4.6).
 ///
 /// The rendered role prompt goes to `append_system_prompt`; the single-shot
@@ -1605,6 +1625,7 @@ async fn build_worker_spec(
         hook_status: None,
     };
     spec.env = contract_env(base_sha);
+    apply_agent_command_timeout(cfg, &mut spec.env);
     let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let real_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
     seed_worker_env(
@@ -2016,6 +2037,7 @@ pub async fn run_validator_in(
         hook_status: None,
     };
     spec.env = contract_env(base_sha);
+    apply_agent_command_timeout(cfg, &mut spec.env);
     spec.sandbox = match validator_sandbox {
         Some(mut resolved) => {
             // The orchestrator pre-resolved the mandatory containment wrap
@@ -2124,6 +2146,33 @@ fn apply_egress_grants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The foreground limit defaults to thirty minutes, follows config, and
+    /// `0` leaves the agent CLI's own limit alone.
+    #[test]
+    fn agent_command_timeout_sets_both_cli_limits_or_neither() {
+        let mut env = HashMap::new();
+        apply_agent_command_timeout(&MissionConfig::default(), &mut env);
+        assert_eq!(env["BASH_DEFAULT_TIMEOUT_MS"], "1800000");
+        assert_eq!(env["BASH_MAX_TIMEOUT_MS"], "1800000");
+
+        let mut env = HashMap::new();
+        let cfg = MissionConfig {
+            agent_command_timeout_secs: Some(900),
+            ..MissionConfig::default()
+        };
+        apply_agent_command_timeout(&cfg, &mut env);
+        assert_eq!(env["BASH_DEFAULT_TIMEOUT_MS"], "900000");
+        assert_eq!(env["BASH_MAX_TIMEOUT_MS"], "900000");
+
+        let mut env = HashMap::new();
+        let cfg = MissionConfig {
+            agent_command_timeout_secs: Some(0),
+            ..MissionConfig::default()
+        };
+        apply_agent_command_timeout(&cfg, &mut env);
+        assert!(env.is_empty());
+    }
 
     /// The Claude CLI's two notices match only at the start of a tool
     /// result, so a file that quotes them is not read as a notice.

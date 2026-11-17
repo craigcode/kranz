@@ -5,6 +5,11 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: worker and validator sessions on the Claude backend may keep a
+  shell command in the foreground for 30 minutes, up from the agent CLI's
+  two. A workspace test run that outlasted two minutes was moved to the
+  background, and the session then ended without its result. Config
+  `agentCommandTimeoutSecs` sets the limit; `0` restores the CLI's own.
 - Added: config `grantRequestTimeoutSecs` sets how long a parked grant
   request waits before it is denied by default. Without it the wait stays
   one hour. `kranz exec` now defaults to 300 seconds and takes

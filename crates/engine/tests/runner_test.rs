@@ -1352,6 +1352,11 @@ async fn run_worker_seeds_scratch_home_and_config_dir_worker_env_hygiene() {
         spec.env.get("KRANZ_BASE_SHA").map(String::as_str),
         Some(base_sha)
     );
+    // The foreground command limit reaches the worker session.
+    assert_eq!(
+        spec.env.get("BASH_DEFAULT_TIMEOUT_MS").map(String::as_str),
+        Some("1800000")
+    );
 
     // seed_worker_env relocates HOME only once the preflight has proven the
     // scratch env authenticates (mission m-165b6f, f-1-2). With an
@@ -1494,6 +1499,11 @@ async fn run_validator_builds_spec_permissions_and_parses_report() {
     assert!(
         !spec.env.contains_key("KRANZ_BASE_SHA"),
         "no base sha means no env var"
+    );
+    assert_eq!(
+        spec.env.get("BASH_MAX_TIMEOUT_MS").map(String::as_str),
+        Some("1800000"),
+        "the foreground command limit reaches validator sessions too"
     );
     assert!(
         !spec.env.contains_key("HOME") && !spec.env.contains_key("CLAUDE_CONFIG_DIR"),

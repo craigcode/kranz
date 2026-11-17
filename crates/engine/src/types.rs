@@ -1581,6 +1581,12 @@ pub struct RemoteWorkspaceConfig {
     pub idle_after_hours: Option<f64>,
 }
 
+/// Default for [`MissionConfig::agent_command_timeout_secs`]: thirty minutes.
+/// The Claude CLI's own foreground limit is two minutes, shorter than a
+/// workspace test run, and a command that outlasts it is moved to the
+/// background where a single-shot session cannot wait for it.
+pub const DEFAULT_AGENT_COMMAND_TIMEOUT_SECS: u64 = 1800;
+
 /// Default for [`MissionConfig::rubber_stamp_threshold_ms`] (ticket
 /// `rubber-stamp-grant-flag`): the docs/metrics.md §2 sub-ten-second bucket,
 /// made configurable. A grant APPROVED in under this latency is flagged as a
@@ -1777,6 +1783,15 @@ pub struct MissionConfig {
     /// always a denial: this key never approves anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_request_timeout_secs: Option<u64>,
+    /// How long a shell command a worker or validator runs may stay in the
+    /// foreground before the agent CLI moves it to the background, in
+    /// seconds (ticket `worker-long-command-stall`). Absent means
+    /// [`DEFAULT_AGENT_COMMAND_TIMEOUT_SECS`]; `0` leaves the agent CLI's own
+    /// limit in place. Honoured by the Claude CLI, which reads it as
+    /// `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`; other backends
+    /// ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_command_timeout_secs: Option<u64>,
 }
 
 impl Default for MissionConfig {
@@ -1870,6 +1885,7 @@ impl Default for MissionConfig {
             validator_allow_uncontained_degrade: false,
             local_backend_allowed_hosts: Vec::new(),
             grant_request_timeout_secs: None,
+            agent_command_timeout_secs: None,
         }
     }
 }
