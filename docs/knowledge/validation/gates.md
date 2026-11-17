@@ -338,10 +338,12 @@ refused if it lies inside the repository, the worktree, the mission directory,
 the contract scratch, the temp directory or any sandbox write root
 (`contract_shell.rs`).
 
-The AppContainer contract path stays on `cmd.exe`. Windows CI runs the receipt
-`windows_contract_shell_appcontainer_sh_receipt`, which tries Git's `sh` inside
-the unchanged AppContainer wrap and prints `KRANZ_WINDOWS_SH_CONTAINED=pass`
-or `KRANZ_WINDOWS_SH_CONTAINED=fail: <reason>`. The contained path can move to
+The AppContainer contract path stays on `cmd.exe`. The CLI's AppContainer
+normal-gate self test, which Windows CI runs, checks that path keeps inner
+double quotes, then tries Git's `sh` inside the unchanged AppContainer wrap
+and prints `KRANZ_WINDOWS_SH_CONTAINED=pass` or
+`KRANZ_WINDOWS_SH_CONTAINED=fail: <reason>` on stderr. The check lives in the
+self test because the AppContainer launcher is the `kranz` binary itself. The contained path can move to
 `sh` only after that line reads `pass`, as a separate change.
 
 `cmd.exe` receives the command as `/S /C "<command>"` with no escaping added,

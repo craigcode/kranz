@@ -282,25 +282,19 @@ jobs:
 
           gate_log="$RUNNER_TEMP/kranz-windows-appcontainer-gates.log"
           run_exact_test "$gate_log" cargo test -p kranz --test appcontainer_production_test windows_production_appcontainer_runs_normal_node_and_rust_gates_within_target -- --exact --nocapture
+          # The same self test checks the contract shell under the resolved
+          # posture: the contained lane stays cmd and keeps inner double
+          # quotes (required), and Git's sh is attempted and its outcome
+          # printed (recorded, never required). The contained lane's cmd
+          # default in crates/engine/src/contract_shell.rs is pinned on
+          # this line.
+          grep 'KRANZ_WINDOWS_SH_CONTAINED=' "$gate_log"
 
           session_log="$RUNNER_TEMP/kranz-windows-session-resolution.log"
           run_exact_test "$session_log" cargo test -p kranz-engine --lib sandbox::tests::windows_enforced_session_process_resolves_appcontainer_while_container_fails_closed -- --exact
 
           gate_log="$RUNNER_TEMP/kranz-windows-gate-resolution.log"
           run_exact_test "$gate_log" cargo test -p kranz-engine --lib command_exec::tests::windows_enforced_gate_process_resolves_appcontainer_while_container_fails_closed -- --exact
-
-          contract_cmd_log="$RUNNER_TEMP/kranz-windows-contract-shell-appcontainer-cmd.log"
-          run_exact_test "$contract_cmd_log" cargo test -p kranz-engine --lib command_exec::tests::windows_contract_shell_appcontainer_cmd_keeps_inner_double_quotes -- --exact --nocapture
-
-          # The CI receipt the contained Contract lane's cmd default is
-          # pinned on (crates/engine/src/contract_shell.rs select_shell): it
-          # asserts the production contained path stays cmd, and only
-          # attempts Git's sh under the same posture, recording — never
-          # requiring — whether that attempt succeeds.
-          sh_receipt_log="$RUNNER_TEMP/kranz-windows-contract-shell-appcontainer-sh-receipt.log"
-          run_exact_test "$sh_receipt_log" cargo test -p kranz-engine --lib command_exec::tests::windows_contract_shell_appcontainer_sh_receipt -- --exact --nocapture
-          grep -q 'KRANZ_WINDOWS_SH_CONTAINED=' "$sh_receipt_log"
-          grep 'KRANZ_WINDOWS_SH_CONTAINED=' "$sh_receipt_log"
       # M7 Linux live receipt: this is a real bwrap spawn, not argv inspection.
       # It proves a sibling write and host-network connection are denied,
       # retains seven interleaved warm Node timings, and verifies the tracked

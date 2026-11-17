@@ -4362,7 +4362,15 @@ mod tests {{
         &gate_env,
         &sandbox,
     )?;
+    eprintln!("gate self test: rust gate retired; checking the contract shell");
+    let contract_shell = contract_shell_receipt(
+        &worktree,
+        &[repo.clone(), mission.clone(), gate_home.clone()],
+        &gate_env,
+        &sandbox,
+    );
     sandbox.cleanup()?;
+    contract_shell?;
     let receipt = ProductionGateReceipt {
         host: crate::sandbox_windows::probe(),
         enforcement: "fs+net",
@@ -4380,6 +4388,101 @@ mod tests {{
         )));
     }
     Ok(rendered)
+}
+
+/// The contract-shell half of the normal-gate receipt, run through the same
+/// resolved posture as the timing samples. The launcher is this executable,
+/// so the check lives here and not in a library test.
+///
+/// It requires what production does today: the contained contract lane
+/// resolves to `cmd`, and `cmd` hands a command with inner double quotes to
+/// the child intact. It then only attempts Git's `sh` under the same posture
+/// and forbidden roots, adding no root, ACL, capability or PATH entry, and
+/// prints the outcome on stderr as the single `KRANZ_WINDOWS_SH_CONTAINED=`
+/// line CI reads. That attempt never fails the receipt:
+/// [`crate::contract_shell::select_shell`] keeps the contained lane on `cmd`
+/// until the line reads `pass`.
+fn contract_shell_receipt(
+    worktree: &Path,
+    roots: &[PathBuf],
+    env: &HashMap<String, String>,
+    sandbox: &crate::command_exec::GateSandbox,
+) -> Result<()> {
+    use crate::contract_shell::{HostShell, ShellKind, ShellLane};
+
+    let mut forbidden_roots = roots.to_vec();
+    forbidden_roots.push(worktree.to_path_buf());
+    forbidden_roots.push(std::env::temp_dir());
+    if let crate::command_exec::GateSandbox::AppContainer { inputs, .. } = sandbox {
+        forbidden_roots.extend(crate::sandbox::write_allowlist(inputs));
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            EngineError::Backend(format!("failed to create contract-shell runtime: {error}"))
+        })?;
+    let timeout = std::time::Duration::from_secs(60);
+
+    let shell =
+        crate::contract_shell::resolve_contract_shell(ShellLane::Contract, true, &forbidden_roots);
+    if shell.kind != ShellKind::Cmd {
+        return Err(EngineError::Backend(format!(
+            "the contained contract lane must resolve to cmd, got {}",
+            shell.label()
+        )));
+    }
+    let (code, output) = runtime.block_on(
+        crate::command_exec::run_contract_command_sandboxed_with_code(
+            worktree,
+            r#".\node.exe -e "process.stdout.write('KRANZ_QUOTES_OK')""#,
+            timeout,
+            env,
+            sandbox,
+            &shell,
+        ),
+    );
+    if code != Some(0) || !output.contains("KRANZ_QUOTES_OK") {
+        return Err(EngineError::Backend(format!(
+            "contained cmd lost the inner double quotes: exit {code:?}: {output:?}"
+        )));
+    }
+
+    let candidates = crate::contract_shell::git_for_windows_sh_candidates();
+    let outcome = match crate::contract_shell::posix_sh_resolution(&candidates, &forbidden_roots) {
+        None => Err("no Git for Windows sh.exe resolved outside every forbidden root".to_string()),
+        Some(program) => {
+            let sh = HostShell {
+                kind: ShellKind::Sh,
+                program,
+            };
+            let (code, output) = runtime.block_on(
+                crate::command_exec::run_contract_command_sandboxed_with_code(
+                    worktree,
+                    r#"printf '%s\n' "KRANZ_SH_CONTAINED_OK""#,
+                    timeout,
+                    env,
+                    sandbox,
+                    &sh,
+                ),
+            );
+            if code == Some(0) && output.contains("KRANZ_SH_CONTAINED_OK") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "sh did not run contained (code {code:?}): {output}"
+                ))
+            }
+        }
+    };
+    match outcome {
+        Ok(()) => eprintln!("KRANZ_WINDOWS_SH_CONTAINED=pass"),
+        Err(reason) => eprintln!(
+            "KRANZ_WINDOWS_SH_CONTAINED=fail: {}",
+            reason.replace(['\n', '\r'], " ")
+        ),
+    }
+    Ok(())
 }
 
 pub fn internal_gate_self_test_requested() -> bool {
