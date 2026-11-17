@@ -147,9 +147,9 @@ const INTERRUPT_POLL: Duration = Duration::from_millis(150);
 const DEFAULT_ORCH_STALL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Default deadline for an unanswered grant request before it fails closed
-/// (deny-default safety valve). Shrunk by tests via
-/// [`MissionEngine::set_grant_request_timeout`].
-const DEFAULT_GRANT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
+/// (deny-default safety valve). Config `grantRequestTimeoutSecs` replaces it;
+/// tests shrink it via [`MissionEngine::set_grant_request_timeout`].
+pub const DEFAULT_GRANT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Max grant requests one milestone's validation may raise per process run.
 /// Each approval extends `command_grants` and re-runs the validator, which can
@@ -366,8 +366,9 @@ pub struct MissionEngine {
     /// preflight session is spawned exactly once, not once per worker. `None`
     /// until the first call to [`Self::worker_auth_verdict`].
     worker_auth_verdict: Option<AuthVerdict>,
-    /// See [`DEFAULT_GRANT_REQUEST_TIMEOUT`]; shrunk by tests.
-    grant_request_timeout: Duration,
+    /// Test override of the grant-request wait; `None` reads the mission
+    /// config (see [`Self::grant_request_timeout`]).
+    grant_request_timeout_override: Option<Duration>,
     /// When the currently-parked grant request was raised, for the timeout →
     /// deny-default valve. Set alongside `pending_grant_request`, cleared when
     /// it resolves. Ephemeral: a restart re-arms the clock, but the parked
@@ -385,6 +386,14 @@ pub struct MissionEngine {
     /// budget earlier than intended — fail-safe (fails closed, never loops),
     /// the same trade-off as the cap counter.
     grant_respawns: HashMap<String, u32>,
+    /// Features whose worker run ended, not passing, after the agent CLI
+    /// moved one of its commands to the background (ticket
+    /// `worker-long-command-stall`). The first such run per feature is
+    /// credited against `max_respawns` like a grant re-run: the session was
+    /// lost waiting on its own command, which says nothing about the change.
+    /// One credit per feature, so the extra spend is bounded at one session.
+    /// Ephemeral, with the same restart trade-off as `grant_respawns`.
+    stall_respawns: std::collections::HashSet<String>,
     /// Ceiling on grant requests per milestone per run (default
     /// [`GRANT_REQUEST_CAP`]; shrunk by tests to exercise the cap boundary).
     grant_request_cap: u32,
@@ -565,10 +574,11 @@ impl MissionEngine {
             active_tree: None,
             primary_branch_at_start: None,
             worker_auth_verdict: None,
-            grant_request_timeout: DEFAULT_GRANT_REQUEST_TIMEOUT,
+            grant_request_timeout_override: None,
             grant_requested_at: None,
             grant_requests: HashMap::new(),
             grant_respawns: HashMap::new(),
+            stall_respawns: std::collections::HashSet::new(),
             grant_request_cap: GRANT_REQUEST_CAP,
             workspace_handle: None,
             workspace_provider: None,
@@ -707,10 +717,11 @@ impl MissionEngine {
             active_tree: None,
             primary_branch_at_start: None,
             worker_auth_verdict: None,
-            grant_request_timeout: DEFAULT_GRANT_REQUEST_TIMEOUT,
+            grant_request_timeout_override: None,
             grant_requested_at: None,
             grant_requests: HashMap::new(),
             grant_respawns: HashMap::new(),
+            stall_respawns: std::collections::HashSet::new(),
             grant_request_cap: GRANT_REQUEST_CAP,
             workspace_handle: None,
             workspace_provider: None,
@@ -781,7 +792,27 @@ impl MissionEngine {
     /// Shrink the grant-request timeout (tests exercise the timeout →
     /// deny-default path without waiting an hour).
     pub fn set_grant_request_timeout(&mut self, timeout: Duration) {
-        self.grant_request_timeout = timeout;
+        self.grant_request_timeout_override = Some(timeout);
+    }
+
+    /// Respawns of `feature_id` that do not count against `max_respawns`:
+    /// operator-decided deny-lift re-runs and the one credited stall.
+    fn respawn_credit(&self, feature_id: &str) -> u32 {
+        self.grant_respawns.get(feature_id).copied().unwrap_or(0)
+            + u32::from(self.stall_respawns.contains(feature_id))
+    }
+
+    /// How long a parked grant request waits before it is denied by default:
+    /// the test override, else config `grantRequestTimeoutSecs`, else
+    /// [`DEFAULT_GRANT_REQUEST_TIMEOUT`].
+    fn grant_request_timeout(&self) -> Duration {
+        self.grant_request_timeout_override.unwrap_or_else(|| {
+            self.state
+                .config
+                .grant_request_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_GRANT_REQUEST_TIMEOUT)
+        })
     }
 
     /// Shrink the per-milestone grant-request cap (tests exercise the
@@ -3006,13 +3037,28 @@ impl MissionEngine {
             if let Some(pending) = self.state.pending_grant_request.clone() {
                 // Arm the clock on first observation — also covers a restart
                 // that reloaded a durable pending request with no timestamp.
-                let requested_at = *self
-                    .grant_requested_at
-                    .get_or_insert_with(std::time::Instant::now);
-                if requested_at.elapsed() >= self.grant_request_timeout {
+                let wait = self.grant_request_timeout();
+                let requested_at = match self.grant_requested_at {
+                    Some(at) => at,
+                    None => {
+                        // Once per request: the operator may be at another
+                        // terminal, so say what is waiting, for how long, and
+                        // the command that answers it.
+                        eprintln!(
+                            "{}",
+                            grant_wait_notice(&self.state.mission.id, &pending, wait)
+                        );
+                        *self.grant_requested_at.insert(std::time::Instant::now())
+                    }
+                };
+                if requested_at.elapsed() >= wait {
                     self.deny_pending_grant(
                         &pending.command,
-                        "grant request timed out with no operator decision (deny-default)",
+                        &format!(
+                            "grant request timed out after {}s with no operator decision \
+                             (deny-default)",
+                            wait.as_secs()
+                        ),
                         None,
                         None,
                     )?;
@@ -3857,6 +3903,33 @@ impl MissionEngine {
                 }
             }
 
+            // Stall classification (ticket worker-long-command-stall): a run
+            // that did not pass after the agent CLI moved one of its commands
+            // to the background is recorded as its own kind of partial run.
+            // The stream never reports whether the command finished, so the
+            // record states only what was seen.
+            if outcome.result != RunResult::Pass {
+                if let Some(summary) = backgrounded_stall_summary(&feature.id, &outcome) {
+                    let credited = self.stall_respawns.insert(feature.id.clone());
+                    // The summary is bounded, so the budget effect leads and
+                    // the run's own sentence goes in the detail with the
+                    // commands.
+                    self.emit_decision(
+                        if credited {
+                            "worker run ended with its command moved to the background; not \
+                             counted against the respawn budget"
+                        } else {
+                            "worker run ended with its command moved to the background; the \
+                             feature's one stall credit is already spent"
+                        },
+                        Some(format!(
+                            "{summary}\n{}",
+                            outcome.backgrounded_commands.join("\n")
+                        )),
+                    )?;
+                }
+            }
+
             // Worker self-escalation (KRZ-331): record the worker's request
             // for the frontier advisor BEFORE the judgement turn — the
             // advisor act — consumes it from the same report.
@@ -3912,8 +3985,8 @@ impl MissionEngine {
                         Some(rendered.clone()),
                     )?;
                     let respawns = self.state.mission.milestones[mi].features[fi].respawns;
-                    let grant_respawns = *self.grant_respawns.get(&feature.id).unwrap_or(&0);
-                    if respawns.saturating_sub(grant_respawns) < self.state.config.max_respawns {
+                    let credit = self.respawn_credit(&feature.id);
+                    if respawns.saturating_sub(credit) < self.state.config.max_respawns {
                         guidance = Some(format!(
                             "The engine's feature-range secret scan found {} unwaived \
                              finding(s) in this feature's commits ({feature_base_sha}..HEAD), \
@@ -3974,11 +4047,12 @@ impl MissionEngine {
                 }
                 JudgementOutcome::Respawn(new_guidance) => {
                     let respawns = self.state.mission.milestones[mi].features[fi].respawns;
-                    // Don't let operator-approved deny-lift respawns eat the
-                    // failure-retry budget: subtract them so `max_respawns`
-                    // bounds only judgement-driven retries.
-                    let grant_respawns = *self.grant_respawns.get(&feature.id).unwrap_or(&0);
-                    if respawns.saturating_sub(grant_respawns) < self.state.config.max_respawns {
+                    // Don't let operator-approved deny-lift respawns or the
+                    // one credited stall eat the failure-retry budget:
+                    // subtract them so `max_respawns` bounds only
+                    // judgement-driven retries.
+                    let credit = self.respawn_credit(&feature.id);
+                    if respawns.saturating_sub(credit) < self.state.config.max_respawns {
                         guidance = Some(new_guidance);
                         continue;
                     }
@@ -7795,6 +7869,41 @@ impl MissionEngine {
     }
 }
 
+/// The decision summary for a worker run that ended, not passing, after the
+/// agent CLI moved a command to the background; `None` for every other run.
+fn backgrounded_stall_summary(feature_id: &str, outcome: &runner::RunOutcome) -> Option<String> {
+    let count = outcome.backgrounded_commands.len();
+    (count > 0).then(|| {
+        format!(
+            "run {} for {feature_id} ended {} after {count} command(s) were moved to the \
+             background, with no report of their result:",
+            outcome.run_id,
+            match outcome.result {
+                RunResult::Pass => "pass",
+                RunResult::Fail => "fail",
+                RunResult::Partial => "partial",
+            }
+        )
+    })
+}
+
+/// The one stderr line printed when a grant request starts waiting: what is
+/// parked, how long before it is denied by default, and the command that
+/// answers it. The target is model-authored, so controls are shown, not
+/// sent, and the answering command single-quotes it for a POSIX shell.
+fn grant_wait_notice(mission_id: &str, pending: &PendingGrantRequest, wait: Duration) -> String {
+    let target = crate::presentation::visible(&pending.command).replace('\n', " ");
+    let quoted = target.replace('\'', "'\\''");
+    format!(
+        "kranz: {:?} grant request `{target}` on {} is waiting for an operator; it is denied \
+         by default in {}s. Answer with: kranz grant approve {mission_id} '{quoted}' (or: \
+         kranz grant deny {mission_id} '{quoted}')",
+        pending.kind,
+        pending.milestone_id,
+        wait.as_secs()
+    )
+}
+
 fn validator_outcome_trusted(outcome: &runner::RunOutcome) -> bool {
     outcome.result == RunResult::Pass && outcome.validator_report.is_some()
 }
@@ -8482,6 +8591,24 @@ pub(crate) mod tests {
     use super::*;
     use crate::judgement::lesson_orch_script;
     use crate::preflight::DroidEnvGuard;
+
+    /// The wait notice names the request, the wait and the answering
+    /// command, and a quote in the target cannot end the quoted argument.
+    #[test]
+    fn grant_wait_notice_names_the_wait_and_the_answering_command() {
+        let pending = PendingGrantRequest {
+            milestone_id: "m1".to_string(),
+            kind: GrantKind::TouchPath,
+            command: "docs/it's here.md".to_string(),
+            request_seq: Some(7),
+        };
+        let notice = grant_wait_notice("m-abc123", &pending, Duration::from_secs(300));
+        assert!(notice.contains("TouchPath grant request `docs/it's here.md` on m1"));
+        assert!(notice.contains("denied by default in 300s"));
+        assert!(notice.contains(r"kranz grant approve m-abc123 'docs/it'\''s here.md'"));
+        assert!(notice.contains(r"kranz grant deny m-abc123 'docs/it'\''s here.md'"));
+        assert_eq!(notice.lines().count(), 1);
+    }
 
     /// Audit M2: a grant target that would be enforced as a pattern, or that
     /// displays as something other than its bytes, is never offered.
@@ -12462,6 +12589,7 @@ pub(crate) mod tests {
             denied_count: 0,
             denied_commands: vec![],
             denied_egress: vec![],
+            backgrounded_commands: vec![],
         };
 
         let validators_before = (
@@ -12648,6 +12776,7 @@ pub(crate) mod tests {
             denied_count: 0,
             denied_commands: vec![],
             denied_egress: vec![],
+            backgrounded_commands: vec![],
         }
     }
 
@@ -12667,6 +12796,7 @@ pub(crate) mod tests {
             denied_count: 0,
             denied_commands: vec![],
             denied_egress: vec![],
+            backgrounded_commands: vec![],
         }
     }
 

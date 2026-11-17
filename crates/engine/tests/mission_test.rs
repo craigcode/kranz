@@ -22,8 +22,8 @@ use kranz_engine::auth_verify::AuthVerdict;
 use kranz_engine::backend::{AgentBackend, PromptMode};
 use kranz_engine::backend_claude::parse_stream_line;
 use kranz_engine::backend_mock::{
-    mock_init, mock_result_error, mock_result_json, mock_result_text, mock_text, MockBackend,
-    MockScript,
+    mock_init, mock_result_error, mock_result_json, mock_result_text, mock_text, mock_tool_result,
+    mock_tool_use, MockBackend, MockScript,
 };
 use kranz_engine::control;
 use kranz_engine::cost;
@@ -4850,6 +4850,107 @@ async fn respawn_bounded_fails_feature_then_mission_continues() {
     )));
 }
 
+/// Worker script: the agent CLI moves the worker's test run to the
+/// background and the session ends partial without its result (ticket
+/// worker-long-command-stall).
+fn worker_stalled_on_backgrounded_command() -> MockScript {
+    let report = json!({
+        "result": "partial",
+        "summary": "the full test run was still going when the session ended",
+    });
+    MockScript {
+        events: vec![
+            mock_init("mock-session"),
+            mock_tool_use("Bash", "cargo test --workspace"),
+            mock_tool_result(
+                "Bash",
+                "Command did not complete within its 120s timeout and was moved to the \
+                 background (ID: b1). Output is being written to: /tmp/b1.output",
+            ),
+            mock_text("I'll wait for the background test run."),
+            mock_result_json(&report),
+        ],
+        ..Default::default()
+    }
+}
+
+/// Ticket worker-long-command-stall: a run that ends not passing after its
+/// command was moved to the background is recorded as its own kind of
+/// partial run, and the first one per feature is not counted against
+/// `max_respawns`. The credit is one per feature, so a feature that keeps
+/// stalling still fails closed, one session later than before.
+#[tokio::test(flavor = "multi_thread")]
+async fn backgrounded_command_stall_is_recorded_and_credited_once() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_stalled_on_backgrounded_command(), // f-1-1 attempt 1 (credited)
+        worker_stalled_on_backgrounded_command(), // attempt 2 (the allowed respawn)
+        worker_stalled_on_backgrounded_command(), // attempt 3 (bought by the credit)
+        worker_pass(),                            // f-1-2
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""), // f-1-2
+            no_lesson(),
+        ]),
+    ]));
+
+    let cfg = MissionConfig {
+        max_respawns: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(2, vec![])).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(ms.features[0].status, FeatureStatus::Failed);
+    assert_eq!(
+        ms.features[0].worker_runs.len(),
+        3,
+        "max_respawns 1 plus exactly one stall credit"
+    );
+    assert_eq!(ms.features[1].status, FeatureStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let stall_decisions: Vec<(&str, Option<&str>)> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::OrchestratorDecision { summary, detail }
+                if summary.contains("command moved to the background") =>
+            {
+                Some((summary.as_str(), detail.as_deref()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stall_decisions.len(), 3, "one record per stalled run");
+    assert!(stall_decisions[0]
+        .0
+        .contains("not counted against the respawn budget"));
+    let detail = stall_decisions[0].1.expect("the record carries a detail");
+    assert!(detail.contains("for f-1-1 ended partial after 1 command(s)"));
+    assert!(detail.ends_with("\ncargo test --workspace"), "{detail}");
+    for later in &stall_decisions[1..] {
+        assert!(later.0.contains("already spent"), "{}", later.0);
+    }
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::FeatureFailed { feature_id, reason, .. }
+            if feature_id == "f-1-1" && reason.contains("respawn budget exhausted")
+    )));
+}
+
 /// Ticket worker-spawn-auth-failure-budget: a worker whose backend CLI dies
 /// in seconds with an auth signature is an INFRASTRUCTURE failure — it must
 /// NOT consume the respawn budget or fail the feature. The milestone blocks
@@ -5272,6 +5373,48 @@ async fn unanswered_grant_request_times_out_to_denied() {
         EventKind::GrantDenied { reason, .. } if reason.contains("timed out"))));
     let state = reducer::fold(&events).unwrap();
     assert!(state.mission.command_grants.is_empty());
+}
+
+/// Config `grantRequestTimeoutSecs` sets the wait with no test override, and
+/// the denial reason states it (ticket `headless-grant-request-fails-fast`).
+#[tokio::test]
+async fn configured_grant_wait_denies_and_names_the_wait() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "gc audit --deep";
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
+        validator_denied(denied_cmd),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        grant_request_timeout_secs: Some(0),
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert!(
+        events.iter().any(|e| matches!(&e.kind,
+            EventKind::GrantDenied { reason, .. } if reason.contains("timed out after 0s"))),
+        "the denial must state the configured wait: {:?}",
+        event_types(&events)
+    );
+    assert!(event_types(&events).contains(&"milestone.blocked"));
 }
 
 /// An incidental command denial on a validator that STILL produced a trusted

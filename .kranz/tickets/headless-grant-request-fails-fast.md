@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: Config grantRequestTimeoutSecs (absent keeps one hour); kranz exec defaults to 300s with --grant-wait; one stderr line per request names the wait and the answering command; the denial reason states the wait. Outcome is still deny-default.
 title: Deny a grant request quickly when no operator can answer it
 priority: 2
 schedule: once
