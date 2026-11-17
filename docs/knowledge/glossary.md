@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-16
+last_verified: 2026-11-17
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-17 (UTC) against the grant wait and stall record in `types.rs` and `orchestrator.rs`. A respawn still re-runs a failed worker; the first run per feature that ends with its command moved to the background is not counted against `maxRespawns`. No term changed.
 
 Rechecked 2026-11-16 (UTC) against the Windows lock probe in `event_log.rs`. No term changed.
 

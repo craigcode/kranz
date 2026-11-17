@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-16
+last_verified: 2026-11-17
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-17 (UTC) against the grant wait and stall record in `types.rs`, `orchestrator.rs` and `runner.rs`: `MissionConfig` gains one optional `#[serde(default)]` key, `grantRequestTimeoutSecs`, and no event changed, so the contract files stay additive. An unanswered grant request is still denied by default; only the length of the wait is configurable. No invariant changed.
 
 Rechecked 2026-11-16 (UTC) against the Windows first-run fixes: the lock probe on Windows reports Dead only when no process has the pid or the process has exited, and any other failure stays Unknown, so the rule that uncertainty never reports Dead holds. A steal there is serialized by a named mutex. The review packet's new JSON fields are observations and grant nothing. `kranz exec` still pushes only through `--push`. No invariant changed.
 

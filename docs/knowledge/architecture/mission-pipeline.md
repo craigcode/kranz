@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-16
+last_verified: 2026-11-17
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -41,7 +41,7 @@ verified_against:
   - docs/design.md
 ---
 
-Rechecked 2026-11-16 (UTC) against the grant wait and stall record: the wait before a parked grant request is denied by default comes from config `grantRequestTimeoutSecs` (absent keeps one hour; `kranz exec` substitutes 300 seconds unless `--grant-wait` or the config key says otherwise), the engine prints one stderr line per request naming the wait and the answering command, and the denial reason states the wait. A worker run that ends without passing after the agent CLI moved one of its commands to the background is recorded as an `orchestrator.decision`, and the first such run per feature is not counted against `maxRespawns` (`docs/scoping/worker-long-command-stall.md`). Pipeline stages, their order and the event schema are unchanged.
+Rechecked 2026-11-17 (UTC) against the grant wait and stall record: the wait before a parked grant request is denied by default comes from config `grantRequestTimeoutSecs` (absent keeps one hour; `kranz exec` substitutes 300 seconds unless `--grant-wait` or the config key says otherwise), the engine prints one stderr line per request naming the wait and the answering command, and the denial reason states the wait. A worker run that ends without passing after the agent CLI moved one of its commands to the background is recorded as an `orchestrator.decision`, and the first such run per feature is not counted against `maxRespawns` (`docs/scoping/worker-long-command-stall.md`). Pipeline stages, their order and the event schema are unchanged.
 
 Rechecked 2026-11-16 (UTC) against the Windows first-run fixes: the event-log lock now probes its holder on Windows (`OpenProcess`, with the process creation time as the identity token) and serializes a steal under a named mutex, so a dead holder is taken over there as on Unix. `kranz exec` checks the AppContainer host preparation before it creates a mission and prints its stdout line with status `ERROR` when the run errors. The review packet JSON gains `schemaVersion`, `missionStatus` and `nativeChecks`. The queue change is a comment. The pipeline and the single-writer rule are unchanged.
 
