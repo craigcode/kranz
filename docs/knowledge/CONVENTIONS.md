@@ -45,6 +45,24 @@ verified_against:
   invalid citations, and failed Git/filesystem probes are check-needed rather
   than silently treated as current.
 
+## Who may change a note
+
+- **`agent` and `mixed` notes:** an agent may edit and re-date them, grounding
+  every claim as above.
+- **`human` notes** hold intent the operator owns, such as the containment
+  policy. An agent may re-date one, and add a dated `Rechecked ... (UTC)` line
+  at the top of its body, only when all of these hold:
+  - it has read the change to the cited files against the note;
+  - the change alters nothing the note states;
+  - the recheck line says what changed and that the note did not.
+- An agent never edits the body of a `human` note: its rules, claims or
+  examples. If a change makes such a note wrong or incomplete, the agent stops
+  and asks the operator.
+- The operator reviews recheck lines on `human` notes as part of the pull
+  request that adds them.
+
+This rule was set by the operator on 2026-11-18.
+
 ## Body
 
 - Use ordinary Markdown links for cross-references (e.g.

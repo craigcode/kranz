@@ -3030,7 +3030,10 @@ mod tests {
         // A unix socket path is capped near 104 bytes on macOS. A long
         // TMPDIR (a gate's scratch home) would fail the bind, which is not
         // the property under test, so long temp roots fall back to /tmp.
+        // Measure the canonical path: the socket is bound under it, so a
+        // short symlink to a long directory must not pass the check.
         let base = std::env::temp_dir();
+        let base = base.canonicalize().unwrap_or(base);
         let base = if base.as_os_str().len() > 60 {
             PathBuf::from("/tmp")
         } else {
