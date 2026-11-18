@@ -1,6 +1,6 @@
 ---
 state: done
-state-note: Cause confirmed from an event log and recorded in docs/scoping/worker-long-command-stall.md with the operator decision. Built: stalled runs are recorded as their own orchestrator.decision and the first per feature is not counted against maxRespawns. Not built, left open in the note: setting the agent CLI foreground command limit from worker config.
+state-note: Cause confirmed from an event log and recorded in docs/scoping/worker-long-command-stall.md with the operator decision. Built: stalled runs are recorded as their own orchestrator.decision and the first per feature is not counted against maxRespawns. Also built after the operator decided it: config agentCommandTimeoutSecs sets the agent CLI foreground command limit (default 1800s) on worker and validator sessions.
 title: Stop worker sessions ending while a long gate command is still running
 priority: 2
 schedule: once
