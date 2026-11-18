@@ -13,6 +13,7 @@
 - [ ] Change is focused and includes regression coverage where appropriate.
 - [ ] Persisted event/config changes are additive and backward compatible.
 - [ ] No credentials, personal paths, raw transcripts, or workstation inventory are committed.
+- [ ] Outside contributions: every commit is signed off (`git commit -s`); see CONTRIBUTING.md.
 - [ ] Rust workspace gates pass.
 - [ ] Dashboard/Tauri gates pass when those surfaces changed.
 - [ ] Documentation and release notes are updated for user-visible behavior.
