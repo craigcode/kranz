@@ -2,7 +2,7 @@
 title: Child containment (children are hostile by default)
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-17
+last_verified: 2026-11-18
 verified_against:
   - AGENTS.md
   - crates/engine/src/agent_env.rs
@@ -16,6 +16,8 @@ verified_against:
   - crates/engine/src/validator_snapshot.rs
   - docs/acp-containment.md
 ---
+
+Rechecked 2026-11-18 (UTC) by an agent under the human-note rule in `CONVENTIONS.md`: `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`, and the macOS test `sandbox_fs_tier_reaches_only_its_own_unix_sockets` in `sandbox.rs` now measures the canonical temp path before its socket-length check, so a short symlink to a long directory no longer makes the bind fail. Test code only. No containment rule, sandbox profile or gate signal policy changed, and nothing this note states changed.
 
 Rechecked 2026-11-17 (UTC) against a test move in `command_exec.rs`, `appcontainer_windows.rs` and `.github/workflows/ci.yml`: the contained contract-shell checks (the `cmd.exe` quoting check and the Git `sh` attempt that prints `KRANZ_WINDOWS_SH_CONTAINED=`) now run inside the CLI's AppContainer normal-gate self test, because the AppContainer launcher is the `kranz` binary itself. No shell selection, containment rule or gate behaviour changed.
 

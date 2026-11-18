@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-17
+last_verified: 2026-11-18
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -63,6 +63,8 @@ verified_against:
   - docs/tickets.md
   - crates/engine/src/git_ops.rs
 ---
+
+Rechecked 2026-11-18 (UTC) against `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`, the same check CI runs. No gate changed.
 
 Rechecked 2026-11-17 (UTC) against the npm advisory check in `.github/workflows/ci.yml`: the dashboard and Even G2 jobs run `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`. High and critical advisories still fail; the script carries a dated list of waived advisory ids, which never applies to a dependency that ships. No mission gate changed.
 
