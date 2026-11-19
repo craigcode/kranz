@@ -6697,9 +6697,8 @@ impl MissionEngine {
         // is diverted here instead of becoming a blocking validation.finding.
         // It never reaches `convert_findings`: no fix feature, no fix-cycle
         // bump, no milestone block before the assertion's own milestone.
-        let (due_findings, notdue_findings) = findings
-            .into_iter()
-            .partition::<Vec<_>, _>(|(_, finding)| {
+        let (due_findings, notdue_findings) =
+            findings.into_iter().partition::<Vec<_>, _>(|(_, finding)| {
                 !notdue_due_milestone.contains_key(finding.subject.trim())
             });
         let findings = due_findings;
