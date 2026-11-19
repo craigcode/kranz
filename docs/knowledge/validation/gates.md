@@ -2,8 +2,9 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-18
+last_verified: 2026-11-19
 verified_against:
+  - crates/engine/src/contract_scope.rs
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
@@ -63,6 +64,13 @@ verified_against:
   - docs/tickets.md
   - crates/engine/src/git_ops.rs
 ---
+
+Rechecked 2026-11-19 (UTC): added the "Milestone-scoped assertions" section
+below, describing `contract_scope.rs`'s due-at rule — an assertion may name a
+plan milestone, approval/revision refuse an unknown or ambiguous title and
+revisions may not change it, a not-yet-due assertion still runs each round
+but is recorded via `validation.assertion.notdue`/`validation.finding.notdue`
+instead of blocking, and the final gate runs every assertion regardless.
 
 Rechecked 2026-11-18 (UTC) against `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`, the same check CI runs. No gate changed.
 
@@ -508,6 +516,34 @@ failing-command evidence attached, spending no fix cycle. The guard in
 `convert_findings` honors this verdict only for findings whose
 `class == "command-assertion"`; a mislabelled non-command finding falls
 through to the normal fix/waive handling.
+
+## Milestone-scoped assertions
+
+A contract `command` or `pty_script` assertion may carry `milestone`, naming
+a plan milestone title ([`contract_scope.rs`](../../../crates/engine/src/contract_scope.rs),
+matched via `norm_title` after trimming and ignoring case). `approve_plan`
+refuses a plan whose contract names an unknown or ambiguous milestone title,
+naming the offending assertion's id in the error; the same check runs on
+every plan revision, and a revision may not change an assertion's
+`milestone` field once approved. An unscoped assertion (`milestone: None`)
+behaves exactly as before this feature.
+
+At validation round `round_index` (0-based, aligned to milestone position),
+an assertion is **due** when it is unscoped, or when its named milestone is
+at or before that round; otherwise it is **not yet due**. A not-yet-due
+assertion still runs every round — engine-side, exactly like a due one — but
+its result is recorded as a `validation.assertion.notdue` event instead of
+feeding the validators' evidence or `contract_results`, so a failure there
+cannot become a blocking finding before the assertion's own milestone. A
+validator finding whose `subject` names a not-yet-due assertion is diverted
+to a `validation.finding.notdue` event instead of `validation.finding`: it
+never reaches `convert_findings`, so it raises no fix feature, no fix-cycle
+bump and no milestone block. Both events are additive and record-only;
+pre-field logs simply never scoped a contract to milestones.
+
+Final-gate judgement (below) is unaffected by due-at scoping: it runs every
+`command` and `agent-judgement` assertion in the approved
+`validation_contract`, due or not, exactly as it always has.
 
 ## What a validator is allowed to run
 

@@ -2,8 +2,9 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-18
+last_verified: 2026-11-19
 verified_against:
+  - crates/engine/src/contract_scope.rs
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
   - crates/engine/src/acp_terminal.rs
@@ -36,6 +37,12 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-19 (UTC) against `contract_scope.rs`, `orchestrator.rs` and
+`types.rs`: `Assertion` gains one optional, additive `milestone` field, and
+not-yet-due command/pty results and findings are recorded via two new
+record-only event kinds instead of reaching `contract_results` or
+`convert_findings`. No invariant changed.
 
 Rechecked 2026-11-18 (UTC) against two small changes: `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`, and a test in `sandbox.rs` measures the canonical temp path for its unix-socket length guard. No invariant changed.
 

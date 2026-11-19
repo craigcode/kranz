@@ -2,8 +2,9 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-17
+last_verified: 2026-11-19
 verified_against:
+  - crates/engine/src/contract_scope.rs
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
@@ -40,6 +41,12 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-19 (UTC) against `contract_scope.rs`: `validation_round` now
+notes that a contract assertion may be scoped to a plan milestone, and that a
+not-yet-due assertion still runs each round but is recorded record-only
+rather than blocking. Pipeline stages, their order and the event schema are
+otherwise unchanged.
 
 Rechecked 2026-11-17 (UTC) against the foreground command limit in `runner.rs` and `types.rs`: worker and validator session specs now carry `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`, set from config `agentCommandTimeoutSecs` (absent means 1800 seconds, `0` sets neither), so the Claude CLI keeps a long command in the foreground instead of moving it to the background after two minutes. Pipeline stages, their order and the event schema are unchanged.
 
@@ -319,7 +326,11 @@ recorded in the [contract change](../../reviews/2026-09-05-feature-progress-cont
 `validation_round` runs scrutiny + functional validators (skippable only when
 the approved policy permits) plus a deterministic out-of-contract-write sweep,
 converts findings to fix-features or waives them (blocking at
-`max_fix_cycles_per_milestone`);
+`max_fix_cycles_per_milestone`). A contract assertion may name the plan
+milestone that must satisfy it; a round still runs an assertion not yet due
+by that round, but records its result and any citing finding record-only
+(`validation.assertion.notdue` / `validation.finding.notdue`) instead of
+letting it block — see [milestone-scoped assertions](../validation/gates.md#milestone-scoped-assertions).
 `final_gate` fails an empty deliverable outright, runs `check:"command"`
 assertions itself and sends `agent-judgement` assertions to the orchestrator
 against the `base_sha..HEAD` diff. Roles: `Orchestrator`, `Worker`,
