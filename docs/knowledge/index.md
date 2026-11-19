@@ -2,7 +2,7 @@
 title: Kranz knowledge vault — index
 owner: mixed
 freshness: live
-last_verified: 2026-11-16
+last_verified: 2026-11-18
 verified_against:
   - docs/scoping/repo-knowledge-store.md
   - crates/engine/src/knowledge.rs
@@ -10,6 +10,8 @@ verified_against:
   - docs/knowledge/decisions/skill-capture-boundary.md
   - .kranz/tickets/repo-knowledge-refresh-drift.md
 ---
+
+Rechecked 2026-11-18 (UTC) against `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`, and `CONVENTIONS.md`, which now says who may change a note. The map is unchanged.
 
 Rechecked 2026-11-16 (UTC) against the skill capture note's recheck: no note was added, moved or retitled, so the map is unchanged.
 

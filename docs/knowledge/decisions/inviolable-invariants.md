@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-17
+last_verified: 2026-11-18
 verified_against:
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -36,6 +36,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-18 (UTC) against two small changes: `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`, and a test in `sandbox.rs` measures the canonical temp path for its unix-socket length guard. No invariant changed.
 
 Rechecked 2026-11-17 (UTC) against the grant wait and stall record in `types.rs`, `orchestrator.rs` and `runner.rs`: `MissionConfig` gains one optional `#[serde(default)]` key, `grantRequestTimeoutSecs`, and no event changed, so the contract files stay additive. An unanswered grant request is still denied by default; only the length of the wait is configurable. No invariant changed.
 
