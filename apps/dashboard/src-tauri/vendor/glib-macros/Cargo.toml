@@ -31,7 +31,7 @@ repository = "https://github.com/gtk-rs/gtk-rs-core"
 proc-macro = true
 
 [dependencies.heck]
-version = "0.4"
+version = "0.5"
 
 [dependencies.proc-macro-crate]
 version = "2.0"
