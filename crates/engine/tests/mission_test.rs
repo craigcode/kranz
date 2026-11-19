@@ -584,6 +584,93 @@ fn seq_of(events: &[Event], type_name: &str) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// 0. Due-at rule: approval refuses plans naming unknown/ambiguous milestones
+// ---------------------------------------------------------------------------
+
+/// `approve_plan` refuses a plan whose assertion names a milestone title
+/// that matches no plan milestone; the mission stays in Planning and no
+/// `plan.approved` event is emitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn assertion_due_approval_refuses_unknown_milestone() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let mut scoped = assertion("a-scope", "the build passes", None);
+    scoped.milestone = Some("Nope".to_string());
+    let contract = vec![scoped];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    let err = engine
+        .approve_plan(simple_plan(1, contract))
+        .expect_err("unknown milestone must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("a-scope"),
+        "error should name the assertion: {msg}"
+    );
+
+    assert_eq!(engine.state().mission.status, MissionStatus::Planning);
+}
+
+/// `approve_plan` accepts a plan whose assertion names a known milestone
+/// title (matched case-insensitively), and the persisted contract keeps the
+/// `milestone` field.
+#[tokio::test(flavor = "multi_thread")]
+async fn assertion_due_approval_accepts_known_milestone() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let mut scoped = assertion("a-scope", "the build passes", None);
+    scoped.milestone = Some("SECOND MILESTONE".to_string());
+    let contract = vec![scoped];
+
+    let plan = Plan {
+        goal: GOAL.to_string(),
+        validation_contract: contract,
+        milestones: vec![
+            PlanMilestone {
+                title: "First Milestone".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 1".to_string(),
+                    spec: "build part 1".to_string(),
+                    validation_criteria: vec!["part 1 works".to_string()],
+                }],
+            },
+            PlanMilestone {
+                title: "second milestone".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 2".to_string(),
+                    spec: "build part 2".to_string(),
+                    validation_criteria: vec!["part 2 works".to_string()],
+                }],
+            },
+        ],
+        considered_alternatives: None,
+        command_grants: vec![],
+        touch_set: vec![],
+        standards_manifest: None,
+        reviewer_independence: None,
+    };
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(plan).unwrap();
+
+    assert_eq!(
+        engine.state().mission.validation_contract[0]
+            .milestone
+            .as_deref(),
+        Some("SECOND MILESTONE")
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 1. Happy path: plan → features → validation → tag → final gate → complete
 // ---------------------------------------------------------------------------
 
