@@ -32,6 +32,7 @@ pub mod command_exec;
 pub mod comparison_metrics;
 pub mod config;
 pub mod container_egress;
+pub(crate) mod contract_scope;
 pub mod contract_controls;
 pub mod contract_gates;
 pub mod contract_health;

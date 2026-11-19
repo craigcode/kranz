@@ -1338,6 +1338,12 @@ impl MissionEngine {
                 empty.title
             )));
         }
+        let milestone_titles: Vec<&str> = plan.milestones.iter().map(|m| m.title.as_str()).collect();
+        crate::contract_scope::validate_milestone_refs(
+            &plan.validation_contract,
+            &milestone_titles,
+            "plan",
+        )?;
         crate::contract_controls::validate(&plan.validation_contract)?;
 
         // Resolve the moving base branch exactly once, before any base-owned
