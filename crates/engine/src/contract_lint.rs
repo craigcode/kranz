@@ -390,6 +390,7 @@ mod tests {
             statement: format!("statement for {id}"),
             check: AssertionCheck::Command,
             command: Some(command.to_string()),
+            milestone: None,
             negative_control: None,
             pty_script: None,
         }
@@ -401,6 +402,7 @@ mod tests {
             statement: format!("statement for {id}"),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            milestone: None,
             negative_control: None,
             pty_script: None,
         }
@@ -463,6 +465,7 @@ mod tests {
             statement: "s".into(),
             check: AssertionCheck::Command,
             command: Some(cmd.into()),
+            milestone: None,
             negative_control: None,
             pty_script: None,
         };

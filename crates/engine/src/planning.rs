@@ -841,6 +841,7 @@ mod tests {
             statement: "s".to_string(),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            milestone: None,
             pty_script: None,
             negative_control: None,
         }
@@ -965,6 +966,7 @@ mod tests {
                 statement: "s".into(),
                 check: AssertionCheck::Command,
                 command: Some("true".into()),
+                milestone: None,
                 pty_script: None,
                 negative_control: None,
             }],

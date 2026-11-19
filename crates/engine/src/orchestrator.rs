@@ -11185,6 +11185,7 @@ pub(crate) mod tests {
             statement: "the worker report and denied egress prove the runtime boundary".to_string(),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            milestone: None,
             pty_script: None,
             negative_control: None,
         }];
@@ -11994,6 +11995,7 @@ pub(crate) mod tests {
             statement: "s".to_string(),
             check: AssertionCheck::PtyScript,
             command: None,
+            milestone: None,
             pty_script: Some(PtyScript {
                 command: "./repl".to_string(),
                 steps: Vec::new(),
@@ -12009,6 +12011,7 @@ pub(crate) mod tests {
                 statement: "s".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("true".to_string()),
+                milestone: None,
                 pty_script: None,
                 negative_control: None,
             },
@@ -12133,6 +12136,7 @@ pub(crate) mod tests {
             statement: "the build passes".to_string(),
             check: AssertionCheck::Command,
             command: Some("true".to_string()),
+            milestone: None,
             pty_script: None,
             negative_control: None,
         }];
@@ -12254,6 +12258,7 @@ pub(crate) mod tests {
             statement: "the diff reads correct".to_string(),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            milestone: None,
             pty_script: None,
             negative_control: None,
         }];
@@ -16744,6 +16749,7 @@ pub(crate) mod tests {
                 statement: "the pinned base is x".to_string(),
                 check: AssertionCheck::Command,
                 command: Some(r#"test "$KRANZ_BASE_SHA" = x"#.to_string()),
+                milestone: None,
                 negative_control: None,
                 pty_script: None,
             }],
@@ -16828,6 +16834,7 @@ pub(crate) mod tests {
             statement: "exits zero".to_string(),
             check: AssertionCheck::Command,
             command: Some("exit 0".to_string()),
+            milestone: None,
             negative_control: None,
             pty_script: None,
         }];

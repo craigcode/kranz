@@ -101,6 +101,7 @@ fn sample_plan() -> Plan {
             statement: "tests pass".to_string(),
             check: AssertionCheck::Command,
             command: Some("cargo test".to_string()),
+            milestone: None,
             negative_control: None,
             pty_script: None,
         }],
