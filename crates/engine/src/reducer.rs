@@ -461,6 +461,31 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             milestone_mut(state, milestone_id)?;
         }
 
+        EventKind::ValidationAssertionNotDue { milestone_id, .. } => {
+            // Audit-only record (contract-scope due-at rule): a not-yet-due
+            // assertion's result never drives a state transition — only its
+            // own milestone can act on it, later. Validate the milestone
+            // reference as a corruption guard only (mirrors
+            // validation.pty.transcript).
+            milestone_mut(state, milestone_id)?;
+        }
+
+        EventKind::ValidationFindingNotDue {
+            milestone_id,
+            run_id,
+            ..
+        } => {
+            // Audit-only record: a finding diverted from validation.finding
+            // because its subject named a not-yet-due assertion. No fix
+            // feature, no fix-cycle bump — those only ever follow
+            // validation.finding. Validate references as a corruption
+            // guard (mirrors validation.finding).
+            milestone_mut(state, milestone_id)?;
+            if run_id != ENGINE_RUN_ID {
+                run_mut(state, run_id)?;
+            }
+        }
+
         EventKind::GateResult { .. } => {
             // Audit-only record (KRZ-312): one gate evaluation — id, ladder
             // position, verdict, artefact handle. Gate results drive no

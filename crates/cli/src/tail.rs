@@ -479,6 +479,36 @@ impl EventRenderer {
                     }
                 ),
             ),
+            EventKind::ValidationAssertionNotDue {
+                milestone_id,
+                assertion_id,
+                due_milestone_id,
+                verdict,
+                ..
+            } => (
+                format!("milestone {milestone_id}"),
+                ansi::DIM,
+                format!(
+                    "not-due assertion [{assertion_id}] {} (due at milestone {due_milestone_id})",
+                    match verdict {
+                        kranz_engine::gate::GateVerdict::Pass => "PASS",
+                        kranz_engine::gate::GateVerdict::Fail => "FAIL",
+                    }
+                ),
+            ),
+            EventKind::ValidationFindingNotDue {
+                milestone_id,
+                due_milestone_id,
+                finding,
+                ..
+            } => (
+                format!("milestone {milestone_id}"),
+                ansi::DIM,
+                format!(
+                    "not-due finding [{}] {}: {} (due at milestone {due_milestone_id})",
+                    finding.severity, finding.subject, finding.evidence
+                ),
+            ),
             EventKind::GateResult {
                 gate,
                 surface,

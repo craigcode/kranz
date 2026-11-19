@@ -5993,6 +5993,45 @@ impl MissionEngine {
         Some(rendered)
     }
 
+    /// Run a NOT-YET-DUE contract's command assertions engine-side with the
+    /// exact same env/sandbox/shell/timeout the due commands run under
+    /// (contract-scope due-at rule, module [`crate::contract_scope`]), but
+    /// return per-assertion verdicts instead of a rendered evidence block:
+    /// a not-due result never joins `contract_results`, it only feeds the
+    /// round's `validation.assertion.notdue` events.
+    async fn run_contract_commands_notdue(
+        contract: &[Assertion],
+        root: &std::path::Path,
+        env: &HashMap<String, String>,
+        sandbox: &crate::command_exec::GateSandbox,
+        shell: &crate::contract_shell::HostShell,
+    ) -> Vec<(String, bool, String)> {
+        let command_assertions: Vec<(String, Option<String>)> = contract
+            .iter()
+            .filter(|a| a.check == AssertionCheck::Command)
+            .map(|a| (a.id.clone(), a.command.clone()))
+            .collect();
+        let mut results = Vec::new();
+        for (id, command) in command_assertions {
+            match command.as_deref() {
+                Some(command) => {
+                    let (ok, output) = crate::command_exec::run_contract_command_sandboxed(
+                        root, command, env, sandbox, shell,
+                    )
+                    .await;
+                    let detail = crate::presentation::fence_command_output(&scrub::scrub(&output));
+                    results.push((id, ok, detail));
+                }
+                None => results.push((
+                    id,
+                    false,
+                    "(check=command but no command — cannot run)".to_string(),
+                )),
+            }
+        }
+        results
+    }
+
     /// Called for the resolved primary, retry and confirmation before any
     /// validator snapshot or paid session. The approved pin, not live config,
     /// selects which roles must satisfy the requirement.
@@ -6068,6 +6107,33 @@ impl MissionEngine {
             roles.push(Role::ValidatorFunctional);
         }
 
+        // Contract-scope due-at rule (module `crate::contract_scope`): hold
+        // this round to only the assertions due by it. An unscoped plan (no
+        // assertion names a milestone) partitions with everything due —
+        // byte-for-byte today's behavior.
+        let milestone_titles: Vec<&str> = self
+            .state
+            .mission
+            .milestones
+            .iter()
+            .map(|m| m.title.as_str())
+            .collect();
+        let (due_contract, not_due_contract): (Vec<Assertion>, Vec<Assertion>) = self
+            .state
+            .mission
+            .validation_contract
+            .iter()
+            .cloned()
+            .partition(|a| crate::contract_scope::is_due(a, &milestone_titles, mi));
+        let notdue_due_milestone: HashMap<String, String> = not_due_contract
+            .iter()
+            .map(|a| {
+                let idx = crate::contract_scope::due_index(a, &milestone_titles)
+                    .expect("a not-due assertion must resolve to exactly one milestone");
+                (a.id.clone(), self.state.mission.milestones[idx].id.clone())
+            })
+            .collect();
+
         let mut findings: Vec<(String, Finding)> = Vec::new();
 
         // Engine-run contract commands (validator repair 3/5): executed once
@@ -6075,7 +6141,7 @@ impl MissionEngine {
         // contract env — and handed to the functional validator as
         // authoritative evidence.
         let contract_results = if roles.contains(&Role::ValidatorFunctional) {
-            let contract = self.state.mission.validation_contract.clone();
+            let contract = due_contract.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let root = self.active_root().to_path_buf();
             let env = self.contract_command_env(base_sha.as_deref())?;
@@ -6166,6 +6232,88 @@ impl MissionEngine {
                 (base, None) => base,
                 (None, pty) => pty,
             };
+
+            // Not-yet-due assertions (contract-scope due-at rule): run with
+            // the exact same env/sandbox/shell/timeout as the due ones, so
+            // the result is no less real — but it never joins
+            // `contract_results` and is recorded only as
+            // `validation.assertion.notdue`, never a blocking finding.
+            if !not_due_contract.is_empty() {
+                let notdue_commands = Self::run_contract_commands_notdue(
+                    &not_due_contract,
+                    &root,
+                    &env,
+                    &gate_sandbox,
+                    &shell,
+                )
+                .await;
+                for (assertion_id, ok, detail) in notdue_commands {
+                    let due_milestone_id = notdue_due_milestone
+                        .get(&assertion_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Err(error) = self.emit(EventKind::ValidationAssertionNotDue {
+                        milestone_id: milestone_id.clone(),
+                        assertion_id,
+                        due_milestone_id,
+                        verdict: if ok {
+                            crate::gate::GateVerdict::Pass
+                        } else {
+                            crate::gate::GateVerdict::Fail
+                        },
+                        detail,
+                    }) {
+                        gate_sandbox.cleanup()?;
+                        return Err(error);
+                    }
+                }
+
+                let notdue_pty_run = crate::pty_harness::run_pty_assertions(
+                    &not_due_contract,
+                    &root,
+                    &env,
+                    &gate_sandbox,
+                    &self.paths.runs_dir(),
+                )
+                .await;
+                for artifact in &notdue_pty_run.artifacts {
+                    let due_milestone_id = notdue_due_milestone
+                        .get(&artifact.assertion_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Err(error) = self.emit(EventKind::ValidationAssertionNotDue {
+                        milestone_id: milestone_id.clone(),
+                        assertion_id: artifact.assertion_id.clone(),
+                        due_milestone_id,
+                        verdict: if artifact.pass {
+                            crate::gate::GateVerdict::Pass
+                        } else {
+                            crate::gate::GateVerdict::Fail
+                        },
+                        detail: artifact.detail.clone(),
+                    }) {
+                        gate_sandbox.cleanup()?;
+                        return Err(error);
+                    }
+                }
+                for skip in &notdue_pty_run.skipped {
+                    let due_milestone_id = notdue_due_milestone
+                        .get(&skip.assertion_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Err(error) = self.emit(EventKind::ValidationAssertionNotDue {
+                        milestone_id: milestone_id.clone(),
+                        assertion_id: skip.assertion_id.clone(),
+                        due_milestone_id,
+                        verdict: crate::gate::GateVerdict::Fail,
+                        detail: skip.note.clone(),
+                    }) {
+                        gate_sandbox.cleanup()?;
+                        return Err(error);
+                    }
+                }
+            }
+
             gate_sandbox.cleanup()?;
             combined
         } else {
@@ -6179,10 +6327,7 @@ impl MissionEngine {
         // and a byte-identical validator task. The runner owns the untrusted
         // warning/delimiters; this helper supplies scrubbed, bounded data.
         let runtime_evidence = if roles.contains(&Role::ValidatorFunctional)
-            && self
-                .state
-                .mission
-                .validation_contract
+            && due_contract
                 .iter()
                 .any(|assertion| assertion.check == AssertionCheck::AgentJudgement)
         {
@@ -6199,7 +6344,7 @@ impl MissionEngine {
 
         for role in roles {
             let milestone = self.state.mission.milestones[mi].clone();
-            let contract = self.state.mission.validation_contract.clone();
+            let contract = due_contract.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let grants = self.state.mission.command_grants.clone();
             let egress_grants = self.state.mission.egress_grants.clone();
@@ -6544,6 +6689,32 @@ impl MissionEngine {
         // saturates the cap and lets the write flow to the fix/waive path below.
         if self.maybe_park_for_touch_grant(&milestone_id, &findings)? {
             return Ok(());
+        }
+
+        // Deterministic backstop (contract-scope due-at rule): any finding
+        // whose subject names a not-yet-due assertion — from the primary,
+        // the retry, or the frontier confirmation, whichever produced it —
+        // is diverted here instead of becoming a blocking validation.finding.
+        // It never reaches `convert_findings`: no fix feature, no fix-cycle
+        // bump, no milestone block before the assertion's own milestone.
+        let (due_findings, notdue_findings) = findings
+            .into_iter()
+            .partition::<Vec<_>, _>(|(_, finding)| {
+                !notdue_due_milestone.contains_key(finding.subject.trim())
+            });
+        let findings = due_findings;
+
+        for (run_id, finding) in &notdue_findings {
+            let due_milestone_id = notdue_due_milestone
+                .get(finding.subject.trim())
+                .cloned()
+                .unwrap_or_default();
+            self.emit(EventKind::ValidationFindingNotDue {
+                milestone_id: milestone_id.clone(),
+                run_id: run_id.clone(),
+                due_milestone_id,
+                finding: finding.clone(),
+            })?;
         }
 
         for (run_id, finding) in &findings {
