@@ -2,13 +2,15 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-18
+last_verified: 2026-11-20
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-11-20 (UTC) against the invariants note's milestone-scoped assertion recheck (not-yet-due assertions are recorded but do not block until their milestone; final gate unchanged): no lesson changed.
 
 Rechecked 2026-11-18 (UTC) against `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`. No lesson changed.
 
