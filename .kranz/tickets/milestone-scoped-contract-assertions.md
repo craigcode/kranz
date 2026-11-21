@@ -2,6 +2,8 @@
 title: Stop a milestone's validation failing on assertions a later milestone delivers
 priority: 1
 schedule: once
+state: done
+state-note: Built by mission m-882080. Operator decision: an optional Assertion.milestone field naming a plan milestone title. Not-yet-due assertions run and are logged as validation.assertion.notdue; findings citing them are diverted to validation.finding.notdue. Finished as a pull request because the final gate cannot pass cargo test --workspace inside the fixed 600s cap and a fix feature id collided (tickets contract-command-timeout and fix-feature-id-collision).
 ---
 
 ## Goal

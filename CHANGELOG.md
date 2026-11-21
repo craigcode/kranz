@@ -5,6 +5,14 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: a contract assertion may name the plan milestone that must satisfy
+  it, in the optional field `milestone`. A validation round holds a
+  milestone only to the assertions due by it. An assertion that is not yet
+  due still runs, and its result is logged as `validation.assertion.notdue`;
+  a validator finding that cites it is logged as `validation.finding.notdue`
+  and creates no fix feature. The final gate still runs every assertion.
+  Approval refuses a plan whose assertion names an unknown milestone, and
+  plans without the field behave as before.
 - Changed: worker and validator sessions on the Claude backend may keep a
   shell command in the foreground for 30 minutes, up from the agent CLI's
   two. A workspace test run that outlasted two minutes was moved to the

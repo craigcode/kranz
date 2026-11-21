@@ -1,4 +1,5 @@
-//! Due-at rule for scoped validation assertions (plan §... milestone scoping).
+//! Due-at rule for scoped validation assertions (ticket
+//! `milestone-scoped-contract-assertions`).
 //!
 //! An [`Assertion`] may name the plan milestone that must satisfy it
 //! (`Assertion.milestone`). This module resolves that title against the
@@ -16,10 +17,6 @@ use crate::types::Assertion;
 /// among `milestone_titles`, matching case- and whitespace-insensitively
 /// ([`norm_title`]). `None` when the field is unset, or when the title
 /// matches zero or more than one milestone.
-// Consumed by the validation-round scoping that wires this rule into the
-// functional-validator loop (a later milestone feature); only
-// `validate_milestone_refs` has a caller today.
-#[allow(dead_code)]
 pub(crate) fn due_index(assertion: &Assertion, milestone_titles: &[&str]) -> Option<usize> {
     let wanted = norm_title(assertion.milestone.as_deref()?);
     let mut matches = milestone_titles
@@ -37,7 +34,6 @@ pub(crate) fn due_index(assertion: &Assertion, milestone_titles: &[&str]) -> Opt
 /// aligned with milestone position). True when unscoped, when the scoped
 /// title cannot be resolved to exactly one milestone (fail toward due
 /// everywhere), or when the resolved milestone is at or before this round.
-#[allow(dead_code)]
 pub(crate) fn is_due(assertion: &Assertion, milestone_titles: &[&str], round_index: usize) -> bool {
     match due_index(assertion, milestone_titles) {
         None => true,
