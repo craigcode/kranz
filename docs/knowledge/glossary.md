@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-18
+last_verified: 2026-11-21
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -22,6 +22,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-21 (UTC) against the worker `git stash` deny: `docs/design.md` lists `Bash(git stash*)` in the worker deny set and says how each backend matches a deny rule on a compound command line; `backend_acp.rs` and `backend_acp/terminals.rs` gained tests only. No term changed.
 
 Rechecked 2026-11-18 (UTC) against `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`. No term changed.
 
