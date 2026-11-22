@@ -39,11 +39,21 @@ Deny rules take precedence over allows in Claude Code.
 | Role | mode | tools | allow | deny |
 |---|---|---|---|---|
 | Orchestrator | `default` | `Bash,Read,Glob,Grep` | `Read`, `Glob`, `Grep`, `Bash(git log*/diff*/show*/status*/rev-parse*/branch*/tag*)` | everything else (unlisted Bash fails) |
-| Worker | `acceptEdits` | default set | `Bash`, edit tools via mode | `Bash(git push*)`, `Bash(npm publish*)`, `Bash(cargo publish*)`, `Bash(twine*)`, `Bash(sudo*)`, `Bash(curl*)`, `Bash(wget*)`, `WebFetch`, `WebSearch`, + config `denyPatterns` |
+| Worker | `acceptEdits` | default set | `Bash`, edit tools via mode | `Bash(git push*)`, `Bash(git remote add*)`, `Bash(git stash*)`, `Bash(npm publish*)`, `Bash(yarn publish*)`, `Bash(pnpm publish*)`, `Bash(cargo publish*)`, `Bash(twine*)`, `Bash(gem push*)`, `Bash(sudo*)`, `Bash(curl*)`, `Bash(wget*)`, `WebFetch`, `WebSearch`, + config `denyPatterns` |
 | Validators | `default` | `Bash,Read,Glob,Grep` | git-inspect patterns + contract `command`s + `allowValidatorCommands` | everything else |
 
 `--dangerously-allow-all` → `bypassPermissions`, loud in UI, never default.
 Denied tool results are tagged `denied` on `worker.message` events.
+
+A worker deny rule is matched against a command line that may contain `;`,
+`&&`, `||`, `|`, or a newline differently on each engine-enforced path. The
+Claude backend relies on the Claude Code CLI's own matcher, which this repo
+does not test. The ACP `session/request_permission` check matches the whole
+command string from its start, so a later segment is not matched (a known
+gap). The Sgian `terminal/create` check splits `sh -c` scripts and catches
+later segments. The grant offer (`matching_deny_rule`) checks each segment.
+The codex, droid, kimi, and cursor backends do not read `disallowed_tools` at
+all.
 
 ### Runtime grants (operator consent widens the profile)
 

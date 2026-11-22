@@ -95,10 +95,13 @@ const AUTHORITY_DENY: &[&str] = &[
 ];
 
 /// Built-in worker deny list (§4.7): no pushing, no publishing, no privilege
-/// escalation, no raw network access.
+/// escalation, no raw network access, no tree-moving `git stash` (the stash
+/// ref is shared across worktrees and a session can end between push and
+/// pop).
 const WORKER_DENY: &[&str] = &[
     "Bash(git push*)",
     "Bash(git remote add*)",
+    "Bash(git stash*)",
     "Bash(npm publish*)",
     "Bash(yarn publish*)",
     "Bash(pnpm publish*)",
@@ -348,18 +351,33 @@ pub fn command_allow_patterns(command: &str) -> Vec<String> {
 
 /// The worker deny rule that blocks `command`, if any — used to name the rule a
 /// `WorkerDeny` grant would lift. Best-effort: parses `Bash(<pattern>*)` rules
-/// and prefix-matches the command against `<pattern>`. Non-`Bash(...)` rules
-/// (WebFetch/WebSearch/tool names) never match a shell command.
+/// and prefix-matches each shell segment of the command (split on `&&`, `||`,
+/// `;`, `|` and newlines, like [`command_allow_patterns`]) as well as the
+/// whole command against `<pattern>`. Non-`Bash(...)` rules (WebFetch/WebSearch/
+/// tool names) never match a shell command.
 ///
-/// When several rules match, returns the MOST SPECIFIC (longest-prefix) one —
-/// so a narrow config rule (`Bash(git push --force*)`) is offered over the broad
-/// built-in (`Bash(git push*)`), keeping the operator's lift as narrow as the
-/// rule that actually blocked the command. A wrong or absent match just means
-/// the grant offers the wrong/no rule and the command stays denied (cap-bounded);
-/// the authoritative enforcement is Claude Code removing the exact rule string
-/// from `disallowed_tools`.
+/// When several rules match, returns the MOST SPECIFIC (longest-prefix) one,
+/// across all segments — so a narrow config rule (`Bash(git push --force*)`)
+/// is offered over the broad built-in (`Bash(git push*)`), keeping the
+/// operator's lift as narrow as the rule that actually blocked the command. A
+/// wrong or absent match just means the grant offers the wrong/no rule and
+/// the command stays denied (cap-bounded); the authoritative enforcement is
+/// Claude Code removing the exact rule string from `disallowed_tools`.
 pub fn matching_deny_rule(command: &str, deny_rules: &[String]) -> Option<String> {
     let cmd = command.trim();
+    let mut candidates: Vec<&str> = vec![cmd];
+    for segment in cmd
+        .split("&&")
+        .flat_map(|s| s.split("||"))
+        .flat_map(|s| s.split(';'))
+        .flat_map(|s| s.split('|'))
+        .flat_map(|s| s.split('\n'))
+    {
+        let segment = segment.trim().trim_end_matches('\r');
+        if !segment.is_empty() {
+            candidates.push(segment);
+        }
+    }
     deny_rules
         .iter()
         .filter_map(|rule| {
@@ -367,7 +385,13 @@ pub fn matching_deny_rule(command: &str, deny_rules: &[String]) -> Option<String
                 .strip_prefix("Bash(")
                 .and_then(|r| r.strip_suffix(')'))?;
             let prefix = pat.strip_suffix('*').unwrap_or(pat);
-            (!prefix.is_empty() && cmd.starts_with(prefix)).then_some((rule, prefix.len()))
+            if prefix.is_empty() {
+                return None;
+            }
+            candidates
+                .iter()
+                .any(|cand| cand.starts_with(prefix))
+                .then_some((rule, prefix.len()))
         })
         .max_by_key(|(_, len)| *len)
         .map(|(rule, _)| rule.clone())
@@ -545,6 +569,98 @@ mod tests {
         ];
         assert_eq!(
             matching_deny_rule("git push --force origin main", &mixed).as_deref(),
+            Some("Bash(git push --force*)")
+        );
+    }
+
+    #[test]
+    fn worker_deny_blocks_git_stash_push_and_bare_git_stash() {
+        assert!(WORKER_DENY.contains(&"Bash(git stash*)"));
+        let profile = for_role(Role::Worker, &MissionConfig::default(), &[], &[], &[]);
+        assert!(profile
+            .disallowed_tools
+            .iter()
+            .any(|r| r == "Bash(git stash*)"));
+
+        let deny = to_strings(WORKER_DENY);
+        for cmd in [
+            "git stash push -u",
+            "git stash",
+            "git stash list",
+            "git stash show -p",
+            "git stash pop",
+            "git stash apply stash@{0}",
+            "git stash drop",
+            "git stash -u",
+        ] {
+            assert_eq!(
+                matching_deny_rule(cmd, &deny).as_deref(),
+                Some("Bash(git stash*)"),
+                "expected `{cmd}` to match Bash(git stash*)"
+            );
+        }
+        for cmd in ["git status", "git diff HEAD -- src/lib.rs"] {
+            assert_eq!(
+                matching_deny_rule(cmd, &deny),
+                None,
+                "`{cmd}` should not match"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_deny_grant_lifts_exactly_the_git_stash_rule() {
+        let cfg = MissionConfig::default();
+        let base = for_role(Role::Worker, &cfg, &[], &[], &[]);
+        let lifted = for_role(
+            Role::Worker,
+            &cfg,
+            &[],
+            &[],
+            &["Bash(git stash*)".to_string()],
+        );
+
+        let expected: Vec<String> = base
+            .disallowed_tools
+            .iter()
+            .filter(|r| *r != "Bash(git stash*)")
+            .cloned()
+            .collect();
+        assert_eq!(lifted.disallowed_tools, expected);
+        assert_eq!(
+            lifted.disallowed_tools.len() + 1,
+            base.disallowed_tools.len()
+        );
+        assert!(lifted
+            .disallowed_tools
+            .iter()
+            .any(|r| r == "Bash(git push*)"));
+    }
+
+    #[test]
+    fn matching_deny_rule_finds_git_stash_after_shell_operators() {
+        let deny = to_strings(WORKER_DENY);
+        for cmd in [
+            "cargo build; git stash push -u",
+            "cargo build && git stash push -u",
+            "cargo build\ngit stash push -u",
+            "cargo build || git stash",
+            "echo x | git stash",
+        ] {
+            assert_eq!(
+                matching_deny_rule(cmd, &deny).as_deref(),
+                Some("Bash(git stash*)"),
+                "expected `{cmd}` to match Bash(git stash*)"
+            );
+        }
+        assert_eq!(matching_deny_rule("cargo build && cargo test", &deny), None);
+
+        let mixed = vec![
+            "Bash(git push*)".to_string(),
+            "Bash(git push --force*)".to_string(),
+        ];
+        assert_eq!(
+            matching_deny_rule("cargo build && git push --force origin main", &mixed).as_deref(),
             Some("Bash(git push --force*)")
         );
     }

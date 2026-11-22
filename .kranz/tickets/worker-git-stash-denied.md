@@ -2,6 +2,8 @@
 title: Stop workers running git stash in the mission worktree
 priority: 2
 schedule: once
+state: done
+state-note: Built by mission m-caf631. Bash(git stash*) is in WORKER_DENY and liftable by grant; matching_deny_rule checks each shell segment. The ACP compound-command gap is pinned by a test, not fixed. Operator decision: the deny rule only, no prompt text. The mission's final gate could not pass cargo test --workspace inside the fixed 600s contract-command cap, so it was finished as a pull request (ticket contract-command-timeout).
 ---
 
 ## Goal
