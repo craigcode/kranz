@@ -2,8 +2,10 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-21
+last_verified: 2026-11-22
 verified_against:
+  - crates/engine/src/contract_scope.rs
+  - crates/engine/src/events.rs
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
@@ -23,7 +25,13 @@ verified_against:
   - AGENTS.md
 ---
 
+Rechecked 2026-11-22 (UTC) against `contract_scope.rs`: the `#[allow(dead_code)]` lines on `due_index` and `is_due` are removed, since the validation round calls both. No term changed.
+
 Rechecked 2026-11-21 (UTC) against the worker `git stash` deny: `docs/design.md` lists `Bash(git stash*)` in the worker deny set and says how each backend matches a deny rule on a compound command line; `backend_acp.rs` and `backend_acp/terminals.rs` gained tests only. No term changed.
+
+Rechecked 2026-11-19 (UTC) against `contract_scope.rs`, `orchestrator.rs`,
+`planning.rs` and `types.rs`: added the "Not-yet-due assertion" entry below.
+No existing term changed.
 
 Rechecked 2026-11-18 (UTC) against `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`. No term changed.
 
@@ -114,6 +122,13 @@ Project vocabulary. Terms link to the note that explains them in depth.
   is a `Command` (a build/test/lint invocation), `AgentJudgement`
   (a validator/orchestrator verdict), or `PtyScript` (an interactive terminal check). See
   [gates](validation/gates.md).
+- **Not-yet-due assertion** — a `command`/`pty_script` assertion whose
+  `milestone` names a plan milestone later than the one currently
+  validating. It still runs every round, but its result and any finding
+  citing it are recorded record-only (`validation.assertion.notdue` /
+  `validation.finding.notdue`) instead of blocking. The final gate runs it
+  regardless of due-ness. See
+  [milestone-scoped assertions](validation/gates.md#milestone-scoped-assertions).
 - **Baseline/candidate pair** — opt-in advisory observations at two actual
   revisions, with approved expectations, separately identified checker overlay
   and source/environment configuration bindings. A recorded pair is not a

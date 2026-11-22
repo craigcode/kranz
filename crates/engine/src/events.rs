@@ -488,6 +488,44 @@ pub enum EventKind {
         detail: Option<String>,
     },
 
+    /// A command or pty-script contract assertion that named a plan
+    /// milestone later than the one currently validating (contract-scope
+    /// due-at rule, module [`crate::contract_scope`]): the assertion still
+    /// runs engine-side, exactly like a due one, but its result never
+    /// reaches the validators' evidence or `contract_results`, so a failure
+    /// here cannot become a blocking finding before the assertion's own
+    /// milestone. Record-only; one per not-yet-due command/pty assertion per
+    /// round, pass or fail. Additive event; absent in pre-field logs, which
+    /// simply never scoped a contract to milestones.
+    #[serde(rename = "validation.assertion.notdue")]
+    ValidationAssertionNotDue {
+        #[serde(rename = "milestoneId")]
+        milestone_id: String,
+        #[serde(rename = "assertionId")]
+        assertion_id: String,
+        #[serde(rename = "dueMilestoneId")]
+        due_milestone_id: String,
+        verdict: crate::gate::GateVerdict,
+        detail: String,
+    },
+
+    /// A validator finding whose `subject` named a not-yet-due contract
+    /// assertion (see [`EventKind::ValidationAssertionNotDue`]): diverted
+    /// here instead of `validation.finding` so it never reaches
+    /// `convert_findings` — no fix feature, no fix-cycle bump, no milestone
+    /// block before the assertion's own milestone. Record-only. Additive
+    /// event; absent in pre-field logs.
+    #[serde(rename = "validation.finding.notdue")]
+    ValidationFindingNotDue {
+        #[serde(rename = "milestoneId")]
+        milestone_id: String,
+        #[serde(rename = "runId")]
+        run_id: String,
+        #[serde(rename = "dueMilestoneId")]
+        due_milestone_id: String,
+        finding: Finding,
+    },
+
     /// One gate evaluation, recorded as a first-class event (ticket
     /// `.kranz/tickets/gate-results-first-class-events`, KRZ-312 — the
     /// governance evidence layer's last substrate gap before
@@ -1232,6 +1270,8 @@ impl EventKind {
             EventKind::ValidationSnapshot { .. } => "validation.snapshot",
             EventKind::ValidationConfirm { .. } => "validation.confirm",
             EventKind::ValidationPtyTranscript { .. } => "validation.pty.transcript",
+            EventKind::ValidationAssertionNotDue { .. } => "validation.assertion.notdue",
+            EventKind::ValidationFindingNotDue { .. } => "validation.finding.notdue",
             EventKind::GateResult { .. } => "gate.result",
             EventKind::HookGateFired { .. } => "hook.gate.fired",
             EventKind::DivergenceNoted { .. } => "divergence.noted",

@@ -5,6 +5,14 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: a contract assertion may name the plan milestone that must satisfy
+  it, in the optional field `milestone`. A validation round holds a
+  milestone only to the assertions due by it. An assertion that is not yet
+  due still runs, and its result is logged as `validation.assertion.notdue`;
+  a validator finding that cites it is logged as `validation.finding.notdue`
+  and creates no fix feature. The final gate still runs every assertion.
+  Approval refuses a plan whose assertion names an unknown milestone, and
+  plans without the field behave as before.
 - Changed: workers may not run `git stash`. It is in the built-in worker
   deny list as one rule, `Bash(git stash*)`, which covers `list` and `show`
   too, and an operator can lift it with a worker-deny grant. Workers had

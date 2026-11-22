@@ -683,6 +683,7 @@ async fn reviewer_independence_final_command_mutation_retires_review_across_resu
             statement: "exercise a mutating gate".into(),
             check: AssertionCheck::Command,
             command: Some(command),
+            milestone: None,
             negative_control: None,
             pty_script: None,
         });
@@ -844,6 +845,7 @@ async fn reviewer_independence_pending_only_revision_preserves_completed_prefix_
         statement: "additional requirement".into(),
         check: AssertionCheck::Command,
         command: Some("true".into()),
+        milestone: None,
         negative_control: None,
         pty_script: None,
     });

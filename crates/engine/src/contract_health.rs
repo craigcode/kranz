@@ -288,6 +288,7 @@ mod tests {
                     statement: "s".into(),
                     check: AssertionCheck::Command,
                     command: Some("true".into()),
+                    milestone: None,
                     negative_control: None,
                     pty_script: None,
                 })

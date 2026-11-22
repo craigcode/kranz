@@ -461,6 +461,31 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             milestone_mut(state, milestone_id)?;
         }
 
+        EventKind::ValidationAssertionNotDue { milestone_id, .. } => {
+            // Audit-only record (contract-scope due-at rule): a not-yet-due
+            // assertion's result never drives a state transition — only its
+            // own milestone can act on it, later. Validate the milestone
+            // reference as a corruption guard only (mirrors
+            // validation.pty.transcript).
+            milestone_mut(state, milestone_id)?;
+        }
+
+        EventKind::ValidationFindingNotDue {
+            milestone_id,
+            run_id,
+            ..
+        } => {
+            // Audit-only record: a finding diverted from validation.finding
+            // because its subject named a not-yet-due assertion. No fix
+            // feature, no fix-cycle bump — those only ever follow
+            // validation.finding. Validate references as a corruption
+            // guard (mirrors validation.finding).
+            milestone_mut(state, milestone_id)?;
+            if run_id != ENGINE_RUN_ID {
+                run_mut(state, run_id)?;
+            }
+        }
+
         EventKind::GateResult { .. } => {
             // Audit-only record (KRZ-312): one gate evaluation — id, ladder
             // position, verdict, artefact handle. Gate results drive no
@@ -972,6 +997,12 @@ fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> R
             "plan.revised cannot replace the approved reviewerIndependence policy".into(),
         ));
     }
+    let milestone_titles: Vec<&str> = plan.milestones.iter().map(|m| m.title.as_str()).collect();
+    crate::contract_scope::validate_milestone_refs(
+        &plan.validation_contract,
+        &milestone_titles,
+        "plan.revised",
+    )?;
     ensure_contract_extends(
         &state.mission.validation_contract,
         &plan.validation_contract,
@@ -1063,6 +1094,7 @@ fn ensure_contract_extends(existing: &[Assertion], revised: &[Assertion]) -> Res
             || old.check != new.check
             || old.command != new.command
             || old.negative_control != new.negative_control
+            || old.milestone != new.milestone
         {
             return Err(EngineError::InvalidState(format!(
                 "plan.revised weakens or changes validation assertion '{}'",
@@ -1484,6 +1516,43 @@ mod negative_control_tests {
             .command = "new".into();
         crate::planning::validate_revised_plan_for_gate(&state.mission, &revised).unwrap();
         dry_run_revised_plan(&state, &revised, 1).unwrap();
+    }
+
+    #[test]
+    fn assertion_due_approval_revision_refuses_milestone_change() {
+        let mut plan = plan();
+        plan.validation_contract[0].milestone = Some("one".to_string());
+        let state = approved(&plan).unwrap();
+        dry_run_revised_plan(&state, &plan, 1).unwrap();
+
+        let mut changed = plan.clone();
+        changed.validation_contract[0].milestone = None;
+        assert!(
+            crate::planning::validate_revised_plan_for_gate(&state.mission, &changed).is_err(),
+            "pre-emit gate must refuse a changed milestone field"
+        );
+        assert!(
+            dry_run_revised_plan(&state, &changed, 1).is_err(),
+            "reducer must refuse a changed milestone field"
+        );
+    }
+
+    #[test]
+    fn assertion_due_approval_revision_refuses_unknown_milestone() {
+        let mut plan = plan();
+        plan.validation_contract[0].milestone = Some("one".to_string());
+        let state = approved(&plan).unwrap();
+
+        let mut unknown = plan;
+        unknown.validation_contract[0].milestone = Some("nope".to_string());
+        assert!(
+            crate::planning::validate_revised_plan_for_gate(&state.mission, &unknown).is_err(),
+            "pre-emit gate must refuse an unknown milestone"
+        );
+        assert!(
+            dry_run_revised_plan(&state, &unknown, 1).is_err(),
+            "reducer must refuse an unknown milestone"
+        );
     }
 }
 

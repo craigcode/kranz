@@ -589,6 +589,7 @@ async fn workspace_gate_runs_bootstrap_in_the_integration_worktree() {
         statement: "the workspace marker exists".into(),
         check: AssertionCheck::Command,
         command: Some(file_exists_contract(".boot-marker")),
+        milestone: None,
         negative_control: None,
         pty_script: None,
     }];
@@ -1160,6 +1161,7 @@ async fn base_sha_reaches_sessions_in_worktree_mode() {
         statement: "the final gate command env carries KRANZ_BASE_SHA".to_string(),
         check: AssertionCheck::Command,
         command: Some(gate_base_sha_assertion_command(&expected_base_sha)),
+        milestone: None,
         negative_control: None,
         pty_script: None,
     });
@@ -1418,6 +1420,7 @@ fn one_feature_plan_with_contract() -> Plan {
                 statement: "vacuous assertion".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("exit 0".to_string()),
+                milestone: None,
                 negative_control: None,
                 pty_script: None,
             },
@@ -1426,6 +1429,7 @@ fn one_feature_plan_with_contract() -> Plan {
                 statement: "not-yet-landed assertion".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("exit 1".to_string()),
+                milestone: None,
                 negative_control: None,
                 pty_script: None,
             },
@@ -1898,6 +1902,7 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
         statement: "the final gate command env carries KRANZ_BASE_SHA".to_string(),
         check: AssertionCheck::Command,
         command: Some(gate_base_sha_assertion_command(&expected_base_sha)),
+        milestone: None,
         negative_control: None,
         pty_script: None,
     });

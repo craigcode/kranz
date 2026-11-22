@@ -506,6 +506,12 @@ pub(crate) fn validate_revised_plan_for_gate(mission: &Mission, plan: &Plan) -> 
         )));
     }
     crate::contract_controls::validate(&plan.validation_contract)?;
+    let milestone_titles: Vec<&str> = plan.milestones.iter().map(|m| m.title.as_str()).collect();
+    crate::contract_scope::validate_milestone_refs(
+        &plan.validation_contract,
+        &milestone_titles,
+        "revised plan",
+    )?;
     validate_contract_extends(&mission.validation_contract, &plan.validation_contract)?;
     validate_vec_extends(
         "commandGrants",
@@ -557,6 +563,7 @@ fn validate_contract_extends(existing: &[Assertion], revised: &[Assertion]) -> R
             || old.check != new.check
             || old.command != new.command
             || old.negative_control != new.negative_control
+            || old.milestone != new.milestone
         {
             return Err(EngineError::InvalidState(format!(
                 "revised plan changes validation assertion '{}'",
@@ -674,6 +681,7 @@ fn plan_schema() -> serde_json::Value {
                 "statement": { "type": "string" },
                 "check": { "type": "string", "enum": ["command", "agent-judgement", "pty-script"] },
                 "command": { "type": "string" },
+                "milestone": { "type": "string", "description": "Optional. The exact title of the plan milestone that must deliver this assertion. Validation rounds for earlier milestones still run it and record the result, but do not treat a failure as a finding. Omit it for checks that must hold at every milestone (format, lint, the full test suite). The final gate always checks every assertion." },
                 "negativeControl": negative_control,
                 "ptyScript": {
                     "type": "object",
@@ -841,6 +849,7 @@ mod tests {
             statement: "s".to_string(),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            milestone: None,
             pty_script: None,
             negative_control: None,
         }
@@ -857,6 +866,16 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn assertion_due_schema_plan_schema_describes_milestone() {
+        let schema = plan_schema();
+        let item = &schema["properties"]["validationContract"]["items"];
+        let milestone = &item["properties"]["milestone"];
+        assert_eq!(milestone["type"], serde_json::json!("string"));
+        let description = milestone["description"].as_str().unwrap_or_default();
+        assert!(!description.is_empty());
     }
 
     #[test]
@@ -965,6 +984,7 @@ mod tests {
                 statement: "s".into(),
                 check: AssertionCheck::Command,
                 command: Some("true".into()),
+                milestone: None,
                 pty_script: None,
                 negative_control: None,
             }],

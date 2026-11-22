@@ -895,6 +895,7 @@ Ship the thing.
                 statement: "cargo test passes".into(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".into()),
+                milestone: None,
                 pty_script: None,
                 negative_control: None,
             }],

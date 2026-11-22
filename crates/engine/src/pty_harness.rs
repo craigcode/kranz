@@ -1097,6 +1097,7 @@ mod tests {
             statement: "the REPL echoes input back".to_string(),
             check: AssertionCheck::PtyScript,
             command: None,
+            milestone: None,
             negative_control: None,
             pty_script: Some(PtyScript {
                 command: command.to_string(),
@@ -1246,6 +1247,7 @@ mod tests {
                 statement: "s".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("true".to_string()),
+                milestone: None,
                 negative_control: None,
                 pty_script: None,
             },
@@ -1254,6 +1256,7 @@ mod tests {
                 statement: "s".to_string(),
                 check: AssertionCheck::AgentJudgement,
                 command: None,
+                milestone: None,
                 negative_control: None,
                 pty_script: None,
             },
@@ -1277,6 +1280,7 @@ mod tests {
             statement: "s".to_string(),
             check: AssertionCheck::PtyScript,
             command: None,
+            milestone: None,
             negative_control: None,
             pty_script: None,
         }];
@@ -1317,6 +1321,7 @@ mod tests {
             statement: "the REPL echoes input back".to_string(),
             check: AssertionCheck::PtyScript,
             command: None,
+            milestone: None,
             negative_control: None,
             pty_script: Some(PtyScript {
                 command: "./repl".to_string(),

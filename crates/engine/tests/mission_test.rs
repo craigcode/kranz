@@ -556,6 +556,7 @@ fn assertion(id: &str, statement: &str, command: Option<&str>) -> Assertion {
             AssertionCheck::AgentJudgement
         },
         command: command.map(str::to_string),
+        milestone: None,
         negative_control: None,
         pty_script: None,
     }
@@ -580,6 +581,497 @@ fn seq_of(events: &[Event], type_name: &str) -> u64 {
         .find(|e| e.kind.type_name() == type_name)
         .unwrap_or_else(|| panic!("no {type_name} event in {:?}", event_types(events)))
         .seq
+}
+
+// ---------------------------------------------------------------------------
+// 0. Due-at rule: approval refuses plans naming unknown/ambiguous milestones
+// ---------------------------------------------------------------------------
+
+/// `approve_plan` refuses a plan whose assertion names a milestone title
+/// that matches no plan milestone; the mission stays in Planning and no
+/// `plan.approved` event is emitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn assertion_due_approval_refuses_unknown_milestone() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let mut scoped = assertion("a-scope", "the build passes", None);
+    scoped.milestone = Some("Nope".to_string());
+    let contract = vec![scoped];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    let err = engine
+        .approve_plan(simple_plan(1, contract))
+        .expect_err("unknown milestone must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("a-scope"),
+        "error should name the assertion: {msg}"
+    );
+
+    assert_eq!(engine.state().mission.status, MissionStatus::Planning);
+}
+
+/// `approve_plan` accepts a plan whose assertion names a known milestone
+/// title (matched case-insensitively), and the persisted contract keeps the
+/// `milestone` field.
+#[tokio::test(flavor = "multi_thread")]
+async fn assertion_due_approval_accepts_known_milestone() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let mut scoped = assertion("a-scope", "the build passes", None);
+    scoped.milestone = Some("SECOND MILESTONE".to_string());
+    let contract = vec![scoped];
+
+    let plan = Plan {
+        goal: GOAL.to_string(),
+        validation_contract: contract,
+        milestones: vec![
+            PlanMilestone {
+                title: "First Milestone".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 1".to_string(),
+                    spec: "build part 1".to_string(),
+                    validation_criteria: vec!["part 1 works".to_string()],
+                }],
+            },
+            PlanMilestone {
+                title: "second milestone".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 2".to_string(),
+                    spec: "build part 2".to_string(),
+                    validation_criteria: vec!["part 2 works".to_string()],
+                }],
+            },
+        ],
+        considered_alternatives: None,
+        command_grants: vec![],
+        touch_set: vec![],
+        standards_manifest: None,
+        reviewer_independence: None,
+    };
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![]));
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(plan).unwrap();
+
+    assert_eq!(
+        engine.state().mission.validation_contract[0]
+            .milestone
+            .as_deref(),
+        Some("SECOND MILESTONE")
+    );
+}
+
+/// Worker script like [`worker_pass`], but writes a chosen file with chosen
+/// content instead of an arbitrary throwaway one — used so a fix worker can
+/// make a real contract command assertion start passing.
+fn worker_pass_writing(path: &str, content: &str) -> MockScript {
+    MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "implemented and tested",
+        "filesTouched": [path],
+        "testsAdded": [],
+        "testEvidence": "all green",
+        "commits": []
+    }))
+    .writes_file(path, content)
+}
+
+/// A critical finding naming the not-yet-due assertion `a-late`, used to
+/// simulate both the diverted round (ms-1, before `a-late` is due) and the
+/// real round (ms-2, once it is) with a single JSON shape.
+fn late_finding() -> serde_json::Value {
+    json!([{
+        "subject": "a-late",
+        "severity": "critical",
+        "evidence": "a-late is still failing",
+        "suggestedFix": "fix the late check"
+    }])
+}
+
+/// Two milestones ("M1", "M2"), one feature each, with an unscoped always-
+/// passing command plus `a-late` (a failing command scoped to "M2"). The
+/// functional validator is scripted, at ms-1, to return a critical finding
+/// naming `a-late` — simulating the pre-fix behaviour where a not-yet-due
+/// assertion's failure became a blocking finding. The contract-scope due-at
+/// rule must instead divert it: ms-1 records a `validation.assertion.notdue`
+/// and a `validation.finding.notdue`, never a blocking `validation.finding`
+/// or `fixfeature.created`, and completes. At ms-2, the same assertion is
+/// due: the engine-run command genuinely fails, the validator task shows the
+/// FAIL, and a critical finding there creates a real fix feature.
+#[tokio::test(flavor = "multi_thread")]
+async fn assertion_due_round_defers_failure_until_its_milestone() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let ok = assertion(
+        "a-ok",
+        "the build succeeds",
+        Some(&file_exists_contract("README.md")),
+    );
+    // Starts failing (the file doesn't exist yet) and is only made to pass by
+    // the ms-2 fix worker — unlike a permanently-broken command, this lets
+    // the final gate (which reruns every assertion unconditionally,
+    // regardless of milestone scope) see it pass too, so the mission
+    // completes rather than blocking on final-gate command-assertion.
+    let mut late = assertion(
+        "a-late",
+        "the late check passes",
+        Some(&file_exists_contract("late-fixed.txt")),
+    );
+    late.milestone = Some("M2".to_string());
+    let contract = vec![ok, late];
+
+    let plan = Plan {
+        goal: GOAL.to_string(),
+        validation_contract: contract,
+        milestones: vec![
+            PlanMilestone {
+                title: "M1".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 1".to_string(),
+                    spec: "build part 1".to_string(),
+                    validation_criteria: vec!["part 1 works".to_string()],
+                }],
+            },
+            PlanMilestone {
+                title: "M2".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 2".to_string(),
+                    spec: "build part 2".to_string(),
+                    validation_criteria: vec!["part 2 works".to_string()],
+                }],
+            },
+        ],
+        considered_alternatives: None,
+        command_grants: vec![],
+        touch_set: vec![],
+        standards_manifest: None,
+        reviewer_independence: None,
+    };
+
+    // Session order: worker M1-f1, orchestrator (all turns), functional
+    // validator ms-1 (scripted with the simulated-old-behaviour finding,
+    // diverted), worker M2-f1, functional validator ms-2 round 1 (the same
+    // finding, now genuinely due → real fix feature), fix worker, functional
+    // validator ms-2 round 2 (clean → mission completes).
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""), // M1 f-1-1
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""), // M2 f-2-1
+            fix_features(1),           // ms-2 round 1 conversion
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""), // ms-2 fix worker
+            no_lesson(),
+        ]),
+        validator_with(late_finding()), // ms-1: diverted
+        worker_pass(),                  // M2 f-2-1
+        validator_with(late_finding()), // ms-2 round 1: real finding
+        worker_pass_writing("late-fixed.txt", "fixed\n"), // ms-2 fix worker
+        validator_with(json!([])),      // ms-2 round 2: clean
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(plan).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    assert_eq!(
+        engine.state().mission.milestones[0].status,
+        MilestoneStatus::Complete
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+
+    // ms-1 records the diverted not-due result, pass or fail, and diverts
+    // the finding — never a blocking validation.finding/fixfeature.created
+    // for ms-1.
+    let notdue_assertion = events.iter().find_map(|e| match &e.kind {
+        EventKind::ValidationAssertionNotDue {
+            milestone_id,
+            assertion_id,
+            due_milestone_id,
+            verdict,
+            ..
+        } if milestone_id == "ms-1" && assertion_id == "a-late" => {
+            Some((due_milestone_id.clone(), *verdict))
+        }
+        _ => None,
+    });
+    let (due_milestone_id, verdict) =
+        notdue_assertion.expect("validation.assertion.notdue for ms-1/a-late");
+    assert_eq!(due_milestone_id, "ms-2");
+    assert_eq!(verdict, kranz_engine::gate::GateVerdict::Fail);
+
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::ValidationFindingNotDue { milestone_id, .. } if milestone_id == "ms-1"
+        )),
+        "validation.finding.notdue for ms-1: {types:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::ValidationFinding { milestone_id, .. } if milestone_id == "ms-1"
+        )),
+        "no blocking validation.finding for ms-1: {types:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::FixFeatureCreated { milestone_id, .. } if milestone_id == "ms-1"
+        )),
+        "no fixfeature.created for ms-1: {types:?}"
+    );
+
+    // ms-2 gets the real finding and a real fix feature.
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::ValidationFinding { milestone_id, .. } if milestone_id == "ms-2"
+        )),
+        "validation.finding for ms-2: {types:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::FixFeatureCreated { milestone_id, .. } if milestone_id == "ms-2"
+        )),
+        "fixfeature.created for ms-2: {types:?}"
+    );
+
+    // The ms-1 validator task never shows a-late; the ms-2 validator task
+    // shows a-late's genuine FAIL.
+    let specs = backend.started_specs();
+    let validator_tasks: Vec<&String> = specs
+        .iter()
+        .filter_map(|s| match &s.prompt {
+            PromptMode::SingleShot(task) if task.contains("Validate milestone") => Some(task),
+            _ => None,
+        })
+        .collect();
+    let ms1_task = validator_tasks
+        .iter()
+        .find(|t| t.contains("`ms-1`"))
+        .expect("a ms-1 validator session ran");
+    assert!(
+        !ms1_task.contains("a-late"),
+        "ms-1 validator task must not mention the not-due assertion: {ms1_task}"
+    );
+    let ms2_task = validator_tasks
+        .iter()
+        .find(|t| t.contains("`ms-2`"))
+        .expect("a ms-2 validator session ran");
+    assert!(
+        ms2_task.contains("[a-late]") && ms2_task.contains("FAIL"),
+        "ms-2 validator task must show a-late's genuine FAIL: {ms2_task}"
+    );
+}
+
+/// The same two-milestone shape as
+/// [`assertion_due_round_defers_failure_until_its_milestone`], but no
+/// assertion names a milestone: every assertion is due at every round, and
+/// behaviour must be byte-for-byte what it was before the due-at rule — both
+/// rounds' validator tasks show every assertion, no `notdue` event is ever
+/// emitted, and the persisted plan carries no `"milestone"` key.
+#[tokio::test(flavor = "multi_thread")]
+async fn assertion_due_unscoped_plan_behaves_as_before() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let contract = vec![assertion(
+        "a-ok",
+        "the build succeeds",
+        Some(&file_exists_contract("README.md")),
+    )];
+
+    let plan = Plan {
+        goal: GOAL.to_string(),
+        validation_contract: contract,
+        milestones: vec![
+            PlanMilestone {
+                title: "M1".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 1".to_string(),
+                    spec: "build part 1".to_string(),
+                    validation_criteria: vec!["part 1 works".to_string()],
+                }],
+            },
+            PlanMilestone {
+                title: "M2".to_string(),
+                features: vec![PlanFeature {
+                    title: "feature 2".to_string(),
+                    spec: "build part 2".to_string(),
+                    validation_criteria: vec!["part 2 works".to_string()],
+                }],
+            },
+        ],
+        considered_alternatives: None,
+        command_grants: vec![],
+        touch_set: vec![],
+        standards_manifest: None,
+        reviewer_independence: None,
+    };
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""), // M1 f-1-1
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""), // M2 f-2-1
+            no_lesson(),
+        ]),
+        validator_with(json!([])), // ms-1
+        worker_pass(),             // M2 f-2-1
+        validator_with(json!([])), // ms-2
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(plan).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        !types.contains(&"validation.assertion.notdue"),
+        "unscoped plan must never emit notdue events: {types:?}"
+    );
+    assert!(
+        !types.contains(&"validation.finding.notdue"),
+        "unscoped plan must never emit notdue findings: {types:?}"
+    );
+
+    let specs = backend.started_specs();
+    let validator_tasks: Vec<&String> = specs
+        .iter()
+        .filter_map(|s| match &s.prompt {
+            PromptMode::SingleShot(task) if task.contains("Validate milestone") => Some(task),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(validator_tasks.len(), 2, "one validator session per round");
+    for task in &validator_tasks {
+        assert!(
+            task.contains("[a-ok]") && task.contains("PASS"),
+            "every round must show every assertion's result: {task}"
+        );
+    }
+
+    let plan_json = std::fs::read_to_string(
+        root.join(".kranz")
+            .join("missions")
+            .join(&mission_id)
+            .join("plan.json"),
+    )
+    .expect("plan.json written on disk");
+    assert!(
+        !plan_json.contains("\"milestone\""),
+        "unscoped plan.json must carry no milestone key: {plan_json}"
+    );
+}
+
+/// A failing command assertion scoped to the (only) milestone still reaches
+/// the final gate and yields a critical, non-waivable `command-assertion`
+/// finding there, regardless of its milestone scope — the final gate runs
+/// every assertion unconditionally (spec item 7; `finalization.rs` is
+/// unchanged by the due-at rule).
+#[tokio::test(flavor = "multi_thread")]
+async fn assertion_due_final_gate_fails_scoped_assertion() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let mut scoped = assertion("a-1", "the build succeeds", Some("cd kranz-no-such-dir"));
+    scoped.milestone = Some("M1".to_string());
+    let contract = vec![scoped];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "command not runnable in this environment"),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "still not runnable"),
+        ]),
+        worker_pass(), // fix feature for the refused waive
+    ]));
+
+    let cfg = MissionConfig {
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        types.contains(&"validation.finding"),
+        "gate finding surfaced: {types:?}"
+    );
+    let finding = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ValidationFinding { finding, .. } if finding.subject == "a-1" => {
+                Some(finding.clone())
+            }
+            _ => None,
+        })
+        .expect("a critical command-assertion finding for a-1");
+    assert_eq!(finding.severity, "critical");
+    assert_eq!(finding.class, "command-assertion");
 }
 
 // ---------------------------------------------------------------------------
@@ -4374,6 +4866,7 @@ async fn declared_pty_script_that_never_executes_cannot_green() {
         statement: "the REPL echoes input back".to_string(),
         check: AssertionCheck::PtyScript,
         command: None,
+        milestone: None,
         negative_control: None,
         pty_script: None,
     }];
@@ -4465,6 +4958,7 @@ async fn cancelling_pty_validation_stops_writes_before_mission_unlock() {
         statement: "the target completes".into(),
         check: AssertionCheck::PtyScript,
         command: None,
+        milestone: None,
         negative_control: None,
         pty_script: Some(PtyScript {
             command: "printf '%s' $$ > pty.pid; exec sleep 30".into(),
@@ -4539,9 +5033,11 @@ async fn declared_pty_script_executes_and_passes_greens() {
         statement: "the REPL echoes input back".to_string(),
         check: AssertionCheck::PtyScript,
         command: None,
+        milestone: None,
         negative_control: None,
         pty_script: Some(PtyScript {
             command: "printf '> '; while IFS= read -r line; do case \"$line\" in quit) \
+            milestone: None,
                  printf 'bye\\n'; exit 0;; *) printf 'echo:%s\\n> ' \"$line\";; esac; done"
                 .to_string(),
             steps: vec![
