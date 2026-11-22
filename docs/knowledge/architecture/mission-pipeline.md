@@ -2,7 +2,7 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-17
+last_verified: 2026-11-21
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -40,6 +40,8 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-21 (UTC) against the worker `git stash` deny: `docs/design.md` lists `Bash(git stash*)` in the worker deny set and says how each backend matches a deny rule on a compound command line; `backend_acp.rs` and `backend_acp/terminals.rs` gained tests only. Pipeline stages and event schemas are unchanged.
 
 Rechecked 2026-11-17 (UTC) against the foreground command limit in `runner.rs` and `types.rs`: worker and validator session specs now carry `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`, set from config `agentCommandTimeoutSecs` (absent means 1800 seconds, `0` sets neither), so the Claude CLI keeps a long command in the foreground instead of moving it to the background after two minutes. Pipeline stages, their order and the event schema are unchanged.
 

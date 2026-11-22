@@ -1356,4 +1356,75 @@ mod tests {
         spec.writable = false;
         assert!(sgian_terminal_prohibition(&spec, &ok_cmd, &ok_val).is_some());
     }
+
+    #[test]
+    fn sgian_terminal_denies_git_stash_after_shell_operators() {
+        let spec = SessionSpec {
+            cwd: PathBuf::from("/repo"),
+            prompt: PromptMode::SingleShot("test".into()),
+            append_system_prompt: None,
+            model: "fixture".into(),
+            effort: "high".into(),
+            session_id: "sess-p".into(),
+            resume: None,
+            permission_mode: None,
+            allowed_tools: vec!["Bash".into()],
+            disallowed_tools: vec!["Bash(git stash*)".into()],
+            tools: vec![],
+            writable: true,
+            settings_json: None,
+            json_schema: None,
+            max_budget_usd: None,
+            max_turns: None,
+            env: std::collections::HashMap::new(),
+            sandbox: None,
+            hook_status: None,
+        };
+        let make_create = |cmd: &str, args: &[&str]| {
+            let create = kranz_acp::terminal::Create {
+                session_id: "peer-1".into(),
+                command: cmd.into(),
+                args: args.iter().map(|s| (*s).to_string()).collect(),
+                env: vec![],
+                cwd: Some("/repo".into()),
+                output_byte_limit: Some(65_536),
+                meta: None,
+            };
+            let val = json!({
+                "kind": "execute",
+                "rawInput": {
+                    "command": create.command,
+                    "args": create.args,
+                }
+            });
+            (create, val)
+        };
+
+        for (cmd, args) in [
+            ("/bin/sh", &["-c", "cargo build; git stash push -u"][..]),
+            ("/bin/sh", &["-c", "cargo build && git stash push -u"][..]),
+            ("/bin/bash", &["-lc", "cargo build\ngit stash push -u"][..]),
+            ("git", &["stash"][..]),
+            ("/usr/bin/git", &["stash", "push", "-u"][..]),
+        ] {
+            let (create, val) = make_create(cmd, args);
+            let reason = sgian_terminal_prohibition(&spec, &create, &val);
+            assert!(
+                matches!(&reason, Some(r) if r.contains("Bash(git stash*)")),
+                "expected deny naming Bash(git stash*) for {cmd} {args:?}, got {reason:?}"
+            );
+        }
+
+        for (cmd, args) in [
+            ("/bin/sh", &["-c", "git diff HEAD -- src/lib.rs"][..]),
+            ("git", &["show", "HEAD:src/lib.rs"][..]),
+        ] {
+            let (create, val) = make_create(cmd, args);
+            assert_eq!(
+                sgian_terminal_prohibition(&spec, &create, &val),
+                None,
+                "expected no prohibition for {cmd} {args:?}"
+            );
+        }
+    }
 }
