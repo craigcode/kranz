@@ -1,0 +1,3 @@
+Don't use `cargo test --workspace` as a contract command assertion. The engine kills contract commands at 600 s, and the operator reports t…
+
+Don't use `cargo test --workspace` as a contract command assertion. The engine kills contract commands at 600 s, and the operator reports the full suite takes 30–80 minutes here (ticket contract-command-timeout), while the contract can't be revised after approval. Instead, use separate scoped commands such as `cargo test -p kranz-engine --lib` and `cargo test -p kranz-engine --test mission_test`. Wrap each one with the anti-vacuity grep: `out=$(... 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`.
