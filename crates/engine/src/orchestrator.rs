@@ -5961,27 +5961,46 @@ impl MissionEngine {
         env: &HashMap<String, String>,
         sandbox: &crate::command_exec::GateSandbox,
         shell: &crate::contract_shell::HostShell,
+        config: &MissionConfig,
     ) -> Option<String> {
-        let command_assertions: Vec<(String, Option<String>)> = contract
+        let command_assertions: Vec<Assertion> = contract
             .iter()
             .filter(|a| a.check == AssertionCheck::Command)
-            .map(|a| (a.id.clone(), a.command.clone()))
+            .cloned()
             .collect();
         if command_assertions.is_empty() {
             return None;
         }
         let mut rendered = String::new();
-        for (id, command) in command_assertions {
-            match command.as_deref() {
+        for assertion in command_assertions {
+            let id = &assertion.id;
+            match assertion.command.as_deref() {
                 Some(command) => {
-                    let (ok, output) = crate::command_exec::run_contract_command_sandboxed(
-                        root, command, env, sandbox, shell,
+                    let limit = crate::contract_timeout::resolve(&assertion, config);
+                    let run = crate::command_exec::run_contract_command_timed(
+                        root,
+                        command,
+                        limit.duration(),
+                        env,
+                        sandbox,
+                        shell,
                     )
                     .await;
-                    let verdict = if ok { "PASS" } else { "FAIL" };
+                    let verdict = if run.timed_out {
+                        format!(
+                            "TIMEOUT after {}s (limit from {})",
+                            limit.secs,
+                            limit.source.label()
+                        )
+                    } else if run.code == Some(0) {
+                        "PASS".to_string()
+                    } else {
+                        "FAIL".to_string()
+                    };
                     // The verdict line is the engine's. The output is whatever
                     // the mission's own code printed, so it goes in a fence.
-                    let tail = crate::presentation::fence_command_output(&scrub::scrub(&output));
+                    let tail =
+                        crate::presentation::fence_command_output(&scrub::scrub(&run.output));
                     rendered.push_str(&format!(
                         "- [{id}] `{command}` → {verdict} (shell: {})\n{tail}",
                         shell.label()
@@ -6007,21 +6026,39 @@ impl MissionEngine {
         env: &HashMap<String, String>,
         sandbox: &crate::command_exec::GateSandbox,
         shell: &crate::contract_shell::HostShell,
+        config: &MissionConfig,
     ) -> Vec<(String, bool, String)> {
-        let command_assertions: Vec<(String, Option<String>)> = contract
+        let command_assertions: Vec<Assertion> = contract
             .iter()
             .filter(|a| a.check == AssertionCheck::Command)
-            .map(|a| (a.id.clone(), a.command.clone()))
+            .cloned()
             .collect();
         let mut results = Vec::new();
-        for (id, command) in command_assertions {
-            match command.as_deref() {
+        for assertion in command_assertions {
+            let id = assertion.id.clone();
+            match assertion.command.as_deref() {
                 Some(command) => {
-                    let (ok, output) = crate::command_exec::run_contract_command_sandboxed(
-                        root, command, env, sandbox, shell,
+                    let limit = crate::contract_timeout::resolve(&assertion, config);
+                    let run = crate::command_exec::run_contract_command_timed(
+                        root,
+                        command,
+                        limit.duration(),
+                        env,
+                        sandbox,
+                        shell,
                     )
                     .await;
-                    let detail = crate::presentation::fence_command_output(&scrub::scrub(&output));
+                    let mut detail =
+                        crate::presentation::fence_command_output(&scrub::scrub(&run.output));
+                    if run.timed_out {
+                        detail = format!(
+                            "TIMEOUT after {}s (limit from {})\n{}",
+                            limit.secs,
+                            limit.source.label(),
+                            detail
+                        );
+                    }
+                    let ok = !run.timed_out && run.code == Some(0);
                     results.push((id, ok, detail));
                 }
                 None => results.push((
@@ -6159,6 +6196,7 @@ impl MissionEngine {
                 &env,
                 &gate_sandbox,
                 &shell,
+                &self.state.config,
             )
             .await;
             // Pty-script assertions (ticket pty-functional-validation): the
@@ -6247,6 +6285,7 @@ impl MissionEngine {
                     &env,
                     &gate_sandbox,
                     &shell,
+                    &self.state.config,
                 )
                 .await;
                 for (assertion_id, ok, detail) in notdue_commands {
@@ -17038,6 +17077,7 @@ pub(crate) mod tests {
             &env,
             &sandbox,
             &shell,
+            &MissionConfig::default(),
         )
         .await
         .expect("one command assertion renders a line");

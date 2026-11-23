@@ -463,6 +463,22 @@ pub(crate) async fn run_bounded_argv(
     env: &HashMap<String, String>,
     raw_tail: Option<&str>,
 ) -> (Option<i32>, String) {
+    run_bounded_argv_core(cwd, program, args, timeout, env, raw_tail)
+        .await
+        .into_code_output()
+}
+
+/// [`run_bounded_argv`]'s core, additionally reporting whether the run ended
+/// in a timeout — used by [`run_contract_command_timed`] to produce a typed
+/// [`ContractCommandRun`].
+async fn run_bounded_argv_core(
+    cwd: &std::path::Path,
+    program: &std::path::Path,
+    args: &[String],
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    raw_tail: Option<&str>,
+) -> BoundedOutcome {
     let mut cmd = tokio::process::Command::new(program);
     #[cfg(windows)]
     if let Some(tail) = raw_tail {
@@ -476,7 +492,7 @@ pub(crate) async fn run_bounded_argv(
         cmd.args(args);
     }
     cmd.env_clear();
-    run_command_bounded(configure_bounded_child(cmd, cwd, env), timeout).await
+    run_command_bounded_core(configure_bounded_child(cmd, cwd, env), timeout).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,7 +1440,11 @@ pub(crate) fn run_bounded_gate_command_resolved_with_code(
 /// [`crate::contract_shell::HostShell`] instead of [`shell_argv`]'s fixed
 /// `cmd`/`sh` choice. Contract-lane callers only (validation round, final
 /// gate, approval contract lint) — merge gates and every other caller keep
-/// using [`run_shell_command_sandboxed`].
+/// using [`run_shell_command_sandboxed`]. No production caller is left since
+/// every contract-lane path now resolves its own timeout via
+/// [`crate::contract_timeout::resolve`] and calls [`run_contract_command_timed`]
+/// directly; kept for test coverage of the fixed-600s shape.
+#[allow(dead_code)]
 pub(crate) async fn run_contract_command_sandboxed(
     cwd: &std::path::Path,
     command: &str,
@@ -1496,6 +1516,33 @@ pub(crate) async fn run_contract_command_sandboxed_with_code(
     sandbox: &GateSandbox,
     shell: &crate::contract_shell::HostShell,
 ) -> (Option<i32>, String) {
+    let run = run_contract_command_timed(cwd, command, timeout, env, sandbox, shell).await;
+    (run.code, run.output)
+}
+
+/// The outcome of one engine-run contract `command` assertion, distinguishing
+/// a timeout from every other way the run can end (non-zero exit, spawn
+/// failure, sandbox wrap failure) — so callers can report a timeout as a
+/// timeout instead of an ordinary command failure.
+pub(crate) struct ContractCommandRun {
+    pub code: Option<i32>,
+    pub output: String,
+    pub timed_out: bool,
+}
+
+/// [`run_contract_command_sandboxed_with_code`], additionally reporting
+/// whether the run ended in a timeout (set from the bounded core's own
+/// timeout arm — never inferred from elapsed time or output text). Spawn
+/// failure, sandbox-wrap failure and a non-zero exit all give
+/// `timed_out: false`.
+pub(crate) async fn run_contract_command_timed(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+    shell: &crate::contract_shell::HostShell,
+) -> ContractCommandRun {
     let env = contract_shell_env(
         gate_env_for_sandbox(env, sandbox),
         sandbox,
@@ -1505,17 +1552,20 @@ pub(crate) async fn run_contract_command_sandboxed_with_code(
     let wrapped = match sandbox.wrap_contract_shell(command, &env, shell) {
         Ok(wrapped) => wrapped,
         Err(error) => {
-            return (
-                None,
-                format!("gate sandbox wrap failed closed (the command did not run): {error}"),
-            )
+            return ContractCommandRun {
+                code: None,
+                output: format!(
+                    "gate sandbox wrap failed closed (the command did not run): {error}"
+                ),
+                timed_out: false,
+            }
         }
     };
     let client_env = match sandbox {
         GateSandbox::Container { spec, .. } => spec.runtime.client_env(),
         _ => env,
     };
-    let (code, output) = run_bounded_argv(
+    let outcome = run_bounded_argv_core(
         cwd,
         &wrapped.program,
         &wrapped.args,
@@ -1524,6 +1574,8 @@ pub(crate) async fn run_contract_command_sandboxed_with_code(
         wrapped.raw_tail.as_deref(),
     )
     .await;
+    let timed_out = outcome.timed_out();
+    let (code, output) = outcome.into_code_output();
     if code.is_none() {
         if let Some((program, args)) = wrapped.timeout_teardown {
             let _ = run_bounded_argv(
@@ -1537,7 +1589,11 @@ pub(crate) async fn run_contract_command_sandboxed_with_code(
             .await;
         }
     }
-    (code, output)
+    ContractCommandRun {
+        code,
+        output,
+        timed_out,
+    }
 }
 
 /// Synchronous bridge for contract-lane gate execution from approval-time
@@ -1577,6 +1633,46 @@ pub(crate) fn run_contract_command_sandboxed_blocking(
                 None,
                 "approval gate runner panicked before producing a verdict".to_string(),
             )
+        })
+    })
+}
+
+/// [`run_contract_command_sandboxed_blocking`]'s twin returning a typed
+/// [`ContractCommandRun`], for approval-time callers that must tell a
+/// timeout apart from an ordinary failure. Not yet wired into the approval
+/// contract lint — a later feature does that.
+#[allow(dead_code)]
+pub(crate) fn run_contract_command_timed_blocking(
+    cwd: &std::path::Path,
+    command: &str,
+    timeout: Duration,
+    env: &HashMap<String, String>,
+    sandbox: &GateSandbox,
+    shell: &crate::contract_shell::HostShell,
+) -> ContractCommandRun {
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return ContractCommandRun {
+                        code: None,
+                        output: format!("failed to create approval gate runtime: {error}"),
+                        timed_out: false,
+                    }
+                }
+            };
+            runtime.block_on(run_contract_command_timed(
+                cwd, command, timeout, env, sandbox, shell,
+            ))
+        });
+        worker.join().unwrap_or_else(|_| ContractCommandRun {
+            code: None,
+            output: "approval gate runner panicked before producing a verdict".to_string(),
+            timed_out: false,
         })
     })
 }
@@ -1819,14 +1915,37 @@ impl Drop for ArmedChildGroup {
     }
 }
 
-async fn run_command_bounded(
-    cmd: tokio::process::Command,
-    timeout: Duration,
-) -> (Option<i32>, String) {
+/// The bounded-execution core's outcome, distinguishing a timeout from every
+/// other way a run can end (spawn failure, wait failure, normal exit) — so
+/// callers that need to report a timeout as a timeout (rather than an
+/// ordinary failure) don't have to infer it from the output text.
+enum BoundedOutcome {
+    Completed(Option<i32>, String),
+    TimedOut(String),
+}
+
+impl BoundedOutcome {
+    fn into_code_output(self) -> (Option<i32>, String) {
+        match self {
+            BoundedOutcome::Completed(code, output) => (code, output),
+            BoundedOutcome::TimedOut(output) => (None, output),
+        }
+    }
+
+    fn timed_out(&self) -> bool {
+        matches!(self, BoundedOutcome::TimedOut(_))
+    }
+}
+
+async fn run_command_bounded(cmd: tokio::process::Command, timeout: Duration) -> (Option<i32>, String) {
+    run_command_bounded_core(cmd, timeout).await.into_code_output()
+}
+
+async fn run_command_bounded_core(cmd: tokio::process::Command, timeout: Duration) -> BoundedOutcome {
     let mut cmd = cmd;
     let mut child = match cmd.spawn() {
         Ok(child) => ArmedChildGroup(child),
-        Err(e) => return (None, format!("failed to spawn shell: {e}")),
+        Err(e) => return BoundedOutcome::Completed(None, format!("failed to spawn shell: {e}")),
     };
     let stdout = child
         .0
@@ -1887,7 +2006,7 @@ async fn run_command_bounded(
             }
             let _ = child.0.start_kill();
             let _ = child.0.wait().await;
-            (None, format!("timed out after {}s", timeout.as_secs()))
+            BoundedOutcome::TimedOut(format!("timed out after {}s", timeout.as_secs()))
         }
         Ok(Err(error)) => {
             #[cfg(unix)]
@@ -1898,14 +2017,16 @@ async fn run_command_bounded(
             }
             let _ = child.0.start_kill();
             let _ = child.0.wait().await;
-            (None, error)
+            BoundedOutcome::Completed(None, error)
         }
         Ok(Ok((stdout, stderr))) => {
             #[cfg(unix)]
             crate::backend_claude::kill_unreaped_group(&child.0);
             let status = match child.0.wait().await {
                 Ok(status) => status,
-                Err(e) => return (None, format!("failed waiting for shell: {e}")),
+                Err(e) => {
+                    return BoundedOutcome::Completed(None, format!("failed waiting for shell: {e}"))
+                }
             };
             let mut combined = stdout;
             if !stderr.trim().is_empty() {
@@ -1914,7 +2035,7 @@ async fn run_command_bounded(
             }
             // `status.code()` is None on signal termination; the bool shape
             // (`success()`) is recovered by callers as `code == Some(0)`.
-            (
+            BoundedOutcome::Completed(
                 status.code(),
                 tail_chars(combined.trim_end(), COMMAND_OUTPUT_TAIL),
             )
@@ -2389,6 +2510,82 @@ mod tests {
         .await;
         assert!(ok, "{output}");
         assert!(output.contains("hi"), "{output}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contract_timeout_run_reports_timed_out_distinct_from_failure() {
+        let shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("sh"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let command = crate::test_shell::contract::sleep_millis(dir.path(), 5_000);
+        let started = std::time::Instant::now();
+        let run = run_contract_command_timed(
+            dir.path(),
+            &command,
+            Duration::from_secs(1),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert!(run.timed_out, "expected a timeout: {}", run.output);
+        assert_eq!(run.code, None);
+        assert!(
+            run.output.contains("timed out after 1s"),
+            "{}",
+            run.output
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "must return well under the 5s sleep: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contract_timeout_run_non_timeout_outcomes_report_timed_out_false() {
+        let shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("sh"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+
+        let run = run_contract_command_timed(
+            dir.path(),
+            "exit 1",
+            Duration::from_secs(5),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert!(!run.timed_out, "{}", run.output);
+        assert_eq!(run.code, Some(1));
+
+        // A spawn failure (the resolved shell binary does not exist) fails
+        // closed with timed_out=false too, never a timeout.
+        let missing_shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("/nonexistent/kranz-no-such-sh"),
+        };
+        let run = run_contract_command_timed(
+            dir.path(),
+            "exit 0",
+            Duration::from_secs(5),
+            &env,
+            &GateSandbox::Disabled,
+            &missing_shell,
+        )
+        .await;
+        assert!(!run.timed_out, "{}", run.output);
+        assert_eq!(run.code, None);
+        assert!(run.output.contains("failed to spawn"), "{}", run.output);
     }
 
     /// Resolve the uncontained Windows contract shell, asserting a real
