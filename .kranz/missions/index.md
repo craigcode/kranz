@@ -60,3 +60,4 @@ Approved plans, newest last.
 - 2026-11-16 · [m-2a80fd](m-2a80fd/plan.md) — On Windows, run validation-contract commands under an absolute, worker-unwritable Git-for-Windows POSIX sh when it is av… [truncated]
 - 2026-11-19 · [m-882080](m-882080/plan.md) — Make each milestone validation round judge the milestone only against contract assertions due by that milestone: an asse… [truncated]
 - 2026-11-19 · [m-caf631](m-caf631/plan.md) — Add `git stash` to the built-in worker deny list as one rule that an operator can lift with a grant. Make the worker-den… [truncated]
+- 2026-11-23 · [m-777557](m-777557/plan.md) — Make the limit on engine-run contract `command` assertions configurable: a per-assertion `timeoutSecs` in the plan wins … [truncated]
