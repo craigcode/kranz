@@ -1558,6 +1558,7 @@ impl MissionEngine {
                                 &[],
                                 &sandbox,
                                 &shell,
+                                &self.state.config,
                             )
                         } else {
                             skipped()
@@ -1820,16 +1821,28 @@ impl MissionEngine {
         // contract_health's lint counters keep classifying it.
         if !contract_lint_report.is_empty() {
             let suspect_count = contract_lint_report.suspects().len();
+            let timed_out_count = contract_lint_report.timed_out().len();
             let skipped = contract_lint_report.not_linted().len();
             let mut headline = if skipped == contract_lint_report.results.len() {
                 format!(
                     "contract lint skipped: {skipped} command assertion(s) were not run on \
                      the base (no containment available or budget spent)"
                 )
+            } else if suspect_count > 0 && timed_out_count > 0 {
+                format!(
+                    "contract lint: {suspect_count} author-bug suspect assertion(s) already \
+                     pass on the untouched base, and {timed_out_count} command assertion(s) \
+                     timed out on the untouched base — see plan.md"
+                )
             } else if suspect_count > 0 {
                 format!(
                     "contract lint: {suspect_count} author-bug suspect assertion(s) already \
                      pass on the untouched base — see plan.md"
+                )
+            } else if timed_out_count > 0 {
+                format!(
+                    "contract lint: {timed_out_count} command assertion(s) timed out on the \
+                     untouched base — see plan.md"
                 )
             } else {
                 "contract lint: all command assertions correctly fail on the untouched base"

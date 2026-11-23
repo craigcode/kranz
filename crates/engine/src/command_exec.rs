@@ -1639,9 +1639,7 @@ pub(crate) fn run_contract_command_sandboxed_blocking(
 
 /// [`run_contract_command_sandboxed_blocking`]'s twin returning a typed
 /// [`ContractCommandRun`], for approval-time callers that must tell a
-/// timeout apart from an ordinary failure. Not yet wired into the approval
-/// contract lint — a later feature does that.
-#[allow(dead_code)]
+/// timeout apart from an ordinary failure (the approval contract lint).
 pub(crate) fn run_contract_command_timed_blocking(
     cwd: &std::path::Path,
     command: &str,

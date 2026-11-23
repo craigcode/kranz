@@ -8583,6 +8583,63 @@ async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
     assert!(detail.contains("[a-2] exit 1"), "{detail}");
 }
 
+/// feature f-2-1: a command assertion whose own `timeoutSecs` is smaller
+/// than how long it actually runs must be reported as a TIMEOUT by the
+/// approval-time contract lint — named in both the `orchestrator.decision`
+/// headline and plan.md on a line separate from "already pass" suspects,
+/// and the headline must never claim every assertion correctly fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_timeout_approval_names_timed_out_command_in_decision_and_plan_md() {
+    if !setup() {
+        return;
+    }
+    if !kranz_engine::test_capability::approval_lint_runs_here() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    let mut scoped = assertion("", "the build succeeds", Some("sleep 3"));
+    scoped.timeout_secs = Some(1);
+    let plan = simple_plan(1, vec![scoped]);
+    engine.approve_plan(plan).unwrap();
+
+    let paths = engine.paths().clone();
+    let md = std::fs::read_to_string(paths.plan_md_file()).expect("plan.md written");
+    assert!(
+        md.contains("timed out on the base (no verdict): [a-1] sleep 3"),
+        "{md}"
+    );
+    assert!(
+        md.contains("it will time out at the final gate too unless its limit is raised"),
+        "{md}"
+    );
+
+    drop(engine);
+    let events = read_log(&paths);
+    let decision = events.iter().find_map(|e| match &e.kind {
+        EventKind::OrchestratorDecision { summary, detail }
+            if summary.contains("contract lint") =>
+        {
+            Some((summary.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let (summary, detail) = decision.expect("contract lint orchestrator.decision emitted");
+    assert!(
+        summary.contains("1 command assertion(s) timed out"),
+        "{summary}"
+    );
+    assert!(!summary.contains("already pass"), "{summary}");
+    assert!(
+        !summary.contains("all command assertions correctly fail"),
+        "{summary}"
+    );
+    let detail = detail.expect("decision carries the full lint summary");
+    assert!(detail.contains("[a-1] sleep 3"), "{detail}");
+}
+
 /// Approval-time assertion commands are agent-authored code. They run in a
 /// detached disposable worktree at the pinned base SHA, never in the primary
 /// checkout, even when sandbox enforcement is off. A command that overwrites

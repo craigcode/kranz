@@ -1474,6 +1474,23 @@ mod tests {
         assert!(clean.evaluate().passed());
     }
 
+    /// A timed-out command is not evidence of a polarity/vacuity bug, so it
+    /// must pass `PassesOnBaseGate` exactly like `CouldNotVerdict` does.
+    #[test]
+    fn contract_timeout_lint_gate_passes_on_timed_out_result() {
+        let gate = PassesOnBaseGate {
+            results: vec![lint_result(
+                "a1",
+                "sleep 99",
+                AssertionLintOutcome::TimedOut {
+                    lint_limit_secs: 1,
+                    gate_limit_secs: 1,
+                },
+            )],
+        };
+        assert!(gate.evaluate().passed());
+    }
+
     // ---- env-sensitive --------------------------------------------------
 
     /// Each documented environment signal fails the gate with its reason.

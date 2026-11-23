@@ -355,6 +355,29 @@ mod tests {
         assert_eq!(health.blocked.other, 1);
     }
 
+    /// A lint decision whose headline names a timed-out count (no
+    /// "all command assertions correctly fail" phrase) must count as
+    /// linted but NOT clean — the same treatment as a decision naming
+    /// author-bug suspects.
+    #[test]
+    fn contract_timeout_lint_decision_counts_as_linted_but_not_clean() {
+        let tmp = TempDir::new().unwrap();
+        seed_mission(
+            tmp.path(),
+            "m-1",
+            vec![
+                created(),
+                decision(
+                    "contract lint: 1 command assertion(s) timed out on the untouched base \
+                     — see plan.md",
+                ),
+            ],
+        );
+        let health = compute_contract_health(tmp.path()).unwrap().unwrap();
+        assert_eq!(health.lint_linted, 1);
+        assert_eq!(health.lint_clean, 0);
+    }
+
     #[test]
     fn waiver_with_unparseable_count_still_counts_one() {
         let tmp = TempDir::new().unwrap();
