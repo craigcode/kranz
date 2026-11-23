@@ -12898,8 +12898,7 @@ pub(crate) mod tests {
             "the two repairs must get distinct fix ids: {fix_ids:?}"
         );
         assert_eq!(
-            engine.state.mission.milestones[0].fix_cycles,
-            fix_cycles_before,
+            engine.state.mission.milestones[0].fix_cycles, fix_cycles_before,
             "an operator-directed repair must never spend a fix cycle"
         );
     }
