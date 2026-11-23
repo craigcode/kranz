@@ -897,6 +897,7 @@ mod tests {
             command: Some(command.to_string()),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }
     }

@@ -4,6 +4,8 @@ owner: agent
 freshness: check-on-touch
 last_verified: 2026-11-23
 verified_against:
+  - crates/engine/src/contract_timeout.rs
+  - crates/engine/src/contract_lint.rs
   - crates/engine/src/contract_scope.rs
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -41,6 +43,16 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-23 (UTC) against the configurable contract-command timeout
+(`contract_timeout.rs`, `contract_lint.rs`, `reducer.rs`, `planning.rs`,
+`orchestrator.rs`, `orchestrator/finalization.rs`, `types.rs`): a contract
+`command` assertion may carry `timeoutSecs` (1-14400), validated at plan
+approval and every revision alongside the existing contract-controls check,
+and a revision may not change an assertion's `timeoutSecs` once approved —
+the same extends-only rule as its other fields. `PlanApproved`/`PlanRevised`
+folding and `dry_run_revised_plan` gained this one extra validation call
+each; no event, stage or pipeline order changed.
 
 Rechecked 2026-11-23 (UTC) against the fix-id change: `findings.rs` picks a fix feature's id cycle as the next free one on the milestone (`next_fix_cycle`), so a repair or a tier escalation no longer reuses an id; `orchestrator.rs` gained comments and tests only. Pipeline stages, fix-cycle spending and event schemas are unchanged.
 

@@ -898,6 +898,7 @@ Ship the thing.
                 milestone: None,
                 pty_script: None,
                 negative_control: None,
+                timeout_secs: None,
             }],
             milestones: vec![PlanMilestone {
                 title: "M1".into(),

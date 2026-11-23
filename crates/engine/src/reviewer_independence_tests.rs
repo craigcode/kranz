@@ -685,6 +685,7 @@ async fn reviewer_independence_final_command_mutation_retires_review_across_resu
             command: Some(command),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         });
         let scripts = vec![MockScript::single_shot_json(&serde_json::json!({
@@ -847,6 +848,7 @@ async fn reviewer_independence_pending_only_revision_preserves_completed_prefix_
         command: Some("true".into()),
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     });
     let mut revised_events = EventLog::read_events(&engine.paths.events_file()).unwrap();

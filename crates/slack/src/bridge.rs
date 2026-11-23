@@ -5341,6 +5341,7 @@ mod tests {
                 command: Some("cargo test".into()),
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {

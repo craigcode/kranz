@@ -375,6 +375,7 @@ mod tests {
                 command: Some("pytest".into()),
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {
@@ -416,6 +417,7 @@ mod tests {
                 command: Some("pytest".into()),
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {
