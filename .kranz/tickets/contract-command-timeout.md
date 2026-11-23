@@ -10,9 +10,9 @@ A contract `command` assertion that needs longer than ten minutes, such as `carg
 
 ## Context
 
-Seen in two missions run on 2026-11-19 (m-882080 and m-caf631). Both plans had a `cargo test --workspace` assertion. Both missions delivered every feature and passed every other assertion, then blocked at the final gate because that command was killed with `timed out after 600s`. Run by hand in each mission's integration worktree, the same command passed: 3,547 tests in 32 minutes and 3,534 tests in 77 minutes, with no failures.
+Seen in two missions run on 2026-11-19 (m-882080 and m-caf631). Both plans had a `cargo test --workspace` assertion. Both missions delivered every feature and passed every other assertion, then blocked at the final gate because that command was killed with `timed out after 600s`. Run by hand in each mission's integration worktree, the same command passed (3,547 and 3,534 tests, no failures), taking 32 and 77 minutes. Those times were measured while two missions were building at once and the disk was nearly full. On an idle machine with a warm build the suite takes about 5 minutes (321 seconds, measured 2026-11-23), and mission m-ec06f2 passed the same assertion at its final gate. So the suite fits the limit in good conditions and exceeds it on a cold build or a busy machine.
 
-The limit is `COMMAND_TIMEOUT` (600 seconds) in `crates/engine/src/command_exec.rs`. No configuration reads or overrides it. Every contract command run under it, so any plan that includes the full workspace suite blocks the same way, and the operator can only accept the assertion by hand.
+The limit is `COMMAND_TIMEOUT` (600 seconds) in `crates/engine/src/command_exec.rs`. No configuration reads or overrides it. Every contract command runs under it, so a plan that includes the full workspace suite can block this way whenever the machine is slow, and the operator can only accept the assertion by hand.
 
 The approval-time contract lint also ran the command and hit the same limit, but listed it among assertions that "already pass or could not reach a verdict". The plan did not say the command could not finish in time, so the problem only showed after all the work was done.
 
