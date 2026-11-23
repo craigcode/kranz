@@ -1937,11 +1937,19 @@ impl BoundedOutcome {
     }
 }
 
-async fn run_command_bounded(cmd: tokio::process::Command, timeout: Duration) -> (Option<i32>, String) {
-    run_command_bounded_core(cmd, timeout).await.into_code_output()
+async fn run_command_bounded(
+    cmd: tokio::process::Command,
+    timeout: Duration,
+) -> (Option<i32>, String) {
+    run_command_bounded_core(cmd, timeout)
+        .await
+        .into_code_output()
 }
 
-async fn run_command_bounded_core(cmd: tokio::process::Command, timeout: Duration) -> BoundedOutcome {
+async fn run_command_bounded_core(
+    cmd: tokio::process::Command,
+    timeout: Duration,
+) -> BoundedOutcome {
     let mut cmd = cmd;
     let mut child = match cmd.spawn() {
         Ok(child) => ArmedChildGroup(child),
@@ -2025,7 +2033,10 @@ async fn run_command_bounded_core(cmd: tokio::process::Command, timeout: Duratio
             let status = match child.0.wait().await {
                 Ok(status) => status,
                 Err(e) => {
-                    return BoundedOutcome::Completed(None, format!("failed waiting for shell: {e}"))
+                    return BoundedOutcome::Completed(
+                        None,
+                        format!("failed waiting for shell: {e}"),
+                    )
                 }
             };
             let mut combined = stdout;
@@ -2534,11 +2545,7 @@ mod tests {
         .await;
         assert!(run.timed_out, "expected a timeout: {}", run.output);
         assert_eq!(run.code, None);
-        assert!(
-            run.output.contains("timed out after 1s"),
-            "{}",
-            run.output
-        );
+        assert!(run.output.contains("timed out after 1s"), "{}", run.output);
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "must return well under the 5s sleep: {:?}",

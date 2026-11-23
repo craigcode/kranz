@@ -1211,7 +1211,9 @@ async fn contract_timeout_gate_reports_config_timeout_source() {
         finding.evidence
     );
     assert!(
-        finding.evidence.contains("config contractCommandTimeoutSecs"),
+        finding
+            .evidence
+            .contains("config contractCommandTimeoutSecs"),
         "{}",
         finding.evidence
     );
@@ -1247,6 +1249,7 @@ async fn run_contract_timeout_validation_fixture() -> Option<(Arc<MockBackend>, 
         ]),
         validator_with(json!([])),
         worker_pass(),
+        validator_with(json!([])),
     ]));
 
     let cfg = MissionConfig {
