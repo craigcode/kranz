@@ -2,8 +2,10 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-22
+last_verified: 2026-11-23
 verified_against:
+  - crates/engine/src/contract_timeout.rs
+  - crates/engine/src/contract_lint.rs
   - crates/engine/src/contract_scope.rs
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -492,9 +494,22 @@ Once all milestones complete, `final_gate()` runs the mission's
   branch). When enforcement is enabled, the resolved worker sandbox also wraps
   the gate. Qualified ACP profiles derive an offline gate policy with the same
   pinned image and no selected provider login; `off` keeps the environment-only
-  posture. The timeout is 10 minutes
-  (`COMMAND_TIMEOUT`). A non-zero exit produces a critical, non-waivable
-  `command-assertion` finding.
+  posture. The wall-clock limit for each command assertion is resolved by
+  [`contract_timeout::resolve`](../../../crates/engine/src/contract_timeout.rs):
+  the assertion's own `timeoutSecs` wins, else the operator-only
+  `contractCommandTimeoutSecs` in `~/.kranz/config.json`, else 600 seconds
+  (`DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS`); every value is clamped to
+  1..=14400 seconds (`MAX_CONTRACT_COMMAND_TIMEOUT_SECS`) so no plan or
+  config can disable the limit. Validation rounds resolve and enforce the
+  same per-assertion limit before the final gate ever runs. A timeout stays
+  a critical, non-waivable `command-assertion` finding — it is never treated
+  as a pass — but its evidence says the command timed out, states the
+  resolved limit and which source it came from (`plan timeoutSecs`, `config
+  contractCommandTimeoutSecs`, or `default`), and points at raising the
+  limit. Validation-round evidence for a timed-out assertion shows a
+  `TIMEOUT after <n>s (limit from <source>)` verdict instead of `PASS`/`FAIL`.
+  A non-zero exit that is not a timeout produces an ordinary critical,
+  non-waivable `command-assertion` finding.
 - **`agent-judgement` assertions** get one orchestrator verdicts turn, shown
   the `diff_stat(base, "HEAD")` where `base` is the pinned `base_sha` (falls
   back to `base_branch` only for legacy missions with no pinned sha).
