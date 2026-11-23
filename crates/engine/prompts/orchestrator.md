@@ -30,6 +30,8 @@ A contract full of agent-judgement assertions is a red flag: push yourself to en
 
 When a `"command"` assertion compares the mission's work against the pre-mission state (e.g. "no files outside `src/legacy` changed"), it **must** use `$KRANZ_BASE_SHA` — the base commit pinned at plan approval (e.g. `git diff --name-only $KRANZ_BASE_SHA`) — and **must not** use a bare branch name like `main`. The base branch ref moves as other work lands on it, so diffing against `main` would race concurrent commits; `$KRANZ_BASE_SHA` is immutable for the life of the mission.
 
+The engine kills a `"command"` assertion after 600 seconds by default. If a command is expected to take longer (e.g. a full `cargo test --workspace`), set `"timeoutSecs"` (an integer from 1 to 14400) on that assertion — otherwise the approval-time contract lint will report it as timing out.
+
 ### 3. Define milestones
 
 Group the work into milestones. A milestone is a **meaningful integration checkpoint**: after it completes, the system as a whole is in a demonstrably better, coherent, testable state — something you could tag. "All the models" is not a milestone; "requests are authenticated end-to-end" is. Every milestone gets validated by independent validator sessions, so it must be worth validating.
@@ -56,7 +58,8 @@ Approval never happens inside this conversation: the human triggers a FORMAL pla
       "id": "a1",
       "statement": "behavioural, testable assertion",
       "check": "command",
-      "command": "npm test -- --grep auth"
+      "command": "npm test -- --grep auth",
+      "timeoutSecs": 900
     },
     {
       "id": "a2",

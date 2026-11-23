@@ -2,6 +2,8 @@
 title: Let a contract command run longer than ten minutes
 priority: 1
 schedule: once
+state: done
+state-note: Built by mission m-777557. A command assertion's limit is its own timeoutSecs, else the operator-only contractCommandTimeoutSecs in ~/.kranz/config.json, else 600s, capped at 14400s. Validation rounds and the final gate use the same limit. A timeout stays a critical command-assertion finding, worded as a timeout. The approval lint keeps its 600s cap and lists timed-out commands on their own line.
 ---
 
 ## Goal

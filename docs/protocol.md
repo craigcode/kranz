@@ -41,7 +41,12 @@ without advancing its cursor; each successful poll still authenticates the
 complete log prefix. See [server read work](reviews/2026-09-12-server-read-work.md).
 
 Command assertions may include optional
-[`negativeControl`](contract-controls.md) definitions. Milestone block/lift
+[`negativeControl`](contract-controls.md) definitions, and an optional
+`timeoutSecs` (integer, 1-14400) overriding the engine's 600-second default
+wall-clock limit for that one command; the operator-only config
+`contractCommandTimeoutSecs` in `~/.kranz/config.json` is consulted when
+`timeoutSecs` is absent (see [gates](knowledge/validation/gates.md)).
+Milestone block/lift
 events may include optional `blockContext` with typed `owner` and `cause`; see
 the [block context contract](reviews/2026-09-12-block-causes-contract.md).
 Absent fields retain legacy behavior.

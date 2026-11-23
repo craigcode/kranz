@@ -558,6 +558,7 @@ fn assertion(id: &str, statement: &str, command: Option<&str>) -> Assertion {
         command: command.map(str::to_string),
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     }
 }
@@ -1072,6 +1073,271 @@ async fn assertion_due_final_gate_fails_scoped_assertion() {
         .expect("a critical command-assertion finding for a-1");
     assert_eq!(finding.severity, "critical");
     assert_eq!(finding.class, "command-assertion");
+}
+
+/// Final gate: a command assertion with its own `timeoutSecs: 1` that sleeps
+/// much longer must be reported as a TIMEOUT (critical, class
+/// `command-assertion`), never silently become a pass, and must name the
+/// plan as the limit's source — not the old fixed 600s.
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_timeout_gate_reports_assertion_timeout_not_600s() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let mut scoped = assertion("a-1", "the build succeeds", Some("sleep 3"));
+    scoped.milestone = Some("M1".to_string());
+    scoped.timeout_secs = Some(1);
+    let contract = vec![scoped];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "command not runnable in this environment"),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "still not runnable"),
+        ]),
+        worker_pass(),
+    ]));
+
+    let cfg = MissionConfig {
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_ne!(
+        status,
+        MissionStatus::Complete,
+        "a timed-out command assertion must never let the mission complete"
+    );
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let finding = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ValidationFinding { finding, .. } if finding.subject == "a-1" => {
+                Some(finding.clone())
+            }
+            _ => None,
+        })
+        .expect("a critical command-assertion finding for a-1");
+    assert_eq!(finding.severity, "critical");
+    assert_eq!(finding.class, "command-assertion");
+    assert!(
+        finding.evidence.contains("timed out after 1s"),
+        "{}",
+        finding.evidence
+    );
+    assert!(
+        finding.evidence.contains("plan timeoutSecs"),
+        "{}",
+        finding.evidence
+    );
+    assert!(
+        !finding.evidence.contains("600s"),
+        "must not mention the old fixed 600s limit: {}",
+        finding.evidence
+    );
+}
+
+/// Same shape, but the limit comes from the operator's
+/// `contractCommandTimeoutSecs` config (no per-assertion `timeoutSecs`): the
+/// final-gate evidence must name the config as the limit's source.
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_timeout_gate_reports_config_timeout_source() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let mut scoped = assertion("a-1", "the build succeeds", Some("sleep 3"));
+    scoped.milestone = Some("M1".to_string());
+    let contract = vec![scoped];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "command not runnable in this environment"),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "still not runnable"),
+        ]),
+        worker_pass(),
+    ]));
+
+    let cfg = MissionConfig {
+        max_fix_cycles_per_milestone: 1,
+        contract_command_timeout_secs: Some(1),
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_ne!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let finding = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ValidationFinding { finding, .. } if finding.subject == "a-1" => {
+                Some(finding.clone())
+            }
+            _ => None,
+        })
+        .expect("a critical command-assertion finding for a-1");
+    assert!(
+        finding.evidence.contains("timed out after 1s"),
+        "{}",
+        finding.evidence
+    );
+    assert!(
+        finding
+            .evidence
+            .contains("config contractCommandTimeoutSecs"),
+        "{}",
+        finding.evidence
+    );
+}
+
+/// Shared fixture for the `contract_timeout_validation_` tests: a single
+/// milestone/feature mission whose one command assertion (`timeoutSecs: 1`)
+/// sleeps longer than its limit. The functional validator round sees it
+/// (hence `skip_functional: false`) and reports no findings, so the
+/// milestone tags — but the final gate reruns the same command and times out
+/// again, is refused waiver twice, and the mission Blocks. Returns the
+/// backend's recorded session specs (to inspect the validator's rendered
+/// task) and the event log (to inspect the final-gate finding).
+async fn run_contract_timeout_validation_fixture() -> Option<(Arc<MockBackend>, Vec<Event>)> {
+    if !setup() {
+        return None;
+    }
+    let (_dir, root) = init_repo();
+
+    let mut scoped = assertion("a-1", "the build succeeds", Some("sleep 3"));
+    scoped.timeout_secs = Some(1);
+    let contract = vec![scoped];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "command not runnable in this environment"),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "still not runnable"),
+        ]),
+        validator_with(json!([])),
+        worker_pass(),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        max_fix_cycles_per_milestone: 1,
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_ne!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    Some((backend, events))
+}
+
+/// The validation round's rendered contract evidence (handed to the
+/// functional validator) must show the timed-out assertion as a `TIMEOUT`
+/// verdict, never a plain `FAIL` — a timed-out command is a distinct
+/// outcome, not folded back into an ordinary failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_timeout_validation_round_evidence_shows_timeout_not_fail() {
+    let Some((backend, _events)) = run_contract_timeout_validation_fixture().await else {
+        return;
+    };
+
+    let specs = backend.started_specs();
+    let validator_task = specs
+        .iter()
+        .find_map(|s| match &s.prompt {
+            PromptMode::SingleShot(task) if task.contains("Validate milestone") => Some(task),
+            _ => None,
+        })
+        .expect("a functional validator session ran");
+    assert!(
+        validator_task.contains("TIMEOUT after 1s"),
+        "{validator_task}"
+    );
+    assert!(
+        !validator_task.contains("→ FAIL"),
+        "a timed-out command must not render as FAIL: {validator_task}"
+    );
+}
+
+/// The validation round and the final gate independently resolve the same
+/// assertion's timeout limit — same seconds, same source label — since both
+/// call the one shared `contract_timeout::resolve`.
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_timeout_validation_round_and_gate_agree_on_limit() {
+    let Some((backend, events)) = run_contract_timeout_validation_fixture().await else {
+        return;
+    };
+
+    let specs = backend.started_specs();
+    let validator_task = specs
+        .iter()
+        .find_map(|s| match &s.prompt {
+            PromptMode::SingleShot(task) if task.contains("Validate milestone") => Some(task),
+            _ => None,
+        })
+        .expect("a functional validator session ran");
+    assert!(
+        validator_task.contains("TIMEOUT after 1s (limit from plan timeoutSecs)"),
+        "{validator_task}"
+    );
+
+    let finding = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::ValidationFinding { finding, .. } if finding.subject == "a-1" => {
+                Some(finding.clone())
+            }
+            _ => None,
+        })
+        .expect("a critical command-assertion finding for a-1 at the final gate");
+    assert!(
+        finding
+            .evidence
+            .contains("limit for a-1: 1s from plan timeoutSecs"),
+        "{}",
+        finding.evidence
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5067,6 +5333,7 @@ async fn declared_pty_script_that_never_executes_cannot_green() {
         command: None,
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     }];
 
@@ -5159,6 +5426,7 @@ async fn cancelling_pty_validation_stops_writes_before_mission_unlock() {
         command: None,
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: Some(PtyScript {
             command: "printf '%s' $$ > pty.pid; exec sleep 30".into(),
             steps: vec![PtyStep::Expect {
@@ -5234,6 +5502,7 @@ async fn declared_pty_script_executes_and_passes_greens() {
         command: None,
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: Some(PtyScript {
             command: "printf '> '; while IFS= read -r line; do case \"$line\" in quit) \
             milestone: None,
@@ -8511,6 +8780,63 @@ async fn approval_lint_surfaces_suspects_in_plan_md_and_decision() {
     let detail = detail.expect("decision carries the full lint summary");
     assert!(detail.contains("[a-1] exit 0"), "{detail}");
     assert!(detail.contains("[a-2] exit 1"), "{detail}");
+}
+
+/// feature f-2-1: a command assertion whose own `timeoutSecs` is smaller
+/// than how long it actually runs must be reported as a TIMEOUT by the
+/// approval-time contract lint — named in both the `orchestrator.decision`
+/// headline and plan.md on a line separate from "already pass" suspects,
+/// and the headline must never claim every assertion correctly fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn contract_timeout_approval_names_timed_out_command_in_decision_and_plan_md() {
+    if !setup() {
+        return;
+    }
+    if !kranz_engine::test_capability::approval_lint_runs_here() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let backend = Arc::new(MockBackend::new());
+    let mut engine = make_engine(&backend, &root, test_cfg());
+
+    let mut scoped = assertion("", "the build succeeds", Some("sleep 3"));
+    scoped.timeout_secs = Some(1);
+    let plan = simple_plan(1, vec![scoped]);
+    engine.approve_plan(plan).unwrap();
+
+    let paths = engine.paths().clone();
+    let md = std::fs::read_to_string(paths.plan_md_file()).expect("plan.md written");
+    assert!(
+        md.contains("timed out on the base (no verdict): [a-1] sleep 3"),
+        "{md}"
+    );
+    assert!(
+        md.contains("it will time out at the final gate too unless its limit is raised"),
+        "{md}"
+    );
+
+    drop(engine);
+    let events = read_log(&paths);
+    let decision = events.iter().find_map(|e| match &e.kind {
+        EventKind::OrchestratorDecision { summary, detail }
+            if summary.contains("contract lint") =>
+        {
+            Some((summary.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let (summary, detail) = decision.expect("contract lint orchestrator.decision emitted");
+    assert!(
+        summary.contains("1 command assertion(s) timed out"),
+        "{summary}"
+    );
+    assert!(!summary.contains("already pass"), "{summary}");
+    assert!(
+        !summary.contains("all command assertions correctly fail"),
+        "{summary}"
+    );
+    let detail = detail.expect("decision carries the full lint summary");
+    assert!(detail.contains("[a-1] sleep 3"), "{detail}");
 }
 
 /// Approval-time assertion commands are agent-authored code. They run in a

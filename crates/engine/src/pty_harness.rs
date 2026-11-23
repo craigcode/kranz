@@ -1099,6 +1099,7 @@ mod tests {
             command: None,
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: Some(PtyScript {
                 command: command.to_string(),
                 steps,
@@ -1249,6 +1250,7 @@ mod tests {
                 command: Some("true".to_string()),
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             },
             Assertion {
@@ -1258,6 +1260,7 @@ mod tests {
                 command: None,
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             },
         ];
@@ -1282,6 +1285,7 @@ mod tests {
             command: None,
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }];
         let run = run_pty_assertions(
@@ -1323,6 +1327,7 @@ mod tests {
             command: None,
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: Some(PtyScript {
                 command: "./repl".to_string(),
                 steps: Vec::new(),

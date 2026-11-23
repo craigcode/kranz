@@ -1,0 +1,227 @@
+# Mission plan — m-777557
+
+**Goal:** Make the limit on engine-run contract `command` assertions configurable: a per-assertion `timeoutSecs` in the plan wins over an operator-only `contractCommandTimeoutSecs` in `~/.kranz/config.json`, which wins over the 600s default, all capped at 14,400s. Validators and the final gate use the same resolved limit, a timed-out command stays a failed assertion but is reported as a timeout, and the approval-time contract lint names timed-out commands separately from commands that pass on the base.
+
+Branch `kranz/mission-m-777557` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Authority granted on approval
+
+Approving this plan grants the following to the mission's sessions with no further prompt.
+
+**Commands** (1; each is a prefix, so `x` also allows `x <anything>`):
+- `cargo run --locked --package kranz -- knowledge-refresh`
+
+**Write paths** (14; glob patterns the mission may change):
+- `crates/engine/src/**`
+- `crates/engine/tests/**`
+- `crates/engine/examples/**`
+- `crates/engine/prompts/orchestrator.md`
+- `crates/cli/src/output.rs`
+- `crates/cli/tests/**`
+- `crates/server/src/tickets.rs`
+- `crates/server/tests/**`
+- `crates/slack/src/outbound.rs`
+- `crates/slack/src/bridge.rs`
+- `docs/knowledge/**`
+- `docs/config-composition.md`
+- `docs/protocol.md`
+- `CHANGELOG.md`
+
+## Cost estimate
+
+Estimated **$8.97 – $44.86** (expected ~$20.55). Rough estimate — live usage is authoritative; based on 50 completed mission(s).
+
+Context-fit check (corpus p90 over 62 plan(s): 4556 chars / 24 files):
+- **f-1-3** (Final gate and validation rounds run under the resolved limit and report timeouts as timeouts) — spec is 5345 chars (corpus p90: 4556)
+- **f-2-1** (Approval contract lint reports timed-out commands as timeouts) — spec points at 25 files (corpus p90: 24)
+
+## Considered alternatives
+
+**Chosen approach:** Per-assertion timeoutSecs (frozen with the contract) over an operator-only global config default over 600s, with a fixed 14,400s engine ceiling, a typed timeout signal from the bounded runner, and a lint that keeps its 600s cap but labels timeouts separately. It fixes the m-882080/m-caf631 blocks without letting a plan or a repo disable the limit, and it leaves the process-tree kill untouched.
+
+Rejected shapes:
+- **Only raise COMMAND_TIMEOUT to e.g. 2 hours globally** — Simplest, but every hung command then burns 2 hours at every validation round, the operator cannot tune it, and the lint still mislabels timeouts.
+- **Config-only limit (no per-assertion field)** — One knob for all assertions forces fast lint/grep assertions to inherit a multi-hour limit, and the plan cannot say which assertion is slow, so approval cannot show it.
+- **Run the approval lint under the full raised limit** — Approval is synchronous, so a 77-minute suite would hold plan approval for over an hour.
+- **New finding class `command-timeout` instead of keeping `command-assertion`** — Changes convert_findings routing and the no-model-waiver rule for command findings, which risks a timeout becoming waivable; the evidence wording distinguishes it without that risk.
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** A plan assertion may carry `timeoutSecs`. A plan without it parses and re-serialises with no `timeoutSecs` key. A value of 0, a value above 14400, or `timeoutSecs` on a non-command assertion is refused, and the message names the assertion id. A revised plan that changes an approved assertion's `timeoutSecs` is refused.
+  `out=$(cargo test -p kranz-engine --lib contract_timeout_schema_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([4-9]|[1-9][0-9]+) passed'`
+- **[a2]** `contractCommandTimeoutSecs` parses from the global config layer. The project layer (`<repo>/.kranz/config.json`) is refused when it sets it. A value of 0 or above 14400 is refused, and the message names the key.
+  `out=$(cargo test -p kranz-engine --lib contract_timeout_config_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([3-9]|[1-9][0-9]+) passed'`
+- **[a3]** An assertion's resolved limit is its own `timeoutSecs` when set, otherwise the config `contractCommandTimeoutSecs`, otherwise exactly 600 seconds, and it never exceeds 14400 seconds.
+  `out=$(cargo test -p kranz-engine --lib contract_timeout_resolve_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([3-9]|[1-9][0-9]+) passed'`
+- **[a4]** With no timeout set anywhere, behaviour is unchanged. The resolved limit is 600 seconds, plan JSON round-trips byte-identically, and config serialises with no new key.
+  `out=$(cargo test -p kranz-engine --lib contract_timeout_default_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([2-9]|[1-9][0-9]+) passed'`
+- **[a5]** The contract-command runner reports a timeout as a typed timeout. A command killed at a 1-second limit is flagged timed out, and its output names 1s. A command that exits non-zero, or that fails to spawn or wrap, is not flagged timed out.
+  `out=$(cargo test -p kranz-engine --lib contract_timeout_run_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([2-9]|[1-9][0-9]+) passed'`
+- **[a6]** At the final gate, a command assertion with a short configured limit is killed at that limit, not at 600 seconds. It produces a critical `command-assertion` finding whose evidence says it timed out after that many seconds and names where the limit came from. The mission does not complete.
+  `out=$(cargo test -p kranz-engine --test mission_test contract_timeout_gate_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([2-9]|[1-9][0-9]+) passed'`
+- **[a7]** Validation rounds run each command assertion under the same resolved limit as the final gate, and render a timed-out command as TIMEOUT with its limit, not as FAIL.
+  `out=$(cargo test -p kranz-engine --test mission_test contract_timeout_validation_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([2-9]|[1-9][0-9]+) passed'`
+- **[a8]** The approval-time contract lint labels a command that timed out on the base tree as a timeout. It is listed on its own line, separately from commands that passed on the base. It does not count as an author-bug suspect that already passes, and it does not count as a clean lint.
+  `out=$(cargo test -p kranz-engine --lib contract_timeout_lint_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([3-9]|[1-9][0-9]+) passed'`
+- **[a9]** Approving a plan whose command assertion cannot finish within its limit on the base tree records an approval decision whose headline names the timeout. plan.md lists that assertion id under the timed-out line, not under the already-pass suspects.
+  `out=$(cargo test -p kranz-engine --test mission_test contract_timeout_approval_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a10]** Anti-vacuity: no test name or other identifier containing `contract_timeout_` existed in `crates/` at the pinned base, so the test filters above match only this mission's new tests.
+  `! git grep -q 'contract_timeout_' $KRANZ_BASE_SHA -- crates`
+- **[a11]** The existing contract-lint, contract-gate and contract-health unit tests still pass.
+  `out=$(cargo test -p kranz-engine --lib contract_lint:: 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed' && out=$(cargo test -p kranz-engine --lib contract_gates:: 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed' && out=$(cargo test -p kranz-engine --lib contract_health:: 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a12]** The orchestrator planning prompt tells planners about `timeoutSecs` for command assertions that need longer than the default limit.
+  `grep -q 'timeoutSecs' crates/engine/prompts/orchestrator.md`
+- **[a13]** The workspace is formatted.
+  `cargo fmt --all --check`
+- **[a14]** Every crate and every test target in the workspace compiles without clippy warnings.
+  `cargo clippy --workspace --all-targets -- -D warnings`
+- **[a15]** The knowledge vault passes its freshness check after this mission's changes to the source files its notes cite.
+  `cargo run --locked --package kranz -- knowledge-refresh`
+- **[a16]** A contract command that exceeds its limit is still killed by the unchanged process-tree kill (unix process group SIGKILL, Windows Job Object, container timeout teardown). No code path turns a timed-out command into a pass or a skip. Merge-gate commands and workspace bootstrap, readiness and data hooks keep their 600-second limit. The body of the human-owned note docs/knowledge/validation/child-containment.md is unedited, apart from a dated Rechecked line at most. *(agent judgement)*
+## Contract lint
+
+Each `check: command` assertion above was run once against the untouched base tree at approval time. Suspects are assertions that already pass (or could not reach a verdict) before this plan's work lands — a possible polarity/vacuity bug in the assertion itself. This never blocks approval.
+
+author-bug suspects (already pass / no verdict on the untouched base): [a10] ! git grep -q 'contract_timeout_' $KRANZ_BASE_SHA -- crates; [a11] out=$(cargo test -p kranz-engine --lib contract_lint:: 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed' && out=$(cargo test -p kranz-engine --lib contract_gates:: 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed' && out=$(cargo test -p kranz-engine --lib contract_health:: 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; [a13] cargo fmt --all --check; [a14] cargo clippy --workspace --all-targets -- -D warnings; [a15] cargo run --locked --package kranz -- knowledge-refresh
+base-expected-to-fail (benign): [a1] out=$(cargo test -p kranz-engine --lib contract_timeout_schema_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([4-9]|[1-9][0-9]+) passed'; [a2] out=$(cargo test -p kranz-engine --lib contract_timeout_config_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([3-9]|[1-9][0-9]+) passed'; [a3] out=$(cargo test -p kranz-engine --lib contract_timeout_resolve_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([3-9]|[1-9][0-9]+) passed'; [a4] out=$(cargo test -p kranz-engine --lib contract_timeout_default_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([2-9]|[1-9][0-9]+) passed'; [a5] out=$(cargo test -p kranz-engine --lib contract_timeout_run_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([2-9]|[1-9][0-9]+) passed'; [a6] out=$(cargo test -p kranz-engine --test mission_test contract_timeout_gate_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([2-9]|[1-9][0-9]+) passed'; [a7] out=$(cargo test -p kranz-engine --test mission_test contract_timeout_validation_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([2-9]|[1-9][0-9]+) passed'; [a8] out=$(cargo test -p kranz-engine --lib contract_timeout_lint_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. ([3-9]|[1-9][0-9]+) passed'; [a9] out=$(cargo test -p kranz-engine --test mission_test contract_timeout_approval_ 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; [a12] grep -q 'timeoutSecs' crates/engine/prompts/orchestrator.md
+
+Lint commands ran under shell: sh
+
+named contract gates (defect classes):
+- vacuous-filter: PASS
+- wrong-polarity: PASS
+- host-shell-syntax: PASS
+- passes-on-base: FAIL
+  [a10] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `! git grep -q 'contract_timeout_' $KRANZ_BASE_SHA -- crates`
+  [a11] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `out=$(cargo test -p kranz-engine --lib contract_lint:: 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed' && out=$(cargo test -p kranz-engine --lib contract_gates:: 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed' && out=$(cargo test -p kranz-engine --lib contract_health:: 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+  [a13] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo fmt --all --check`
+  [a14] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo clippy --workspace --all-targets -- -D warnings`
+  [a15] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo run --locked --package kranz -- knowledge-refresh`
+- env-sensitive: PASS
+
+
+## Milestone 1 — Every contract-command run honours one resolved, bounded limit
+
+### 1.1 Per-assertion timeoutSecs in the contract schema with a hard ceiling
+
+CONTEXT: kranz (Rust workspace) runs each contract `check: command` assertion in a mission plan under a hard 600-second cap, `COMMAND_TIMEOUT` in crates/engine/src/command_exec.rs:149, and nothing can raise it. Full-workspace test suites take 30 to 80 minutes, so they always time out. This mission makes the limit configurable. THIS FEATURE adds only the plan-schema field, its bounds and its validation. Do NOT change how commands execute (a later feature does that).
+
+DO:
+1. Create crates/engine/src/contract_timeout.rs and register it in crates/engine/src/lib.rs (pub(crate) is fine). Define `pub const DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS: u64 = 600;` and `pub const MAX_CONTRACT_COMMAND_TIMEOUT_SECS: u64 = 14_400;` with doc comments: 600 is today's cap, and 14,400 (4h) is a fixed engine ceiling so no plan or config can disable the limit. Add `pub(crate) fn validate(contract: &[crate::types::Assertion]) -> crate::error::Result<()>`, modelled on `crate::contract_controls::validate` and returning the same error variant. It refuses an assertion whose `timeout_secs` is Some(0), or Some(n) with n > 14400, or Some(_) on an assertion whose `check` is not `AssertionCheck::Command` (pty-script has its own ptyScript.timeoutSecs). Every message must contain the assertion id, the offending value and the allowed range 1..=14400.
+2. In crates/engine/src/types.rs `pub struct Assertion` (around line 612), add after `negative_control`: `#[serde(default, skip_serializing_if = "Option::is_none")] pub timeout_secs: Option<u64>,` (serialises as `timeoutSecs`), with a doc comment: the wall-clock limit for this command assertion at validation rounds and the final gate; it wins over config `contractCommandTimeoutSecs`; absent keeps old plans byte-identical.
+3. Every `Assertion { ... }` struct literal in the workspace must gain `timeout_secs: None`. There are about 53 of them in 26 files across crates/engine (src, tests, examples), crates/cli (src/output.rs, tests/cli_test.rs), crates/server (src/tickets.rs, tests/server_test.rs) and crates/slack (src/outbound.rs, src/bridge.rs). `grep -rn 'negative_control: None' crates` finds most, and a perl -pi one-liner inserting a line after them is fine. Then let `cargo clippy --workspace --all-targets -- -D warnings` find the rest.
+4. Call `crate::contract_timeout::validate(&plan.validation_contract)?` right next to every existing `crate::contract_controls::validate(&plan.validation_contract)?` call: crates/engine/src/planning.rs ~line 508, crates/engine/src/reducer.rs ~lines 80 and 994, crates/engine/src/orchestrator.rs ~lines 1348 and 2618 (re-grep, line numbers drift).
+5. Revision freeze: add `|| old.timeout_secs != new.timeout_secs` to the changed-assertion checks in planning.rs `validate_contract_extends` (~line 562) and the matching check in reducer.rs (~line 1096, the one comparing `old.negative_control != new.negative_control`), so a revised plan cannot change an approved assertion's limit.
+6. Add `"timeoutSecs": {"type": "integer", "minimum": 1, "maximum": 14400}` to the assertion `properties` of the plan JSON schema in planning.rs (~lines 640-720, beside "ptyScript" and "negativeControl"), so planners' structured output may emit it. Mention in its description that it applies only to check=command.
+
+TESTS (unit tests in crates/engine/src, run by `cargo test -p kranz-engine --lib`). Name them EXACTLY with these prefixes, which must not be used for anything else: `contract_timeout_schema_` (at least 4 tests) and `contract_timeout_default_` (at least 1 here; a later feature adds another). No identifier containing `contract_timeout_` may exist outside these new tests.
+
+CONSTRAINTS: additive only. Do not touch command_exec.rs execution paths, the approval lint, merge gates or workspace hooks. Run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` before finishing.
+
+Done when:
+- contract_timeout_schema_: a plan JSON assertion with "timeoutSecs": 5400 deserialises to Some(5400) and re-serialises with timeoutSecs: 5400
+- contract_timeout_schema_: validate refuses timeoutSecs 14401 with a message containing the assertion id and 14400
+- contract_timeout_schema_: validate refuses timeoutSecs 0, and refuses timeoutSecs on an agent-judgement assertion, each message containing the assertion id
+- contract_timeout_schema_: validate_contract_extends (planning) and the reducer's revised-contract check both refuse a revision that changes only timeout_secs of an existing assertion
+- contract_timeout_default_: a plan JSON assertion without timeoutSecs deserialises to None and re-serialises with no timeoutSecs key (byte-identical to the input JSON value)
+- The plan JSON schema in planning.rs lists timeoutSecs with minimum 1 and maximum 14400
+- cargo clippy --workspace --all-targets -- -D warnings passes
+
+### 1.2 Operator-only contractCommandTimeoutSecs config key and the limit resolver
+
+CONTEXT: kranz runs contract `check: command` assertions under a fixed 600s cap (`COMMAND_TIMEOUT`, crates/engine/src/command_exec.rs:149). A previous feature in this mission created crates/engine/src/contract_timeout.rs with `DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS = 600`, `MAX_CONTRACT_COMMAND_TIMEOUT_SECS = 14_400` and `validate()`, and added `timeout_secs: Option<u64>` (`timeoutSecs`) to `Assertion` in crates/engine/src/types.rs. THIS FEATURE adds the operator's mission-wide default and the one function that resolves an assertion's effective limit. Do NOT wire it into execution yet (the next feature does).
+
+DO:
+1. In crates/engine/src/types.rs `MissionConfig` (~line 1650), add next to `agent_command_timeout_secs`: `#[serde(default, skip_serializing_if = "Option::is_none")] pub contract_command_timeout_secs: Option<u64>,` (`contractCommandTimeoutSecs`), with a doc comment: the default wall-clock limit for contract command assertions that set no `timeoutSecs`; absent means 600s; range 1..=14400; operator-only. Set it to None in `impl Default for MissionConfig`. Fix every exhaustive `MissionConfig { .. }` literal that breaks.
+2. In crates/engine/src/config.rs `CONFIG_TRUST_RULES` (~line 377), add `ConfigTrustRule::operator_only("contractCommandTimeoutSecs", PatchClass::Never, "it sets how long engine-run contract commands may run before they are killed")`. The project layer (`<repo>/.kranz/config.json`) is then refused, and runtime patches are refused. The operator changes it by editing ~/.kranz/config.json.
+3. In the config validation function in config.rs (the one that validates values such as hookStatus.endpoint or local backend hosts; find it by grepping `pub fn validate`), refuse a value of 0 or greater than MAX_CONTRACT_COMMAND_TIMEOUT_SECS. The message names `contractCommandTimeoutSecs`, the value and the range 1..=14400.
+4. In crates/engine/src/contract_timeout.rs add `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub(crate) enum TimeoutSource { Assertion, Config, Default }` with `fn label(&self) -> &'static str` returning "plan timeoutSecs", "config contractCommandTimeoutSecs" or "default". Add `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub(crate) struct ContractTimeout { pub secs: u64, pub source: TimeoutSource }` with `pub fn duration(&self) -> std::time::Duration`. Add `pub(crate) fn resolve(assertion: &Assertion, config: &MissionConfig) -> ContractTimeout`: the assertion's timeout_secs wins, else config.contract_command_timeout_secs, else 600 with source Default. Clamp the result to 1..=14400 defensively, since a log written before validation existed must not be able to disable the limit.
+5. If docs or tests enumerate config keys, such as the operator-only list test in config.rs or the config docs test, update them.
+
+TESTS (unit, `cargo test -p kranz-engine --lib`). Exact name prefixes: `contract_timeout_config_` (at least 3), `contract_timeout_resolve_` (at least 3), and one more `contract_timeout_default_` test. No other identifier may contain `contract_timeout_`.
+
+CONSTRAINTS: additive only. Do not change command execution, merge gates, workspace hooks or the approval lint. Run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`.
+
+Done when:
+- contract_timeout_config_: a global-layer config JSON with contractCommandTimeoutSecs 5400 parses to Some(5400)
+- contract_timeout_config_: a project-layer config setting contractCommandTimeoutSecs is refused with the operator-only message naming the key
+- contract_timeout_config_: config validation refuses contractCommandTimeoutSecs 0 and 14401 with messages naming contractCommandTimeoutSecs
+- contract_timeout_resolve_: assertion timeoutSecs 1 with config 3 resolves to 1s with source Assertion
+- contract_timeout_resolve_: assertion without timeoutSecs and config 3 resolves to 3s with source Config
+- contract_timeout_resolve_: an assertion with an out-of-range value constructed directly (bypassing validate) is clamped to 14400
+- contract_timeout_default_: an assertion with no timeoutSecs and a default MissionConfig resolves to exactly 600s with source Default, and a default MissionConfig serialises without a contractCommandTimeoutSecs key
+
+### 1.3 Final gate and validation rounds run under the resolved limit and report timeouts as timeouts
+
+CONTEXT: kranz runs contract `check: command` assertions engine-side at the final gate (crates/engine/src/orchestrator/finalization.rs ~lines 232-269, via `crate::command_exec::run_contract_command_sandboxed`) and in validation rounds (crates/engine/src/orchestrator.rs associated fns `run_contract_commands_for_validation` ~line 5956 and `run_contract_commands_notdue` ~line 6002). All of them use the fixed 600s `COMMAND_TIMEOUT` (crates/engine/src/command_exec.rs:149). Earlier features in this mission added `Assertion.timeout_secs` and crates/engine/src/contract_timeout.rs with `resolve(assertion, &MissionConfig) -> ContractTimeout { secs, source }` (source label via `.source.label()`) and `.duration()`. THIS FEATURE makes every one of those runs use `resolve()`, and makes a timeout distinguishable from a failure. FIRST read docs/knowledge/validation/child-containment.md and the doc comments on `run_command_bounded`, `ArmedChildGroup` and `run_contract_command_sandboxed_with_code` in command_exec.rs. The process-tree kill on timeout (unix process-group SIGKILL via kill_unreaped_group, Windows Job Object kill, the container `timeout_teardown`) MUST NOT change.
+
+DO:
+1. Typed timeout signal. Today `run_command_bounded`'s timeout arm returns `(None, format!("timed out after {}s", ...))` (~line 1874-1891), which callers cannot tell apart from a spawn failure or a wrap failure. Add `pub(crate) struct ContractCommandRun { pub code: Option<i32>, pub output: String, pub timed_out: bool }` and `pub(crate) async fn run_contract_command_timed(cwd, command, timeout: Duration, env, sandbox: &GateSandbox, shell: &HostShell) -> ContractCommandRun`, plus a blocking twin mirroring `run_contract_command_sandboxed_blocking` (a later feature uses it from the approval lint). Set `timed_out` from the bounded core's own timeout arm, for example by having a private inner core return an enum while every existing public/pub(crate) wrapper keeps its exact (Option<i32>, String) return values and output text. Do not infer it from elapsed time or by matching the output text. Spawn failure, wrap failure ('gate sandbox wrap failed closed') and a non-zero exit must give timed_out=false. Keep the container teardown-on-no-exit-code behaviour exactly as in run_contract_command_sandboxed_with_code.
+2. Final gate (finalization.rs). For each command assertion compute `let limit = crate::contract_timeout::resolve(assertion, &self.state.config);` and run with `limit.duration()` through run_contract_command_timed (same gate_root, env, gate_sandbox, contract_shell). If code == Some(0), no finding. If timed_out, push the SAME critical Finding shape (severity "critical", class "command-assertion", rule None), with evidence scrubbed via scrub::scrub: `format!("command timed out after {secs}s (limit for {id}: {secs}s from {source}; raise it with the assertion's timeoutSecs or the operator's contractCommandTimeoutSecs in ~/.kranz/config.json, at most 14400s) — the command did not finish; no failure was observed (shell: {shell}): {command}\n{output}")`. Otherwise keep the existing `command_failed_evidence` wording byte-identical. A timeout must never become a pass, a skip or a waivable finding.
+3. Validation rounds (orchestrator.rs). Both associated fns must run each assertion under `resolve(assertion, config)`. Keep them associated fns WITHOUT a self receiver (their doc comment explains the Send requirement). Pass `&MissionConfig`, or the per-assertion resolved limits, as a new parameter from the call sites. Render verdicts: PASS when code == Some(0), `TIMEOUT after {secs}s (limit from {source})` when timed_out, FAIL otherwise. For notdue results keep ok=false on timeout and put the same TIMEOUT text at the start of the detail.
+4. Grep that no production command-assertion path still calls run_contract_command_sandboxed (the fixed-600s wrapper). Leave the wrapper for any other callers. Do NOT change merge gates (run_shell_command_sandboxed / run_bounded_gate_command*), workspace hooks (workspace_gate.rs uses COMMAND_TIMEOUT for those) or the approval lint (crates/engine/src/contract_lint.rs; a later feature changes it).
+
+TESTS. Exact name prefixes, which no other identifier may use:
+- `contract_timeout_run_`: at least 2 unit tests in crates/engine/src/command_exec.rs, run with `cargo test -p kranz-engine --lib`. Use GateSandbox::Disabled and the test_shell sleep helpers as contract_lint.rs tests do (`crate::test_shell::contract::sleep_millis`), unix-gated if needed.
+- `contract_timeout_gate_`: at least 2 tests in crates/engine/tests/mission_test.rs.
+- `contract_timeout_validation_`: at least 2 tests in crates/engine/tests/mission_test.rs.
+Follow the patterns of existing mission_test.rs tests that drive a mission through validation rounds and the final gate with the mock backend (grep `assertion_due_final_gate_` / `assertion_due_round_` for examples). Use limits of 1 to 3 seconds and sleeps of a few seconds so tests stay fast.
+
+CONSTRAINTS: process-tree kill code unchanged. If you touch command_exec.rs, also re-read child-containment.md: if nothing it states changed, leave it alone (a later feature adds the recheck line). If something it states WOULD change, stop and report that in knownGaps rather than editing it. Run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`.
+
+Done when:
+- contract_timeout_run_: run_contract_command_timed with a 1s limit on a 5s sleep returns timed_out=true, code None, output containing 'timed out after 1s', and returns in well under 5s
+- contract_timeout_run_: a command that exits 1 returns timed_out=false with code Some(1); a wrap or spawn failure returns timed_out=false
+- contract_timeout_gate_: a mission whose command assertion sleeps longer than its timeoutSecs=1 reaches the final gate and gets a critical command-assertion finding whose evidence contains 'timed out after 1s' and 'plan timeoutSecs' and does not contain '600s'; the mission does not complete
+- contract_timeout_gate_: with config contractCommandTimeoutSecs=1 and no per-assertion value, the final-gate evidence contains 'timed out after 1s' and 'config contractCommandTimeoutSecs'
+- contract_timeout_validation_: a validation round's rendered contract evidence shows 'TIMEOUT after 1s' for the timed-out assertion and not 'FAIL'
+- contract_timeout_validation_: the validation round and the final gate report the same limit (seconds and source) for the same assertion
+- Existing final-gate failure wording ('command failed (shell: ...)') is unchanged for non-timeout failures
+
+
+## Milestone 2 — The approval lint names timed-out commands before the operator approves
+
+### 2.1 Approval contract lint reports timed-out commands as timeouts
+
+CONTEXT: when a plan is approved, kranz runs each contract `check: command` assertion once against the untouched base tree (crates/engine/src/contract_lint.rs, called from crates/engine/src/orchestrator.rs ~line 1551) to warn the operator about suspect assertions. Today a command that runs out of time (per-command cap `PER_COMMAND_TIMEOUT` = 600s) gets `AssertionLintOutcome::CouldNotVerdict`. That outcome is an 'author-bug suspect' lumped with 'already passes on base', and the approval headline (orchestrator.rs ~lines 1820-1849) then wrongly says 'N author-bug suspect assertion(s) already pass on the untouched base'. Earlier features in this mission added `crate::contract_timeout::resolve(assertion, &MissionConfig) -> ContractTimeout { secs, source }` (the limit validation rounds and the final gate use), and `crate::command_exec::run_contract_command_timed` plus a blocking twin returning `ContractCommandRun { code, output, timed_out }`. Approval is synchronous, so the lint must NOT run commands for longer than its own 600s cap.
+
+DO:
+1. In contract_lint.rs add an outcome `TimedOut { lint_limit_secs: u64, gate_limit_secs: u64 }` (or equivalent fields). For each command assertion, the lint runs with `min(resolved gate limit, PER_COMMAND_TIMEOUT)` using the blocking timed runner. A typed timeout gives TimedOut; any other no-exit-code result stays CouldNotVerdict. Thread the mission config into `run_contract_lint` / `run_contract_lint_with_limits`, or a closure that resolves each assertion's gate limit; the orchestrator.rs caller passes `&self.state.config`. Keep the 180s OVERALL_BUDGET behaviour.
+2. TimedOut is NOT an author-bug suspect (`is_author_bug_suspect` false, excluded from `suspects()`). Add `timed_out()` returning those results. `summary()` gets a separate line, placed after suspects: `timed out on the base (no verdict): [id] command — <detail>; ...`. When gate_limit_secs <= lint_limit_secs the detail is `timed out after {lint}s, the gate limit for this assertion; it will time out at the final gate too unless its limit is raised (timeoutSecs on the assertion, or contractCommandTimeoutSecs in ~/.kranz/config.json, at most 14400s)`. Otherwise it is `did not finish within the lint's {lint}s cap; the gate allows {gate}s`. Keep the existing label text 'author-bug suspects (already pass / no verdict on the untouched base)' and the other lines byte-identical: tests in crates/engine/tests/mission_test.rs and crates/engine/tests/worktree_isolation.rs assert them.
+3. Approval headline in orchestrator.rs ~1820-1849. Keep the 'contract lint:' prefix (crates/engine/src/contract_health.rs counts by it). When at least one TimedOut exists, the headline must name the count, e.g. `contract lint: {n} command assertion(s) timed out on the untouched base — see plan.md`, combined with the suspect clause when suspects also exist. It must never contain 'all command assertions correctly fail' while a timeout exists, and the 'already pass' clause counts only real suspects. Make sure plan.md (wherever the lint summary is written into it; grep for `summary()` / plan.md rendering) shows the new timed-out line.
+4. contract_health.rs: a lint with a timeout counts as linted but not clean. contract_gates.rs `PassesOnBaseGate`: TimedOut must not fail the gate (same as CouldNotVerdict). Fix any exhaustive matches on AssertionLintOutcome.
+5. The existing test `approval_lint_runner_times_out_slow_command` in contract_lint.rs expects CouldNotVerdict for a timeout. Update it to expect TimedOut, since that is the intended behaviour change. Leave every other existing assertion as is.
+
+TESTS. Exact prefixes, which no other identifier may use: `contract_timeout_lint_` (at least 3 unit tests, `cargo test -p kranz-engine --lib`, in contract_lint.rs / contract_health.rs / contract_gates.rs) and `contract_timeout_approval_` (at least 1 test in crates/engine/tests/mission_test.rs that approves a plan whose command assertion sleeps longer than its timeoutSecs=1 and checks the decision headline and plan.md). Use GateSandbox::Disabled and the test_shell sleep helpers in unit tests, as existing contract_lint tests do.
+
+CONSTRAINTS: lint stays advisory and never blocks approval. Never run a lint command longer than 600s. Do not change final-gate or validation-round behaviour, merge gates or workspace hooks. Run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`, and run `cargo test -p kranz-engine --lib contract_lint::`, `contract_gates::` and `contract_health::`.
+
+Done when:
+- contract_timeout_lint_: a command sleeping 5s with a 1s resolved limit yields TimedOut, is not in suspects(), and summary() lists its id on a 'timed out on the base' line and not on the author-bug suspects line
+- contract_timeout_lint_: when the gate limit equals the lint limit, the summary says the command will time out at the final gate too unless its limit is raised; when the gate limit exceeds the lint cap, it says the gate allows that many seconds
+- contract_timeout_lint_: contract_health counts a lint decision whose headline names a timeout as linted but not clean, and PassesOnBaseGate passes for a TimedOut result
+- contract_timeout_approval_: approving a plan whose command assertion has timeoutSecs=1 and sleeps longer records a 'contract lint:' decision whose headline names the timed-out count and does not say 'already pass' or 'all command assertions correctly fail', and plan.md lists the id under the timed-out line
+- Existing contract_lint::, contract_gates:: and contract_health:: unit tests pass (with approval_lint_runner_times_out_slow_command updated to TimedOut)
+
+### 2.2 Document the configurable limit, teach planners timeoutSecs, recheck knowledge notes
+
+CONTEXT: this mission made the limit on engine-run contract `check: command` assertions configurable. Resolution order: a per-assertion `timeoutSecs` in the plan (1..=14400, frozen with the approved contract, refused on non-command assertions), else the operator-only `contractCommandTimeoutSecs` in ~/.kranz/config.json (refused from the project layer and from runtime patches), else 600s. The engine caps every value at 14,400s. Validation rounds and the final gate use the same resolved limit. A timeout stays a critical `command-assertion` finding, but its evidence says it timed out, with the limit and where it came from, and validation evidence shows TIMEOUT. The approval-time contract lint (600s cap per command) lists timed-out commands on their own line. Code lives in crates/engine/src/contract_timeout.rs, command_exec.rs (run_contract_command_timed), orchestrator/finalization.rs, orchestrator.rs and contract_lint.rs. Process-tree kill, merge-gate and workspace-hook timeouts are unchanged. THIS FEATURE updates docs and the planning prompt only. No Rust behaviour changes.
+
+DO:
+1. crates/engine/prompts/orchestrator.md, section '### 2. Define the VALIDATION CONTRACT': add one short paragraph saying the engine kills a command assertion after 600 seconds by default, and that a command expected to take longer (e.g. a full `cargo test --workspace`) must set `"timeoutSecs"` (1-14400) on that assertion, or the approval lint will report it as timing out. Optionally show `timeoutSecs` in the JSON example. Change nothing else in the prompt. Run any prompt tests (e.g. `cargo test -p kranz-engine --test config_cost_prompts_test`) and update snapshot-style expectations only where they pin this text.
+2. docs/knowledge/validation/gates.md (owner: agent): replace the sentence 'The timeout is 10 minutes (`COMMAND_TIMEOUT`).' in the Final-gate judgement section with an accurate description of the resolution order, the ceiling, the timeout evidence wording and that validation rounds use the same limit. Add crates/engine/src/contract_timeout.rs and crates/engine/src/contract_lint.rs to verified_against if missing, and set last_verified to today's UTC date. Ground every claim in the code.
+3. Find where config keys such as `agentCommandTimeoutSecs` or `grantRequestTimeoutSecs` are documented (grep docs/ and docs/config-composition.md) and document `contractCommandTimeoutSecs` the same way, including that it is operator-only. If docs/protocol.md documents plan assertion fields, add `timeoutSecs` there.
+4. Add a CHANGELOG.md entry under the unreleased section, following its existing style.
+5. Run `cargo run --locked --package kranz -- knowledge-refresh`. For every note it flags because this mission changed a cited file, follow docs/knowledge/CONVENTIONS.md. For agent or mixed notes, verify the claims against the code and re-date them, fixing any wrong claim. For owner: human notes (e.g. docs/knowledge/validation/child-containment.md, which cites command_exec.rs), you may ONLY re-date and add a dated 'Rechecked YYYY-MM-DD (UTC) ...' line at the top of the body, in the existing style, saying what changed and that nothing the note states changed, and only if that is true. Never edit a human note's body. If a human note has become wrong, stop and report it in knownGaps. Repeat until knowledge-refresh exits 0.
+
+CONSTRAINTS: no Rust source changes beyond prompt-test expectations. Run `cargo fmt --all --check`.
+
+Done when:
+- grep -q 'timeoutSecs' crates/engine/prompts/orchestrator.md succeeds and the prompt states the 600-second default and the 14400 maximum
+- docs/knowledge/validation/gates.md no longer says the timeout is a fixed 10 minutes and describes the resolution order plan timeoutSecs > config contractCommandTimeoutSecs > 600s with the 14400s ceiling
+- contractCommandTimeoutSecs is documented as operator-only alongside the other config keys
+- cargo run --locked --package kranz -- knowledge-refresh exits 0
+- child-containment.md body is unchanged apart from a dated Rechecked line, if one was added
+- Prompt tests (config_cost_prompts_test) pass

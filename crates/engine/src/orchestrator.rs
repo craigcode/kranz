@@ -1346,6 +1346,7 @@ impl MissionEngine {
             "plan",
         )?;
         crate::contract_controls::validate(&plan.validation_contract)?;
+        crate::contract_timeout::validate(&plan.validation_contract)?;
 
         // Resolve the moving base branch exactly once, before any base-owned
         // contract/policy read or mission-branch side effect. Every approval
@@ -1557,6 +1558,7 @@ impl MissionEngine {
                                 &[],
                                 &sandbox,
                                 &shell,
+                                &self.state.config,
                             )
                         } else {
                             skipped()
@@ -1819,16 +1821,28 @@ impl MissionEngine {
         // contract_health's lint counters keep classifying it.
         if !contract_lint_report.is_empty() {
             let suspect_count = contract_lint_report.suspects().len();
+            let timed_out_count = contract_lint_report.timed_out().len();
             let skipped = contract_lint_report.not_linted().len();
             let mut headline = if skipped == contract_lint_report.results.len() {
                 format!(
                     "contract lint skipped: {skipped} command assertion(s) were not run on \
                      the base (no containment available or budget spent)"
                 )
+            } else if suspect_count > 0 && timed_out_count > 0 {
+                format!(
+                    "contract lint: {suspect_count} author-bug suspect assertion(s) already \
+                     pass on the untouched base, and {timed_out_count} command assertion(s) \
+                     timed out on the untouched base — see plan.md"
+                )
             } else if suspect_count > 0 {
                 format!(
                     "contract lint: {suspect_count} author-bug suspect assertion(s) already \
                      pass on the untouched base — see plan.md"
+                )
+            } else if timed_out_count > 0 {
+                format!(
+                    "contract lint: {timed_out_count} command assertion(s) timed out on the \
+                     untouched base — see plan.md"
                 )
             } else {
                 "contract lint: all command assertions correctly fail on the untouched base"
@@ -2616,6 +2630,7 @@ impl MissionEngine {
             ));
         }
         crate::contract_controls::validate(&plan.validation_contract)?;
+        crate::contract_timeout::validate(&plan.validation_contract)?;
 
         // (1) The completed milestones, in current order, must be reproduced
         // unchanged and first in the revised plan.
@@ -5964,27 +5979,46 @@ impl MissionEngine {
         env: &HashMap<String, String>,
         sandbox: &crate::command_exec::GateSandbox,
         shell: &crate::contract_shell::HostShell,
+        config: &MissionConfig,
     ) -> Option<String> {
-        let command_assertions: Vec<(String, Option<String>)> = contract
+        let command_assertions: Vec<Assertion> = contract
             .iter()
             .filter(|a| a.check == AssertionCheck::Command)
-            .map(|a| (a.id.clone(), a.command.clone()))
+            .cloned()
             .collect();
         if command_assertions.is_empty() {
             return None;
         }
         let mut rendered = String::new();
-        for (id, command) in command_assertions {
-            match command.as_deref() {
+        for assertion in command_assertions {
+            let id = &assertion.id;
+            match assertion.command.as_deref() {
                 Some(command) => {
-                    let (ok, output) = crate::command_exec::run_contract_command_sandboxed(
-                        root, command, env, sandbox, shell,
+                    let limit = crate::contract_timeout::resolve(&assertion, config);
+                    let run = crate::command_exec::run_contract_command_timed(
+                        root,
+                        command,
+                        limit.duration(),
+                        env,
+                        sandbox,
+                        shell,
                     )
                     .await;
-                    let verdict = if ok { "PASS" } else { "FAIL" };
+                    let verdict = if run.timed_out {
+                        format!(
+                            "TIMEOUT after {}s (limit from {})",
+                            limit.secs,
+                            limit.source.label()
+                        )
+                    } else if run.code == Some(0) {
+                        "PASS".to_string()
+                    } else {
+                        "FAIL".to_string()
+                    };
                     // The verdict line is the engine's. The output is whatever
                     // the mission's own code printed, so it goes in a fence.
-                    let tail = crate::presentation::fence_command_output(&scrub::scrub(&output));
+                    let tail =
+                        crate::presentation::fence_command_output(&scrub::scrub(&run.output));
                     rendered.push_str(&format!(
                         "- [{id}] `{command}` → {verdict} (shell: {})\n{tail}",
                         shell.label()
@@ -6010,21 +6044,39 @@ impl MissionEngine {
         env: &HashMap<String, String>,
         sandbox: &crate::command_exec::GateSandbox,
         shell: &crate::contract_shell::HostShell,
+        config: &MissionConfig,
     ) -> Vec<(String, bool, String)> {
-        let command_assertions: Vec<(String, Option<String>)> = contract
+        let command_assertions: Vec<Assertion> = contract
             .iter()
             .filter(|a| a.check == AssertionCheck::Command)
-            .map(|a| (a.id.clone(), a.command.clone()))
+            .cloned()
             .collect();
         let mut results = Vec::new();
-        for (id, command) in command_assertions {
-            match command.as_deref() {
+        for assertion in command_assertions {
+            let id = assertion.id.clone();
+            match assertion.command.as_deref() {
                 Some(command) => {
-                    let (ok, output) = crate::command_exec::run_contract_command_sandboxed(
-                        root, command, env, sandbox, shell,
+                    let limit = crate::contract_timeout::resolve(&assertion, config);
+                    let run = crate::command_exec::run_contract_command_timed(
+                        root,
+                        command,
+                        limit.duration(),
+                        env,
+                        sandbox,
+                        shell,
                     )
                     .await;
-                    let detail = crate::presentation::fence_command_output(&scrub::scrub(&output));
+                    let mut detail =
+                        crate::presentation::fence_command_output(&scrub::scrub(&run.output));
+                    if run.timed_out {
+                        detail = format!(
+                            "TIMEOUT after {}s (limit from {})\n{}",
+                            limit.secs,
+                            limit.source.label(),
+                            detail
+                        );
+                    }
+                    let ok = !run.timed_out && run.code == Some(0);
                     results.push((id, ok, detail));
                 }
                 None => results.push((
@@ -6162,6 +6214,7 @@ impl MissionEngine {
                 &env,
                 &gate_sandbox,
                 &shell,
+                &self.state.config,
             )
             .await;
             // Pty-script assertions (ticket pty-functional-validation): the
@@ -6250,6 +6303,7 @@ impl MissionEngine {
                     &env,
                     &gate_sandbox,
                     &shell,
+                    &self.state.config,
                 )
                 .await;
                 for (assertion_id, ok, detail) in notdue_commands {
@@ -11370,6 +11424,7 @@ pub(crate) mod tests {
             milestone: None,
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }];
         engine.state.mission.milestones.push(Milestone {
             id: "ms-1".to_string(),
@@ -12268,6 +12323,7 @@ pub(crate) mod tests {
                 timeout_secs: None,
             }),
             negative_control: None,
+            timeout_secs: None,
         };
         let contract = vec![
             pty("a-pty"),
@@ -12280,6 +12336,7 @@ pub(crate) mod tests {
                 milestone: None,
                 pty_script: None,
                 negative_control: None,
+                timeout_secs: None,
             },
         ];
         let transcript_event = |id: &str, verdict: crate::gate::GateVerdict, seq: u64| Event {
@@ -12405,6 +12462,7 @@ pub(crate) mod tests {
             milestone: None,
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }];
         engine.state.mission.milestones.push(Milestone {
             id: "ms-1".to_string(),
@@ -12527,6 +12585,7 @@ pub(crate) mod tests {
             milestone: None,
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }];
         // The local backend cannot apply the resolved sandbox profile, so
         // mandatory validator containment fails closed without the explicit
@@ -17111,6 +17170,7 @@ pub(crate) mod tests {
                 command: Some(r#"test "$KRANZ_BASE_SHA" = x"#.to_string()),
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {
@@ -17196,6 +17256,7 @@ pub(crate) mod tests {
             command: Some("exit 0".to_string()),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }];
         let root = tempfile::tempdir().unwrap();
@@ -17212,6 +17273,7 @@ pub(crate) mod tests {
             &env,
             &sandbox,
             &shell,
+            &MissionConfig::default(),
         )
         .await
         .expect("one command assertion renders a line");

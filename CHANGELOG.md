@@ -388,6 +388,17 @@ Notable user-visible changes are documented here. This project follows
 - Fixed: the secret scan skipped added lines that begin with `++`, and
   flagged ordinary prose after the words "basic" or "bearer".
 - Fixed: `kranz config set` leaves the config file owner-only.
+- Added: the wall-clock limit on an engine-run contract `command` assertion
+  is configurable. A per-assertion `timeoutSecs` (1-14400) in the plan wins;
+  otherwise the operator-only config `contractCommandTimeoutSecs` in
+  `~/.kranz/config.json` wins; otherwise the limit stays 600 seconds. Every
+  value is capped at 14400 seconds regardless of source. Validation rounds
+  and the final gate resolve and enforce the same limit, and a timed-out
+  command is still a critical, non-waivable `command-assertion` finding but
+  its evidence says it timed out, names the resolved limit and its source,
+  and validation-round evidence shows a `TIMEOUT` verdict rather than
+  `PASS`/`FAIL`. The approval-time contract lint now lists timed-out
+  commands on their own line, separate from author-bug suspects.
 
 ## 0.5.0 - 2026-11-08
 

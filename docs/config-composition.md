@@ -296,6 +296,17 @@ neither can strip a safety floor, so they are not findings:
   parties: a contract mount that is not listed here refuses provisioning,
   naming it. Paths compare exactly (a trailing `/` is ignored); empty, the
   default, allows none.
+- **`contractCommandTimeoutSecs`**: the wall-clock limit, in seconds, an
+  engine-run contract `command` assertion gets when it carries no
+  `timeoutSecs` of its own. Operator-only — refused from the project layer
+  and from runtime `config-change` patches
+  (`crates/engine/src/config.rs`'s `CONFIG_TRUST_RULES`), since it is a
+  mission-wide ceiling the repository being validated must not loosen on
+  itself. A per-assertion `timeoutSecs` in the plan (1-14400, frozen with
+  the approved contract) wins over this key, which wins over the engine's
+  600-second default; every value is clamped to 1..=14400 regardless of
+  source (`crates/engine/src/contract_timeout.rs`). Validation rounds and
+  the final gate resolve and enforce the same limit.
 
 ## Findings and dispositions
 
