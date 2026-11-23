@@ -1806,6 +1806,13 @@ pub struct MissionConfig {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_command_timeout_secs: Option<u64>,
+    /// The default wall-clock limit for contract `command` assertions that
+    /// set no per-assertion `timeoutSecs`, in seconds. Absent means 600s
+    /// (`DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS`); range 1..=14400
+    /// (`MAX_CONTRACT_COMMAND_TIMEOUT_SECS`). Operator-only: it sets how
+    /// long engine-run contract commands may run before they are killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_command_timeout_secs: Option<u64>,
 }
 
 impl Default for MissionConfig {
@@ -1900,6 +1907,7 @@ impl Default for MissionConfig {
             local_backend_allowed_hosts: Vec::new(),
             grant_request_timeout_secs: None,
             agent_command_timeout_secs: None,
+            contract_command_timeout_secs: None,
         }
     }
 }

@@ -3,12 +3,11 @@
 //! not change how commands execute (see `command_exec.rs`).
 
 use crate::error::{EngineError, Result};
-use crate::types::{Assertion, AssertionCheck};
+use crate::types::{Assertion, AssertionCheck, MissionConfig};
 
 /// Today's hard cap on a contract `command` assertion, unchanged unless a
 /// plan or operator config overrides it (within [`MAX_CONTRACT_COMMAND_TIMEOUT_SECS`]).
 /// Wired into command execution by a later feature.
-#[allow(dead_code)]
 pub const DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS: u64 = 600;
 
 /// A fixed engine ceiling (4 hours): no plan or config may raise a
@@ -41,6 +40,59 @@ pub(crate) fn validate(contract: &[Assertion]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Where a resolved [`ContractTimeout`] came from, for timeout-reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeoutSource {
+    /// The assertion's own `timeoutSecs`.
+    Assertion,
+    /// The operator's `contractCommandTimeoutSecs` in `~/.kranz/config.json`.
+    Config,
+    /// [`DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS`]; neither of the above was set.
+    Default,
+}
+
+impl TimeoutSource {
+    fn label(&self) -> &'static str {
+        match self {
+            TimeoutSource::Assertion => "plan timeoutSecs",
+            TimeoutSource::Config => "config contractCommandTimeoutSecs",
+            TimeoutSource::Default => "default",
+        }
+    }
+}
+
+/// The resolved wall-clock limit for one contract `command` assertion run,
+/// and where it came from (for timeout reporting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContractTimeout {
+    pub secs: u64,
+    pub source: TimeoutSource,
+}
+
+impl ContractTimeout {
+    pub fn duration(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.secs)
+    }
+}
+
+/// Resolve the effective timeout for a contract `command` assertion: the
+/// assertion's own `timeoutSecs` wins, else the operator's
+/// `contractCommandTimeoutSecs`, else [`DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS`].
+/// Clamped to 1..=[`MAX_CONTRACT_COMMAND_TIMEOUT_SECS`] defensively, since a
+/// value written before `validate` existed (or constructed directly,
+/// bypassing it) must not be able to disable the limit.
+pub(crate) fn resolve(assertion: &Assertion, config: &MissionConfig) -> ContractTimeout {
+    let (secs, source) = match assertion.timeout_secs {
+        Some(secs) => (secs, TimeoutSource::Assertion),
+        None => match config.contract_command_timeout_secs {
+            Some(secs) => (secs, TimeoutSource::Config),
+            None => (DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS, TimeoutSource::Default),
+        },
+    };
+    let secs = secs.clamp(1, MAX_CONTRACT_COMMAND_TIMEOUT_SECS);
+    ContractTimeout { secs, source }
 }
 
 #[cfg(test)]
@@ -118,5 +170,53 @@ mod tests {
         let a = assertion("a1", AssertionCheck::Command, None);
         let b = assertion("a2", AssertionCheck::Command, Some(14_400));
         validate(&[a, b]).unwrap();
+    }
+
+    #[test]
+    fn contract_timeout_resolve_assertion_wins_over_config() {
+        let a = assertion("a1", AssertionCheck::Command, Some(1));
+        let config = MissionConfig {
+            contract_command_timeout_secs: Some(3),
+            ..MissionConfig::default()
+        };
+        let resolved = resolve(&a, &config);
+        assert_eq!(resolved.secs, 1);
+        assert_eq!(resolved.source, TimeoutSource::Assertion);
+        assert_eq!(resolved.source.label(), "plan timeoutSecs");
+        assert_eq!(resolved.duration(), std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn contract_timeout_resolve_config_wins_over_default() {
+        let a = assertion("a1", AssertionCheck::Command, None);
+        let config = MissionConfig {
+            contract_command_timeout_secs: Some(3),
+            ..MissionConfig::default()
+        };
+        let resolved = resolve(&a, &config);
+        assert_eq!(resolved.secs, 3);
+        assert_eq!(resolved.source, TimeoutSource::Config);
+        assert_eq!(resolved.source.label(), "config contractCommandTimeoutSecs");
+    }
+
+    #[test]
+    fn contract_timeout_resolve_clamps_out_of_range_value_constructed_directly() {
+        let mut a = assertion("a1", AssertionCheck::Command, None);
+        a.timeout_secs = Some(999_999);
+        let resolved = resolve(&a, &MissionConfig::default());
+        assert_eq!(resolved.secs, MAX_CONTRACT_COMMAND_TIMEOUT_SECS);
+        assert_eq!(resolved.source, TimeoutSource::Assertion);
+    }
+
+    #[test]
+    fn contract_timeout_default_resolves_to_600_with_default_source() {
+        let a = assertion("a1", AssertionCheck::Command, None);
+        let resolved = resolve(&a, &MissionConfig::default());
+        assert_eq!(resolved.secs, 600);
+        assert_eq!(resolved.source, TimeoutSource::Default);
+        assert_eq!(resolved.source.label(), "default");
+
+        let value = serde_json::to_value(MissionConfig::default()).unwrap();
+        assert!(value.get("contractCommandTimeoutSecs").is_none());
     }
 }
