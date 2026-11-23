@@ -2,6 +2,8 @@
 title: A fix feature added while unblocking reuses the next fix's id and stops the mission
 priority: 1
 schedule: once
+state: done
+state-note: Built by mission m-ec06f2. The fix id's cycle is the next one free on the milestone (next_fix_cycle in findings.rs). The same rule fixes the collision after a tier escalation, which the mission found while drafting. events.rs, types.rs and reducer.rs are unchanged.
 ---
 
 ## Goal
