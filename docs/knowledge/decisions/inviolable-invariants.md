@@ -4,6 +4,8 @@ owner: agent
 freshness: check-on-touch
 last_verified: 2026-11-23
 verified_against:
+  - crates/engine/src/contract_timeout.rs
+  - crates/engine/src/contract_lint.rs
   - crates/engine/src/contract_scope.rs
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
@@ -37,6 +39,15 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-23 (UTC) against the configurable contract-command timeout
+(`contract_timeout.rs`, `contract_lint.rs`, `reducer.rs`, `planning.rs`,
+`orchestrator.rs`, `orchestrator/finalization.rs`, `types.rs`): a contract
+`command` assertion's wall-clock limit is now resolved from its own
+`timeoutSecs`, else the operator-only `contractCommandTimeoutSecs` config,
+else 600 seconds, capped at 14400; a timeout still produces a critical
+`command-assertion` finding, never a pass. `MissionConfig` gains one
+additive `#[serde(default)]` key. No invariant changed.
 
 Rechecked 2026-11-23 (UTC) against the fix-id change: `findings.rs` picks a fix feature's id cycle as the next free one on the milestone (`next_fix_cycle`), so a repair or a tier escalation no longer reuses an id; `orchestrator.rs` gained comments and tests only. No invariant changed.
 

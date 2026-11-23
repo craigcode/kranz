@@ -591,6 +591,7 @@ async fn workspace_gate_runs_bootstrap_in_the_integration_worktree() {
         command: Some(file_exists_contract(".boot-marker")),
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     }];
 
@@ -1163,6 +1164,7 @@ async fn base_sha_reaches_sessions_in_worktree_mode() {
         command: Some(gate_base_sha_assertion_command(&expected_base_sha)),
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     });
     engine.approve_plan(plan).unwrap();
@@ -1422,6 +1424,7 @@ fn one_feature_plan_with_contract() -> Plan {
                 command: Some("exit 0".to_string()),
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             },
             Assertion {
@@ -1431,6 +1434,7 @@ fn one_feature_plan_with_contract() -> Plan {
                 command: Some("exit 1".to_string()),
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             },
         ],
@@ -1904,6 +1908,7 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
         command: Some(gate_base_sha_assertion_command(&expected_base_sha)),
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     });
     engine.approve_plan(plan).unwrap();

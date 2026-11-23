@@ -407,6 +407,7 @@ fn plan() -> Plan {
                 command: Some("cargo test".to_string()),
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             },
             Assertion {
@@ -416,6 +417,7 @@ fn plan() -> Plan {
                 command: None,
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             },
         ],

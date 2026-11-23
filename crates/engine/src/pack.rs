@@ -1281,6 +1281,7 @@ kind = "local-dir"
             command: Some("cargo test --workspace zz_pack_contract_floor 2>&1 | grep -qE 'test result: ok\\. [1-9]'".to_string()),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }];
         let tree = tempfile::tempdir().unwrap();

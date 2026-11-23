@@ -2,13 +2,19 @@
 title: The two readiness axes — AMM projection and contract/consent health
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-19
+last_verified: 2026-11-23
 verified_against:
   - crates/cli/src/ready.rs
   - crates/cli/src/amm.rs
   - crates/engine/src/contract_health.rs
   - .kranz/tickets/amm-readiness-projection.md
 ---
+
+Rechecked 2026-11-23 (UTC) against `contract_health.rs`: a lint decision
+whose headline names timed-out command assertion(s) (the configurable
+contract-command timeout) counts as linted but not clean, the same
+treatment as an author-bug-suspect headline. Measurement, mapping and
+threshold are unchanged.
 
 Rechecked 2026-11-19 (UTC) against `contract_health.rs`: the only change is
 one existing `Assertion` literal gaining `milestone: None`. No measurement,

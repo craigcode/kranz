@@ -106,6 +106,7 @@ fn assertion(id: &str, command: Option<&str>) -> Assertion {
         command: command.map(str::to_string),
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     }
 }

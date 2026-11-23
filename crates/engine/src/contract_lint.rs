@@ -18,7 +18,7 @@
 //! killed, sandbox-aware gate runner as validation/final gates; it never
 //! starts a nested runtime on the caller's runtime thread.
 
-use crate::types::{Assertion, AssertionCheck};
+use crate::types::{Assertion, AssertionCheck, MissionConfig};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -42,9 +42,25 @@ pub enum AssertionLintOutcome {
     /// The command exits non-zero on the untouched base tree — the usual,
     /// benign case: the feature simply hasn't landed yet.
     FailedOnBase,
-    /// The command hit the per-command timeout and never produced an exit
-    /// code — treated as a suspect since no verdict could be reached.
+    /// The command hit some other no-exit-code condition (spawn failure,
+    /// sandbox wrap failure) — treated as a suspect since no verdict could
+    /// be reached.
     CouldNotVerdict,
+    /// The command hit a typed wall-clock timeout (reported by the bounded
+    /// executor itself, never inferred from elapsed time) before producing
+    /// an exit code. Not an author-bug suspect: a slow command is not
+    /// evidence of a polarity/vacuity bug, so this is named separately in
+    /// the approval lint rather than lumped with [`Self::CouldNotVerdict`].
+    TimedOut {
+        /// The wall-clock limit actually enforced for this lint run:
+        /// `min(the lint's own per-command cap, the resolved final-gate
+        /// limit)`.
+        lint_limit_secs: u64,
+        /// The resolved final-gate limit for this assertion (per-assertion
+        /// `timeoutSecs`, else operator `contractCommandTimeoutSecs`, else
+        /// the 600s default).
+        gate_limit_secs: u64,
+    },
     /// Skipped because the overall wall-clock lint budget was already spent
     /// before this assertion's turn.
     NotLinted,
@@ -53,6 +69,9 @@ pub enum AssertionLintOutcome {
 impl AssertionLintOutcome {
     /// True for outcomes that warrant operator attention as a possible
     /// author bug: already passing on base, or no verdict could be reached.
+    /// A timeout is NOT included: it is reported separately (see
+    /// [`ContractLintReport::timed_out`]) rather than as an author-bug
+    /// suspect.
     pub fn is_author_bug_suspect(&self) -> bool {
         matches!(
             self,
@@ -101,6 +120,16 @@ impl ContractLintReport {
         self.results
             .iter()
             .filter(|r| r.outcome == AssertionLintOutcome::NotLinted)
+            .collect()
+    }
+
+    /// Results that hit a typed wall-clock timeout against the base — named
+    /// separately from [`Self::suspects`] since a timeout is not evidence of
+    /// a polarity/vacuity author bug.
+    pub fn timed_out(&self) -> Vec<&AssertionLint> {
+        self.results
+            .iter()
+            .filter(|r| matches!(r.outcome, AssertionLintOutcome::TimedOut { .. }))
             .collect()
     }
 
@@ -153,6 +182,38 @@ impl ContractLintReport {
             parts.push(format!(
                 "author-bug suspects (already pass / no verdict on the untouched base): {list}"
             ));
+        }
+
+        let timed_out = self.timed_out();
+        if !timed_out.is_empty() {
+            let list = timed_out
+                .iter()
+                .map(|a| {
+                    let AssertionLintOutcome::TimedOut {
+                        lint_limit_secs,
+                        gate_limit_secs,
+                    } = a.outcome
+                    else {
+                        unreachable!("filtered to TimedOut above")
+                    };
+                    let detail = if gate_limit_secs <= lint_limit_secs {
+                        format!(
+                            "timed out after {lint_limit_secs}s, the gate limit for this \
+                             assertion; it will time out at the final gate too unless its \
+                             limit is raised (timeoutSecs on the assertion, or \
+                             contractCommandTimeoutSecs in ~/.kranz/config.json, at most 14400s)"
+                        )
+                    } else {
+                        format!(
+                            "did not finish within the lint's {lint_limit_secs}s cap; the gate \
+                             allows {gate_limit_secs}s"
+                        )
+                    };
+                    format!("[{}] {} — {detail}", a.id, a.command)
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            parts.push(format!("timed out on the base (no verdict): {list}"));
         }
 
         let expected: Vec<&AssertionLint> = self
@@ -254,9 +315,11 @@ pub(crate) fn containment_usable(
 }
 
 /// Lint every `check: command` assertion in `contract` against the
-/// untouched base tree, using the module's default per-command timeout and
-/// overall budget. `passthrough` is the mission config's
-/// `contractEnvPassthrough` (see [`lint_env`]).
+/// untouched base tree, using the module's default per-command timeout cap
+/// and overall budget. `passthrough` is the mission config's
+/// `contractEnvPassthrough` (see [`lint_env`]). `config` resolves each
+/// assertion's final-gate timeout limit ([`crate::contract_timeout::resolve`])
+/// so a timed-out lint run can report whether the gate would time out too.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_contract_lint(
     cwd: &Path,
@@ -267,6 +330,7 @@ pub(crate) fn run_contract_lint(
     passthrough: &[String],
     sandbox: &crate::command_exec::GateSandbox,
     shell: &crate::contract_shell::HostShell,
+    config: &MissionConfig,
 ) -> ContractLintReport {
     run_contract_lint_with_limits(
         cwd,
@@ -279,12 +343,14 @@ pub(crate) fn run_contract_lint(
         passthrough,
         sandbox,
         shell,
+        config,
     )
 }
 
-/// Same as [`run_contract_lint`] but with injectable `per_command` timeout
-/// and `overall` budget, so tests can exercise timeout/budget behavior
-/// without waiting on the production defaults.
+/// Same as [`run_contract_lint`] but with injectable `lint_cap` (the lint's
+/// own per-command timeout cap — never exceeded regardless of the resolved
+/// gate limit) and `overall` budget, so tests can exercise timeout/budget
+/// behavior without waiting on the production defaults.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_contract_lint_with_limits(
     cwd: &Path,
@@ -292,11 +358,12 @@ pub(crate) fn run_contract_lint_with_limits(
     base_sha: Option<&str>,
     contract: &[Assertion],
     tree_clean_at_base: bool,
-    per_command: Duration,
+    lint_cap: Duration,
     overall: Duration,
     passthrough: &[String],
     sandbox: &crate::command_exec::GateSandbox,
     shell: &crate::contract_shell::HostShell,
+    config: &MissionConfig,
 ) -> ContractLintReport {
     let env = lint_env(scratch, base_sha, passthrough);
     let overall_start = Instant::now();
@@ -321,20 +388,29 @@ pub(crate) fn run_contract_lint_with_limits(
             continue;
         }
 
-        let (code, output_tail) = crate::command_exec::run_contract_command_sandboxed_blocking(
+        let gate_timeout = crate::contract_timeout::resolve(assertion, config);
+        let run_timeout = lint_cap.min(gate_timeout.duration());
+        let run = crate::command_exec::run_contract_command_timed_blocking(
             cwd,
             command,
-            per_command,
+            run_timeout,
             &env,
             sandbox,
             shell,
         );
-        let outcome = classify(code.is_some(), code == Some(0));
+        let outcome = if run.timed_out {
+            AssertionLintOutcome::TimedOut {
+                lint_limit_secs: run_timeout.as_secs(),
+                gate_limit_secs: gate_timeout.secs,
+            }
+        } else {
+            classify(run.code.is_some(), run.code == Some(0))
+        };
         results.push(AssertionLint {
             id: assertion.id.clone(),
             command: command.to_string(),
             outcome,
-            output_tail,
+            output_tail: run.output,
             shell_label: shell.label(),
         });
     }
@@ -381,6 +457,7 @@ mod tests {
             &[],
             &crate::command_exec::GateSandbox::Disabled,
             &shell,
+            &MissionConfig::default(),
         )
     }
 
@@ -392,6 +469,7 @@ mod tests {
             command: Some(command.to_string()),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }
     }
@@ -404,6 +482,7 @@ mod tests {
             command: None,
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }
     }
@@ -467,6 +546,7 @@ mod tests {
             command: Some(cmd.into()),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         };
         let mut judged = command("a-2", "unused");
@@ -564,6 +644,7 @@ mod tests {
             &[],
             &crate::command_exec::GateSandbox::Disabled,
             &shell,
+            &MissionConfig::default(),
         );
         let elapsed = start.elapsed();
 
@@ -572,11 +653,127 @@ mod tests {
             "runner should not wait for the full sleep, took {elapsed:?}"
         );
         assert_eq!(report.results.len(), 1);
-        assert_eq!(
+        assert!(matches!(
             report.results[0].outcome,
-            AssertionLintOutcome::CouldNotVerdict
+            AssertionLintOutcome::TimedOut { .. }
+        ));
+        assert!(!report.results[0].outcome.is_author_bug_suspect());
+    }
+
+    fn command_assertion_with_timeout(id: &str, command: &str, timeout_secs: u64) -> Assertion {
+        let mut a = command_assertion(id, command);
+        a.timeout_secs = Some(timeout_secs);
+        a
+    }
+
+    /// A command sleeping 5s with a resolved 1s limit (`timeoutSecs: 1`)
+    /// must be classified `TimedOut`, excluded from `suspects()`, and named
+    /// on the "timed out on the base" summary line rather than the
+    /// author-bug-suspects line.
+    #[test]
+    fn contract_timeout_lint_classifies_timed_out_separately_from_suspects() {
+        let scratch = tempfile::tempdir().unwrap();
+        let shell = resolve_test_shell(&[scratch.path()]);
+        let contract = vec![command_assertion_with_timeout(
+            "a1",
+            &sleep_for(&shell, scratch.path(), 5_000),
+            1,
+        )];
+        let report = run_contract_lint_with_limits(
+            scratch.path(),
+            scratch.path(),
+            None,
+            &contract,
+            true,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            &[],
+            &crate::command_exec::GateSandbox::Disabled,
+            &shell,
+            &MissionConfig::default(),
         );
-        assert!(report.results[0].outcome.is_author_bug_suspect());
+
+        assert_eq!(report.results.len(), 1);
+        assert!(matches!(
+            report.results[0].outcome,
+            AssertionLintOutcome::TimedOut {
+                lint_limit_secs: 1,
+                gate_limit_secs: 1,
+            }
+        ));
+        assert!(report.suspects().is_empty());
+        assert_eq!(report.timed_out().len(), 1);
+
+        let summary = report.summary();
+        assert!(
+            summary.contains("timed out on the base (no verdict): [a1]"),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("author-bug suspects"),
+            "a timeout must not appear on the suspects line: {summary}"
+        );
+    }
+
+    /// When the lint's own cap equals the resolved gate limit, the summary
+    /// warns that the final gate will time out too unless the limit is
+    /// raised; when the gate allows more than the lint's cap, it instead
+    /// says how many seconds the gate allows.
+    #[test]
+    fn contract_timeout_lint_summary_distinguishes_gate_limit_from_lint_cap() {
+        let scratch = tempfile::tempdir().unwrap();
+        let shell = resolve_test_shell(&[scratch.path()]);
+
+        // gate limit (1s) <= lint cap (600s) -> the run is bounded by the
+        // gate limit, so lint_limit_secs == gate_limit_secs.
+        let contract = vec![command_assertion_with_timeout(
+            "a1",
+            &sleep_for(&shell, scratch.path(), 5_000),
+            1,
+        )];
+        let report = run_contract_lint_with_limits(
+            scratch.path(),
+            scratch.path(),
+            None,
+            &contract,
+            true,
+            Duration::from_secs(600),
+            Duration::from_secs(600),
+            &[],
+            &crate::command_exec::GateSandbox::Disabled,
+            &shell,
+            &MissionConfig::default(),
+        );
+        let summary = report.summary();
+        assert!(
+            summary.contains("it will time out at the final gate too unless its limit is raised"),
+            "{summary}"
+        );
+
+        // lint cap (1s) < gate limit (600s, default) -> the gate allows more
+        // time than the lint used.
+        let contract2 = vec![command_assertion(
+            "a2",
+            &sleep_for(&shell, scratch.path(), 5_000),
+        )];
+        let report2 = run_contract_lint_with_limits(
+            scratch.path(),
+            scratch.path(),
+            None,
+            &contract2,
+            true,
+            Duration::from_secs(1),
+            Duration::from_secs(600),
+            &[],
+            &crate::command_exec::GateSandbox::Disabled,
+            &shell,
+            &MissionConfig::default(),
+        );
+        let summary2 = report2.summary();
+        assert!(
+            summary2.contains("did not finish within the lint's 1s cap; the gate allows 600s"),
+            "{summary2}"
+        );
     }
 
     #[test]
@@ -603,6 +800,7 @@ mod tests {
             &[],
             &crate::command_exec::GateSandbox::Disabled,
             &shell,
+            &MissionConfig::default(),
         );
 
         assert_eq!(report.results.len(), 3);
