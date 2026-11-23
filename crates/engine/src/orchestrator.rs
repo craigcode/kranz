@@ -2819,7 +2819,9 @@ impl MissionEngine {
         // Added features enter as fix-origin features on the target milestone —
         // the only event that can add a feature. Ids reuse the fix-feature
         // shape but on a "re-plan" cycle namespace so they never collide with
-        // validation fix ids (which are ms-<id>-fix-<cycle>-<n>).
+        // validation fix ids (which are ms-<id>-fix-<cycle>-<n>, where <cycle>
+        // is the next free fix-id cycle on the milestone — see
+        // `findings::next_fix_cycle`).
         for (i, pf) in to_add.into_iter().enumerate() {
             let feature = Feature {
                 id: format!("{target_id}-replan-{replan_cycle}-{}", i + 1),
@@ -3424,7 +3426,10 @@ impl MissionEngine {
                 // — resuming validation unchanged would just fail again. The
                 // reducer's fix-cycle guard only increments from Validating
                 // status, so this repair does not spend a fix cycle; it is
-                // not validator-finding loop churn.
+                // not validator-finding loop churn. It still takes the next
+                // free fix-id cycle (`findings::next_fix_cycle`), so repeated
+                // repairs — or a repair followed by a validator finding —
+                // never mint a colliding fix id.
                 let reason = if note.is_empty() {
                     action.clone()
                 } else {
@@ -12155,6 +12160,90 @@ pub(crate) mod tests {
         );
     }
 
+    /// A tier escalation resets `fix_cycles` to 0 but the milestone already
+    /// carries completed fix features from the exhausted cycles — before
+    /// this fix, the post-escalation fix id formula (`fix_cycles + 1`)
+    /// reused the first one's id and the reducer would reject it as a
+    /// duplicate with a different payload. `findings::next_fix_cycle` must
+    /// skip past both existing ids.
+    #[tokio::test]
+    async fn fix_id_unique_after_tier_escalation() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mut cfg = MissionConfig {
+            skip_functional: true,
+            max_fix_cycles_per_milestone: 2,
+            validator_allow_uncontained_degrade: true,
+            ..MissionConfig::default()
+        };
+        cfg.worker.backend = Some("local".to_string());
+        cfg.worker.base_url = Some("http://localhost:8080".to_string());
+        cfg.worker.context_budget = Some(8192);
+        cfg.allow_below_default_worker_model = true;
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            tier_escalation_finding_script("part 1 works"),
+            tier_escalation_orch_script(1),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![
+                fix_feature_for_test("ms-1-fix-1-1", FeatureStatus::Complete),
+                fix_feature_for_test("ms-1-fix-2-1", FeatureStatus::Complete),
+            ],
+            status: MilestoneStatus::Active,
+            fix_cycles: 2,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        });
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Local);
+
+        let result = engine.validation_round(0).await;
+        assert!(result.is_ok(), "escalation round must succeed: {result:?}");
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::TierEscalated { milestone_id, .. } if milestone_id == "ms-1")),
+            "expected tier.escalated: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        let fix_ids: Vec<&str> = engine.state.mission.milestones[0]
+            .features
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        assert!(
+            fix_ids.contains(&"ms-1-fix-3-1"),
+            "expected the post-escalation fix to land on the next free cycle: {fix_ids:?}"
+        );
+        assert_eq!(
+            fix_ids.iter().filter(|id| **id == "ms-1-fix-3-1").count(),
+            1,
+            "fix id must be unique within the milestone: {fix_ids:?}"
+        );
+    }
+
+    fn fix_feature_for_test(id: &str, status: FeatureStatus) -> Feature {
+        Feature {
+            id: id.to_string(),
+            title: "t".to_string(),
+            spec: "s".to_string(),
+            validation_criteria: Vec::new(),
+            origin: FeatureOrigin::Fix,
+            status,
+            worker_runs: Vec::new(),
+            commits: Vec::new(),
+            respawns: 0,
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Declared pty-script that never executed (ticket
     // pty-script-skip-vacuous-green): the final-gate backstop
@@ -12717,6 +12806,101 @@ pub(crate) mod tests {
             events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1")),
             "frontier tier must still block at the cap: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// Streams one `unblock-add-fix` decision per round on the long-lived
+    /// orchestrator session (mirrors `tier_escalation_orch_script`).
+    fn unblock_add_fix_orch_script(decisions: Vec<String>) -> crate::backend_mock::MockScript {
+        use crate::backend_mock::{mock_init, mock_result_text, mock_text};
+        crate::backend_mock::MockScript::streaming(vec![
+            mock_init("orch-session"),
+            mock_result_text("ready"),
+        ])
+        .responding(
+            decisions
+                .into_iter()
+                .map(|reply| vec![mock_text(&reply), mock_result_text(&reply)])
+                .collect(),
+        )
+    }
+
+    /// Two operator-directed `unblock-add-fix` repairs on the same milestone
+    /// — neither spends a fix cycle (the reducer only increments fix_cycles
+    /// on a `fixfeature.created` folded while Validating), so before this
+    /// fix the second repair's id formula (`fix_cycles + 1`) always
+    /// reproduced the first repair's id and the reducer rejected it as a
+    /// duplicate with a different payload. `findings::next_fix_cycle` takes
+    /// the next free cycle instead, so the second repair gets its own id
+    /// even though fix_cycles never moved.
+    #[tokio::test]
+    async fn fix_id_unique_two_repairs_get_distinct_ids() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let decision = |title: &str| {
+            serde_json::json!({
+                "action": "unblock-add-fix",
+                "note": "operator-directed repair",
+                "fix": {
+                    "title": title,
+                    "spec": format!("repair: {title}"),
+                    "validationCriteria": []
+                }
+            })
+            .to_string()
+        };
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            unblock_add_fix_orch_script(vec![decision("first repair"), decision("second repair")]),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Blocked,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        });
+
+        let fix_cycles_before = engine.state.mission.milestones[0].fix_cycles;
+
+        engine
+            .emit(EventKind::UserMessage {
+                text: "repair it".into(),
+                interrupt: false,
+            })
+            .unwrap();
+        engine.handle_blocked(0).await.unwrap();
+
+        // The milestone must still be blockable for a second operator-directed
+        // repair, exactly as it would be if the re-run validation failed again.
+        engine.state.mission.milestones[0].status = MilestoneStatus::Blocked;
+        engine
+            .emit(EventKind::UserMessage {
+                text: "repair it again".into(),
+                interrupt: false,
+            })
+            .unwrap();
+        engine.handle_blocked(0).await.unwrap();
+
+        let fix_ids: Vec<&str> = engine.state.mission.milestones[0]
+            .features
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        assert_eq!(fix_ids.len(), 2, "both repairs must land: {fix_ids:?}");
+        assert_ne!(
+            fix_ids[0], fix_ids[1],
+            "the two repairs must get distinct fix ids: {fix_ids:?}"
+        );
+        assert_eq!(
+            engine.state.mission.milestones[0].fix_cycles,
+            fix_cycles_before,
+            "an operator-directed repair must never spend a fix cycle"
         );
     }
 
