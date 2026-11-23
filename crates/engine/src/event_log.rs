@@ -379,7 +379,15 @@ fn drain_lines<W: std::io::Write>(
 }
 
 fn ensure_absent_or_regular_at(dir: &Dir, name: &str, display: &Path) -> Result<()> {
-    match dir.symlink_metadata(name) {
+    // windows: a rival's steal can leave this name delete-pending, and a
+    // metadata probe in that window is "access is denied" too (see
+    // `settle_delete_pending`). Unsettled, a racing acquire died here with a
+    // raw io error before it ever reached the lock.
+    #[cfg(windows)]
+    let probed = settle_delete_pending(|| dir.symlink_metadata(name));
+    #[cfg(not(windows))]
+    let probed = dir.symlink_metadata(name);
+    match probed {
         Ok(metadata) if metadata.file_type().is_file() => Ok(()),
         Ok(_) => Err(EngineError::InvalidState(format!(
             "refusing non-regular mission runtime path {}",
@@ -398,26 +406,38 @@ fn open_create_new_at(dir: &Dir, name: &str) -> std::io::Result<File> {
         .write(true)
         .create_new(true)
         .follow(FollowSymlinks::No);
-    // windows: a name whose file was just deleted stays in a delete-pending
-    // state until the last handle to it closes, and a create in that window
-    // fails with "access is denied", not "already exists". A rival stealing
-    // a stale lock opens exactly that window. Wait it out, bounded, so the
-    // caller sees the settled answer; a real denial still surfaces.
+    // windows: a create on a delete-pending name fails with "access is
+    // denied", not "already exists" (see `settle_delete_pending`).
     #[cfg(windows)]
+    let opened = settle_delete_pending(|| dir.open_with(name, &options));
+    #[cfg(not(windows))]
+    let opened = dir.open_with(name, &options);
+    opened.map(|file| file.into_std())
+}
+
+/// windows: a name whose file was just deleted stays in a delete-pending
+/// state until the last handle to it closes, and any open, create, metadata
+/// probe or delete of that name in the window fails with "access is denied".
+/// A rival stealing a stale lock opens exactly that window. Run `op`, wait
+/// the window out (bounded), and return the settled answer; a real denial
+/// still surfaces once the retries are spent, and every other result
+/// returns at once.
+#[cfg(any(windows, test))]
+fn settle_delete_pending<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
     for _ in 0..DELETE_PENDING_RETRIES {
-        match dir.open_with(name, &options) {
+        match op() {
             Err(error) if error.kind() == ErrorKind::PermissionDenied => {
                 std::thread::sleep(DELETE_PENDING_BACKOFF);
             }
-            other => return other.map(|file| file.into_std()),
+            other => return other,
         }
     }
-    dir.open_with(name, &options).map(|file| file.into_std())
+    op()
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const DELETE_PENDING_RETRIES: u32 = 50;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const DELETE_PENDING_BACKOFF: Duration = Duration::from_millis(10);
 
 fn open_write_at(dir: &Dir, name: &str, create: bool) -> std::io::Result<File> {
@@ -1219,7 +1239,14 @@ fn steal_lock(
         // (unguarded) create attempt can still slip into the remove→create
         // window and win the freed slot. If it does, loop back and judge
         // THAT holder like any other — never surface the raw io collision.
-        match mission_dir.remove_file(lock_name) {
+        // windows: the holder may be releasing right now, which leaves the
+        // name delete-pending and this remove "access is denied"; settled,
+        // it is NotFound and the loop re-judges.
+        #[cfg(windows)]
+        let removed = settle_delete_pending(|| mission_dir.remove_file(lock_name));
+        #[cfg(not(windows))]
+        let removed = mission_dir.remove_file(lock_name);
+        match removed {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
@@ -2101,6 +2128,70 @@ mod tests {
         symlink(&target, &link).unwrap();
         let err = EventLog::read_events(&link).unwrap_err();
         assert!(err.to_string().contains("refusing"), "{err}");
+    }
+
+    /// The Windows delete-pending window answers "access is denied" for a
+    /// name whose file is on its way out. The wait must return the settled
+    /// answer, whatever it is.
+    #[test]
+    fn delete_pending_settle_returns_the_settled_answer() {
+        let mut calls = 0;
+        let settled = settle_delete_pending(|| {
+            calls += 1;
+            if calls <= 3 {
+                Err(std::io::Error::from(ErrorKind::PermissionDenied))
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(settled.unwrap(), 4, "denials are waited out, then Ok");
+
+        let mut calls = 0;
+        let settled: std::io::Result<()> = settle_delete_pending(|| {
+            calls += 1;
+            if calls <= 2 {
+                Err(std::io::Error::from(ErrorKind::PermissionDenied))
+            } else {
+                Err(std::io::Error::from(ErrorKind::NotFound))
+            }
+        });
+        assert_eq!(settled.unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(calls, 3, "the settled error returns at once");
+    }
+
+    /// Any result other than "access is denied" is already settled: no
+    /// retry, no sleep.
+    #[test]
+    fn delete_pending_settle_does_not_retry_other_results() {
+        let mut calls = 0;
+        let settled: std::io::Result<()> = settle_delete_pending(|| {
+            calls += 1;
+            Err(std::io::Error::from(ErrorKind::AlreadyExists))
+        });
+        assert_eq!(settled.unwrap_err().kind(), ErrorKind::AlreadyExists);
+        assert_eq!(calls, 1);
+
+        let mut calls = 0;
+        let settled = settle_delete_pending(|| {
+            calls += 1;
+            Ok(7)
+        });
+        assert_eq!(settled.unwrap(), 7);
+        assert_eq!(calls, 1);
+    }
+
+    /// A real denial (a lock the user cannot access) must still surface as
+    /// "access is denied" once the bounded wait is spent, never hang and
+    /// never turn into another error.
+    #[test]
+    fn delete_pending_settle_surfaces_a_real_denial() {
+        let mut calls = 0u32;
+        let settled: std::io::Result<()> = settle_delete_pending(|| {
+            calls += 1;
+            Err(std::io::Error::from(ErrorKind::PermissionDenied))
+        });
+        assert_eq!(settled.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        assert_eq!(calls, DELETE_PENDING_RETRIES + 1);
     }
 
     #[cfg(unix)]

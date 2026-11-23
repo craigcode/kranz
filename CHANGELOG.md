@@ -5,6 +5,13 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: on Windows, an acquire of the mission lock that raced another
+  process stealing a stale lock could fail with "Access is denied" where it
+  should report that the mission is locked. The engine already waited out
+  Windows' delete-pending window when creating the lock file; it now does
+  the same for the file-type check before the acquire and for the remove
+  inside the steal. A lock file that really cannot be accessed still
+  reports the denial.
 - Fixed: a fix feature created after an operator-directed repair
   (`unblock-add-fix`) or after a tier escalation no longer reuses an existing
   fix feature id. The mission used to stop with "duplicate
