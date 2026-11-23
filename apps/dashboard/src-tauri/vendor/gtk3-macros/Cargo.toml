@@ -50,7 +50,7 @@ path = "src/lib.rs"
 proc-macro = true
 
 [dependencies.proc-macro-crate]
-version = "1.0"
+version = "3.5"
 
 [dependencies.proc-macro2]
 version = "1.0"
