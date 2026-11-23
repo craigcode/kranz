@@ -39,6 +39,7 @@ pub mod contract_lint;
 pub(crate) mod contract_scope;
 pub(crate) mod contract_shell;
 pub mod contract_sweep;
+pub(crate) mod contract_timeout;
 pub mod corpus_export;
 pub mod cost;
 pub mod decompose;

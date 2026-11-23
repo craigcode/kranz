@@ -111,6 +111,7 @@ fn assertion(checker: &str) -> Assertion {
             timeout_seconds: 5,
             baseline_pair: None,
         }),
+        timeout_secs: None,
     }
 }
 

@@ -78,6 +78,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 return Ok(());
             }
             crate::contract_controls::validate(&plan.validation_contract)?;
+            crate::contract_timeout::validate(&plan.validation_contract)?;
             state.mission.base_sha = base_sha.clone();
             state.mission.goal = plan.goal.clone();
             state.mission.validation_contract = plan.validation_contract.clone();
@@ -992,6 +993,7 @@ fn take_pending_question(
 
 fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> Result<()> {
     crate::contract_controls::validate(&plan.validation_contract)?;
+    crate::contract_timeout::validate(&plan.validation_contract)?;
     if plan.reviewer_independence != state.mission.reviewer_independence {
         return Err(EngineError::Config(
             "plan.revised cannot replace the approved reviewerIndependence policy".into(),
@@ -1095,6 +1097,7 @@ fn ensure_contract_extends(existing: &[Assertion], revised: &[Assertion]) -> Res
             || old.command != new.command
             || old.negative_control != new.negative_control
             || old.milestone != new.milestone
+            || old.timeout_secs != new.timeout_secs
         {
             return Err(EngineError::InvalidState(format!(
                 "plan.revised weakens or changes validation assertion '{}'",

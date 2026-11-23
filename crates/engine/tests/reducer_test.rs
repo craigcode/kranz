@@ -53,6 +53,7 @@ fn plan() -> Plan {
             command: Some("cargo test".to_string()),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }],
         milestones: vec![
@@ -1825,6 +1826,30 @@ fn plan_revision_rejected_mismatched_revision_is_rejected() {
     assert!(err
         .to_string()
         .contains("does not match pending revision 1"));
+}
+
+#[test]
+fn contract_timeout_schema_dry_run_revised_plan_refuses_timeout_secs_change() {
+    let mut approved = plan();
+    approved.validation_contract[0].timeout_secs = Some(1800);
+    let state = fold_kinds(vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: approved.clone(),
+            base_sha: None,
+        },
+        EventKind::PlanRevisionProposed {
+            revision: 1,
+            plan: approved.clone(),
+            instructions: "seed".into(),
+        },
+    ]);
+
+    let mut revised = approved;
+    revised.validation_contract[0].timeout_secs = Some(3600);
+    let err = dry_run_revised_plan(&state, &revised, 1).unwrap_err();
+    assert!(matches!(err, EngineError::InvalidState(_)));
+    assert!(err.to_string().contains("a-1"));
 }
 
 #[test]
@@ -3729,6 +3754,7 @@ fn plan_three_milestones() -> Plan {
             command: Some("cargo test".to_string()),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }],
         milestones: vec![

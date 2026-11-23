@@ -1551,6 +1551,7 @@ mod tests {
                     command: Some("cargo test\u{1b}[K".into()),
                     milestone: None,
                     negative_control: None,
+                    timeout_secs: None,
                     pty_script: None,
                 }],
                 considered_alternatives: None,
@@ -2509,6 +2510,7 @@ mod tests {
                 command: Some("cargo test".to_string()),
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {

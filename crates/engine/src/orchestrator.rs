@@ -1346,6 +1346,7 @@ impl MissionEngine {
             "plan",
         )?;
         crate::contract_controls::validate(&plan.validation_contract)?;
+        crate::contract_timeout::validate(&plan.validation_contract)?;
 
         // Resolve the moving base branch exactly once, before any base-owned
         // contract/policy read or mission-branch side effect. Every approval
@@ -2616,6 +2617,7 @@ impl MissionEngine {
             ));
         }
         crate::contract_controls::validate(&plan.validation_contract)?;
+        crate::contract_timeout::validate(&plan.validation_contract)?;
 
         // (1) The completed milestones, in current order, must be reproduced
         // unchanged and first in the revised plan.
@@ -11365,6 +11367,7 @@ pub(crate) mod tests {
             milestone: None,
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }];
         engine.state.mission.milestones.push(Milestone {
             id: "ms-1".to_string(),
@@ -12179,6 +12182,7 @@ pub(crate) mod tests {
                 timeout_secs: None,
             }),
             negative_control: None,
+            timeout_secs: None,
         };
         let contract = vec![
             pty("a-pty"),
@@ -12191,6 +12195,7 @@ pub(crate) mod tests {
                 milestone: None,
                 pty_script: None,
                 negative_control: None,
+                timeout_secs: None,
             },
         ];
         let transcript_event = |id: &str, verdict: crate::gate::GateVerdict, seq: u64| Event {
@@ -12316,6 +12321,7 @@ pub(crate) mod tests {
             milestone: None,
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }];
         engine.state.mission.milestones.push(Milestone {
             id: "ms-1".to_string(),
@@ -12438,6 +12444,7 @@ pub(crate) mod tests {
             milestone: None,
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }];
         // The local backend cannot apply the resolved sandbox profile, so
         // mandatory validator containment fails closed without the explicit
@@ -16928,6 +16935,7 @@ pub(crate) mod tests {
                 command: Some(r#"test "$KRANZ_BASE_SHA" = x"#.to_string()),
                 milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {
@@ -17013,6 +17021,7 @@ pub(crate) mod tests {
             command: Some("exit 0".to_string()),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }];
         let root = tempfile::tempdir().unwrap();

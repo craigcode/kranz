@@ -609,6 +609,7 @@ mod tests {
             command: None,
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }
     }

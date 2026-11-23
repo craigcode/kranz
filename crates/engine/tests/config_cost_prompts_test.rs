@@ -842,6 +842,7 @@ fn judgement_assertion(id: &str) -> Assertion {
         command: None,
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     }
 }
@@ -854,6 +855,7 @@ fn command_assertion(id: &str, command: &str) -> Assertion {
         command: Some(command.into()),
         milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     }
 }

@@ -632,6 +632,14 @@ pub struct Assertion {
     /// Absent in legacy plans; controls produce advisory evidence only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negative_control: Option<crate::contract_controls::ControlSpec>,
+    /// The wall-clock limit for this command assertion at validation rounds
+    /// and the final gate; applies only when `check` is
+    /// [`AssertionCheck::Command`]. Wins over the operator-only
+    /// `contractCommandTimeoutSecs` config, which wins over the engine
+    /// default. Additive: `None` in every pre-field contract, and
+    /// `skip_serializing_if` keeps old plans byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 /// One scripted terminal session against an interactive target — the

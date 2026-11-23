@@ -392,6 +392,7 @@ mod tests {
             command: Some(command.to_string()),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }
     }
@@ -404,6 +405,7 @@ mod tests {
             command: None,
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }
     }
@@ -467,6 +469,7 @@ mod tests {
             command: Some(cmd.into()),
             milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         };
         let mut judged = command("a-2", "unused");

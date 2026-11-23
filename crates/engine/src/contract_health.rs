@@ -290,6 +290,7 @@ mod tests {
                     command: Some("true".into()),
                     milestone: None,
                     negative_control: None,
+                    timeout_secs: None,
                     pty_script: None,
                 })
                 .collect(),

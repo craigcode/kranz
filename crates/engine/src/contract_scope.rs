@@ -92,6 +92,7 @@ mod tests {
             milestone: milestone.map(str::to_string),
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }
     }
 
