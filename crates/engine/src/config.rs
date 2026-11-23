@@ -3087,8 +3087,8 @@ mod tests {
                 contract_command_timeout_secs: Some(bad),
                 ..MissionConfig::default()
             };
-            let err =
-                validate(&cfg).expect_err(&format!("contractCommandTimeoutSecs {bad} must be refused"));
+            let err = validate(&cfg)
+                .expect_err(&format!("contractCommandTimeoutSecs {bad} must be refused"));
             let msg = err.to_string();
             assert!(msg.contains("contractCommandTimeoutSecs"), "{msg}");
             assert!(msg.contains(&bad.to_string()), "{msg}");

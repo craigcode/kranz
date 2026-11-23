@@ -8,6 +8,7 @@ use crate::types::{Assertion, AssertionCheck, MissionConfig};
 /// Today's hard cap on a contract `command` assertion, unchanged unless a
 /// plan or operator config overrides it (within [`MAX_CONTRACT_COMMAND_TIMEOUT_SECS`]).
 /// Wired into command execution by a later feature.
+#[allow(dead_code)]
 pub const DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS: u64 = 600;
 
 /// A fixed engine ceiling (4 hours): no plan or config may raise a
@@ -43,6 +44,7 @@ pub(crate) fn validate(contract: &[Assertion]) -> Result<()> {
 }
 
 /// Where a resolved [`ContractTimeout`] came from, for timeout-reporting.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TimeoutSource {
     /// The assertion's own `timeoutSecs`.
@@ -54,6 +56,7 @@ pub(crate) enum TimeoutSource {
 }
 
 impl TimeoutSource {
+    #[allow(dead_code)]
     fn label(&self) -> &'static str {
         match self {
             TimeoutSource::Assertion => "plan timeoutSecs",
@@ -65,6 +68,7 @@ impl TimeoutSource {
 
 /// The resolved wall-clock limit for one contract `command` assertion run,
 /// and where it came from (for timeout reporting).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ContractTimeout {
     pub secs: u64,
@@ -72,6 +76,7 @@ pub(crate) struct ContractTimeout {
 }
 
 impl ContractTimeout {
+    #[allow(dead_code)]
     pub fn duration(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.secs)
     }
@@ -83,12 +88,16 @@ impl ContractTimeout {
 /// Clamped to 1..=[`MAX_CONTRACT_COMMAND_TIMEOUT_SECS`] defensively, since a
 /// value written before `validate` existed (or constructed directly,
 /// bypassing it) must not be able to disable the limit.
+#[allow(dead_code)]
 pub(crate) fn resolve(assertion: &Assertion, config: &MissionConfig) -> ContractTimeout {
     let (secs, source) = match assertion.timeout_secs {
         Some(secs) => (secs, TimeoutSource::Assertion),
         None => match config.contract_command_timeout_secs {
             Some(secs) => (secs, TimeoutSource::Config),
-            None => (DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS, TimeoutSource::Default),
+            None => (
+                DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS,
+                TimeoutSource::Default,
+            ),
         },
     };
     let secs = secs.clamp(1, MAX_CONTRACT_COMMAND_TIMEOUT_SECS);
