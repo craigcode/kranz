@@ -5,6 +5,12 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: a fix feature created after an operator-directed repair
+  (`unblock-add-fix`) or after a tier escalation no longer reuses an existing
+  fix feature id. The mission used to stop with "duplicate
+  fixfeature.created ... with a different payload". The id's cycle number is
+  now the next one free on the milestone. Ids in existing event logs, and
+  when a fix cycle is spent, are unchanged.
 - Added: a contract assertion may name the plan milestone that must satisfy
   it, in the optional field `milestone`. A validation round holds a
   milestone only to the assertions due by it. An assertion that is not yet

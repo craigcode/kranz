@@ -15,6 +15,8 @@ timeout recheck (a contract `command` assertion's wall-clock limit is now
 configurable, via plan `timeoutSecs` or operator config
 `contractCommandTimeoutSecs`, capped at 14400 seconds): no lesson changed.
 
+Rechecked 2026-11-23 (UTC) against `.kranz/lessons/index.md`, which gained the m-ec06f2 lesson (scope contract test commands; do not use `cargo test --workspace` as a contract command). The curated list is unchanged.
+
 Rechecked 2026-11-22 (UTC) against the invariants note's worker `git stash` deny recheck: no lesson changed.
 
 Rechecked 2026-11-20 (UTC) against the invariants note's milestone-scoped assertion recheck (not-yet-due assertions are recorded but do not block until their milestone; final gate unchanged): no lesson changed.

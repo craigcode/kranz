@@ -54,6 +54,8 @@ the same extends-only rule as its other fields. `PlanApproved`/`PlanRevised`
 folding and `dry_run_revised_plan` gained this one extra validation call
 each; no event, stage or pipeline order changed.
 
+Rechecked 2026-11-23 (UTC) against the fix-id change: `findings.rs` picks a fix feature's id cycle as the next free one on the milestone (`next_fix_cycle`), so a repair or a tier escalation no longer reuses an id; `orchestrator.rs` gained comments and tests only. Pipeline stages, fix-cycle spending and event schemas are unchanged.
+
 Rechecked 2026-11-22 (UTC) against `contract_scope.rs`: the `#[allow(dead_code)]` lines on `due_index` and `is_due` are removed, since the validation round calls both. Pipeline stages and event schemas are unchanged.
 
 Rechecked 2026-11-21 (UTC) against the worker `git stash` deny: `docs/design.md` lists `Bash(git stash*)` in the worker deny set and says how each backend matches a deny rule on a compound command line; `backend_acp.rs` and `backend_acp/terminals.rs` gained tests only. Pipeline stages and event schemas are unchanged.

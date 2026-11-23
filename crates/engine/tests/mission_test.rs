@@ -4612,6 +4612,205 @@ async fn unblock_add_fix_schedules_repair_before_revalidation() {
     }
 }
 
+/// The old id rule computed a fix feature's cycle as `fix_cycles + 1` alone,
+/// ignoring any fix ids already minted on the milestone. An operator-directed
+/// `unblock-add-fix` repair deliberately spends no fix cycle, so when a
+/// validator-driven fix round followed it, both computed the SAME cycle (the
+/// milestone's `fix_cycles` had not moved between the two), and the reducer
+/// rejected the second `fixfeature.created` as a duplicate with a different
+/// payload — wedging mission m-882080 in RUNNING. The fixed rule
+/// (`findings::next_fix_cycle`) additionally takes `1 + the highest existing
+/// {milestone_id}-fix-<c>-` cycle, so the repair and the next validator-driven
+/// fix always land on distinct cycles. This test drives exactly that
+/// sequence — block at the cap, operator repair, one more validator finding,
+/// its fix — and the mission must reach Complete without ever hitting the
+/// duplicate-fixfeature error.
+#[tokio::test(flavor = "multi_thread")]
+async fn fix_id_unique_repair_then_finding_completes() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    // Phase 1: block at the fix-cycle cap (same shape as
+    // `unblock_add_fix_schedules_repair_before_revalidation`): one fix round
+    // consumes the only cycle, a second failing round blocks the milestone.
+    let finding = json!([{
+        "subject": "part 1 works",
+        "severity": "major",
+        "evidence": "fmt check fails",
+        "suggestedFix": ""
+    }]);
+    let backend1 = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            fix_features(1),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            fix_features(1),
+        ]),
+        validator_with(finding.clone()),
+        worker_pass(),
+        validator_with(finding),
+    ]));
+    let cfg = MissionConfig {
+        skip_functional: false,
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend1, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    // Before resuming: raise the fix-cycle cap by one (so the upcoming
+    // validator finding gets a normal fix round instead of re-blocking), and
+    // ask the operator's question that will steer the unblock decision
+    // toward a repair.
+    control::enqueue(
+        &paths,
+        &ControlCommand::ConfigChange {
+            patch: json!({"maxFixCyclesPerMilestone": 2}),
+        },
+    )
+    .unwrap();
+    control::enqueue(
+        &paths,
+        &ControlCommand::Msg {
+            text: "it is just rustfmt — repair then re-validate".into(),
+            interrupt: false,
+        },
+    )
+    .unwrap();
+
+    // Phase 2: unblock-add-fix repair, then ONE more validator-driven fix
+    // round for a fresh minor finding, then a clean round completes the
+    // mission. Script ORDER is session-start order: orchestrator (one
+    // streaming session), repair worker, post-repair validator (minor
+    // finding), fix worker, final (clean) validator.
+    let decision = json!({
+        "action": "unblock-add-fix",
+        "note": "schedule a fmt repair",
+        "fix": {
+            "title": "run cargo fmt --all",
+            "spec": "run cargo fmt --all and commit the result",
+            "validationCriteria": ["cargo fmt --all --check exits clean"]
+        }
+    })
+    .to_string();
+    let minor = json!([{
+        "subject": "helper docs",
+        "severity": "minor",
+        "evidence": "docstring omits the error case",
+        "suggestedFix": "extend the docstring"
+    }]);
+    let backend2 = Arc::new(MockBackend::with_scripts(vec![
+        orch_script(vec![
+            decision,
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            fix_features(1),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        worker_pass(),
+        validator_with(minor),
+        worker_pass(),
+        validator_with(json!([])),
+    ]));
+    let backend2_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend2) as Arc<dyn AgentBackend>;
+    let mut engine = MissionEngine::resume(backend2_dyn, &root, &mission_id, LockForce::No)
+        .expect("resume mission");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let state = engine.state().clone();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let unblock_seq = events
+        .iter()
+        .find(|e| matches!(&e.kind, EventKind::MilestoneUnblocked { .. }))
+        .expect("unblock event")
+        .seq;
+
+    // Exactly two fix features follow the unblock: the repair, and the fix
+    // for the one finding raised after it. On the old id rule these would
+    // have collided on the same `{milestone_id}-fix-<c>-1` id and the second
+    // `fixfeature.created` would have been rejected as a duplicate — which
+    // is exactly the failure this test targets.
+    let post_unblock_fixes: Vec<_> = events
+        .iter()
+        .filter(|e| e.seq > unblock_seq && matches!(&e.kind, EventKind::FixFeatureCreated { .. }))
+        .collect();
+    assert_eq!(
+        post_unblock_fixes.len(),
+        2,
+        "the repair and the finding's fix both land after the unblock"
+    );
+
+    let repair_id = match &post_unblock_fixes[0].kind {
+        EventKind::FixFeatureCreated { feature, .. } => {
+            assert_eq!(feature.title, "run cargo fmt --all");
+            assert_eq!(feature.origin, FeatureOrigin::Fix);
+            feature.id.clone()
+        }
+        _ => unreachable!(),
+    };
+    let finding_fix_id = match &post_unblock_fixes[1].kind {
+        EventKind::FixFeatureCreated { feature, .. } => {
+            assert_eq!(feature.title, "fix issue 1");
+            assert_eq!(feature.origin, FeatureOrigin::Fix);
+            feature.id.clone()
+        }
+        _ => unreachable!(),
+    };
+    assert_ne!(
+        repair_id, finding_fix_id,
+        "the repair and the validator-driven fix must mint distinct ids"
+    );
+
+    // Every feature id on the milestone is unique — the reducer's duplicate
+    // rejection never fired, so every fixfeature.created that landed carries
+    // a distinct id.
+    let ms = &state.mission.milestones[0];
+    let mut ids: Vec<&str> = ms.features.iter().map(|f| f.id.as_str()).collect();
+    let unique_count = {
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        sorted.len()
+    };
+    assert_eq!(
+        unique_count,
+        ids.len(),
+        "every feature id on the milestone must be unique: {ids:?}"
+    );
+    assert!(
+        ids.contains(&repair_id.as_str()),
+        "the repair's id was not reused/dropped: {ids:?}"
+    );
+    ids.retain(|id| *id != repair_id);
+    assert!(
+        !ids.contains(&repair_id.as_str()),
+        "the repair's id must appear exactly once: {ids:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn contract_commands_run_engine_side_and_reach_validator_task() {
     if !setup() {
