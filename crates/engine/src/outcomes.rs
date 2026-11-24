@@ -119,6 +119,10 @@ pub struct Outcomes {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_reasons: Option<reasons::Report>,
     pub autonomy_ratio: AutonomyRatio,
+    /// Abandoned missions, beside the autonomy ratio above: it does not feed
+    /// the ratio's numerator or denominator, just rides along for visibility.
+    #[serde(default)]
+    pub abandoned: crate::escalation_metrics::AbandonedMissions,
     pub grant_latency: GrantLatency,
     /// Signal receipt-to-consent latency (ticket `signal-intake-8-linkage`,
     /// D-F), folded from `.kranz/signals/ledger.jsonl` (`Received` →
@@ -329,6 +333,9 @@ pub struct MissionOutcomes {
     /// independently of the log, so a merged bit can never ride the memo
     /// entry — it is probed live at report time.
     pub comparison: ComparisonInputs,
+    /// This mission's abandoned row (KRZ — abandoned-missions fold): `None`
+    /// unless the mission's terminal outcome is `mission.abandoned`.
+    pub abandoned: Option<crate::escalation_metrics::AbandonedMissionRow>,
 }
 
 /// The log-derived per-mission inputs the KRZ-333 comparison fold needs
@@ -885,6 +892,7 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         divergences,
         gate_score_samples,
         comparison,
+        abandoned: crate::escalation_metrics::abandoned_mission_row(mission_id, events),
     }
 }
 
@@ -1026,6 +1034,8 @@ pub fn compute_outcomes_with_options(
     let mut comparison_inputs: Vec<(String, ComparisonInputs)> = Vec::new();
     let mut reason_missions = Vec::new();
     let mut unavailable_logs = Vec::new();
+    // Abandoned-mission rows (beside the autonomy ratio, never feeding it).
+    let mut abandoned_rows: Vec<crate::escalation_metrics::AbandonedMissionRow> = Vec::new();
 
     for id in ids {
         let paths = crate::paths::MissionPaths::new(repo_root, &id);
@@ -1053,6 +1063,9 @@ pub fn compute_outcomes_with_options(
             unavailable_logs.push(id.clone());
         }
         comparison_inputs.push((id.clone(), out.comparison.clone()));
+        if let Some(row) = out.abandoned.clone() {
+            abandoned_rows.push(row);
+        }
         if out.is_closed {
             closed_missions += 1;
             total_interventions += out.interventions;
@@ -1242,6 +1255,7 @@ pub fn compute_outcomes_with_options(
             zero_intervention_missions,
             zero_intervention_share,
         },
+        abandoned: crate::escalation_metrics::summarize_abandoned(abandoned_rows),
         grant_latency: bucketize(&all_latencies_ms),
         signal_consent_latency: compute_signal_consent_latency(repo_root),
         escalations,
@@ -2367,6 +2381,107 @@ mod tests {
             assert_eq!(ratio.closed_missions, 2);
             assert_eq!(ratio.zero_intervention_missions, 1);
             assert_eq!(ratio.zero_intervention_share, 0.5);
+        }
+
+        #[test]
+        fn abandoned_missions_fold_outcomes_ratio_unchanged() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            // m-1: created then completed, no interventions.
+            seed_mission(
+                root,
+                "m-1",
+                vec![created("clean"), EventKind::MissionCompleted {}],
+            );
+
+            // m-2: created, plan approved, one post-approval steer, one
+            // feature delivered, one operator unblock (non-lift reason),
+            // then abandoned.
+            seed_mission(
+                root,
+                "m-2",
+                vec![
+                    created("abandoned one"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::UserMessage {
+                        text: "steer it".into(),
+                        interrupt: false,
+                    },
+                    EventKind::FeatureCompleted {
+                        feature_id: "f-1-1".into(),
+                        commits: vec!["aaa [f-1-1] add the thing".to_string()],
+                    },
+                    EventKind::MilestoneUnblocked {
+                        block_context: None,
+                        milestone_id: "ms-1".into(),
+                        reason: "operator decision".into(),
+                        validator_guidance: None,
+                    },
+                    EventKind::MissionAbandoned {
+                        reason: "giving up".into(),
+                    },
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let ratio = outcomes.autonomy_ratio;
+            assert_eq!(ratio.closed_missions, 2);
+            assert_eq!(ratio.total_interventions, 1);
+            assert_eq!(ratio.zero_intervention_missions, 1);
+            assert_eq!(ratio.zero_intervention_share, 0.5);
+
+            let abandoned = &outcomes.abandoned;
+            assert_eq!(abandoned.missions, 1);
+            assert_eq!(abandoned.rows.len(), 1);
+            let row = &abandoned.rows[0];
+            assert_eq!(row.mission_id, "m-2");
+            assert_eq!(row.interventions.steers, 1);
+            assert_eq!(row.interventions.operator_unblocks, 1);
+            assert_eq!(row.total_interventions, 2);
+            assert!(row.delivered_before_abandon);
+        }
+
+        #[test]
+        fn abandoned_missions_fold_outcomes_json_field() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-2",
+                vec![
+                    created("abandoned one"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::MissionAbandoned {
+                        reason: "giving up".into(),
+                    },
+                ],
+            );
+            let outcomes = compute_outcomes(root).unwrap();
+            let value = serde_json::to_value(&outcomes).unwrap();
+            assert!(
+                value
+                    .get("abandoned")
+                    .and_then(|a| a.get("missions"))
+                    .is_some(),
+                "abandoned.missions must be present in the wire format"
+            );
+
+            // Legacy JSON without the `abandoned` field must still deserialize.
+            let mut legacy = value.clone();
+            legacy.as_object_mut().unwrap().remove("abandoned");
+            let legacy: Outcomes = serde_json::from_value(legacy)
+                .expect("legacy outcomes JSON without `abandoned` must still deserialize");
+            assert_eq!(
+                legacy.abandoned,
+                crate::escalation_metrics::AbandonedMissions::default()
+            );
         }
 
         #[test]
