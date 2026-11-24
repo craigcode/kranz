@@ -1077,8 +1077,9 @@ impl MissionEngine {
             return Ok(MissionStatus::Blocked);
         }
         let lesson_paths = lesson
-            .and_then(|body| {
-                body.map(|body| self.write_prepared_lesson(&body))
+            .and_then(|lesson| {
+                lesson
+                    .map(|lesson| self.write_prepared_lesson(&lesson))
                     .transpose()
             })
             .unwrap_or_else(|error| {

@@ -15,6 +15,13 @@ verified_against:
   - crates/cli/src/ready.rs
 ---
 
+Rechecked 2026-11-24 (UTC) against the lesson check record and listing
+(`crates/engine/src/lesson_checks.rs`, `kranz lessons list`): both are
+read-only evidence/record surfaces. The only new model-facing text is the
+capture-turn `CHECK:` question; no prompt-injection, lint-generation or
+execution primitive is added. The freeze and the retained surfaces are
+unchanged.
+
 Rechecked 2026-11-24 (UTC) against `outcomes.rs`: `Outcomes` gained an `abandoned` field that reports abandoned missions beside the autonomy ratio without feeding it. This is evidence reporting; no positioning boundary moved.
 
 Rechecked 2026-11-16 (UTC) against the `ready.rs` change: `kranz ready` lists a missing Windows sandbox host preparation as a host blocker outside the score. It is a readiness report, not an execution primitive. The freeze and the retained surfaces are unchanged.

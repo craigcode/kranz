@@ -2974,3 +2974,202 @@ Add rate limiting.
         assert_eq!(Ticket::read_state(&root, "rl"), TicketState::Failed);
     }
 }
+
+// ---------------------------------------------------------------------------
+// `kranz lessons list`
+// ---------------------------------------------------------------------------
+
+mod lesson_check_cli {
+    use serde_json::Value;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn init_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        (dir, root)
+    }
+
+    fn write_lesson(repo: &Path, id: &str, summary: &str) {
+        let lessons_dir = repo.join(".kranz").join("lessons");
+        fs::create_dir_all(&lessons_dir).unwrap();
+        fs::write(lessons_dir.join(format!("{id}.md")), format!("{summary}\n")).unwrap();
+        let index = lessons_dir.join("index.md");
+        let line = format!("- {id}.md · {summary}\n");
+        use std::io::Write as _;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(index)
+            .unwrap();
+        f.write_all(line.as_bytes()).unwrap();
+    }
+
+    fn write_check(repo: &Path, id: &str, contents: &str) {
+        let lessons_dir = repo.join(".kranz").join("lessons");
+        fs::write(lessons_dir.join(format!("{id}.check")), contents).unwrap();
+    }
+
+    fn run_kranz(repo: &Path, args: &[&str]) -> std::process::Output {
+        let child_tmp = tempfile::tempdir().expect("create child tempdir");
+        Command::new(env!("CARGO_BIN_EXE_kranz"))
+            .args(["--repo", repo.to_str().unwrap()])
+            .args(args)
+            .env("TMPDIR", child_tmp.path())
+            .env("TEMP", child_tmp.path())
+            .env("TMP", child_tmp.path())
+            .output()
+            .expect("spawn kranz")
+    }
+
+    #[test]
+    fn lesson_check_cli_lists_legacy_as_unclassified() {
+        let (_dir, root) = init_repo();
+        write_lesson(&root, "m-one", "first lesson");
+        write_lesson(&root, "m-two", "second lesson");
+
+        let output = run_kranz(&root, &["lessons", "list"]);
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("m-one.md"), "{stdout}");
+        assert!(stdout.contains("m-two.md"), "{stdout}");
+        assert!(stdout.contains("unclassified"), "{stdout}");
+        assert!(stdout.contains("link: -"), "{stdout}");
+    }
+
+    #[test]
+    fn lesson_check_cli_needs_check_drops_linked_lesson() {
+        let (_dir, root) = init_repo();
+        write_lesson(&root, "m-one", "first lesson");
+        write_check(&root, "m-one", "orchestrator: checkable\n");
+
+        let output = run_kranz(&root, &["lessons", "list", "--needs-check"]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("m-one.md"), "{stdout}");
+
+        write_check(
+            &root,
+            "m-one",
+            "orchestrator: checkable\nlink: .kranz/tickets/x.md\n",
+        );
+        let output = run_kranz(&root, &["lessons", "list", "--needs-check"]);
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            !stdout.contains("m-one.md"),
+            "linked lesson should be dropped: {stdout}"
+        );
+        assert!(
+            stdout.contains("no checkable lessons without a linked check"),
+            "{stdout}"
+        );
+    }
+
+    #[test]
+    fn lesson_check_cli_json_output_shape() {
+        let (_dir, root) = init_repo();
+        write_lesson(&root, "m-one", "first lesson");
+        write_check(
+            &root,
+            "m-one",
+            "orchestrator: checkable\nlink: .kranz/tickets/x.md\n",
+        );
+        write_lesson(&root, "m-two", "second lesson");
+
+        let output = run_kranz(&root, &["lessons", "list", "--json"]);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let value: Value = serde_json::from_str(&stdout).unwrap();
+        let lessons = value["lessons"].as_array().unwrap();
+        assert_eq!(lessons.len(), 2, "{value}");
+        assert!(value["warnings"].as_array().is_some(), "{value}");
+
+        let one = lessons
+            .iter()
+            .find(|l| l["lesson"] == "m-one.md")
+            .expect("m-one present");
+        assert_eq!(one["missionId"], "m-one");
+        assert_eq!(one["summary"], "first lesson");
+        assert_eq!(one["classification"], "checkable");
+        assert_eq!(one["source"], "orchestrator");
+        assert_eq!(one["link"], ".kranz/tickets/x.md");
+
+        let two = lessons
+            .iter()
+            .find(|l| l["lesson"] == "m-two.md")
+            .expect("m-two present");
+        assert_eq!(two["missionId"], "m-two");
+        assert_eq!(two["classification"], "unclassified");
+        assert_eq!(two["source"], "none");
+        assert!(two["link"].is_null(), "{value}");
+    }
+
+    #[test]
+    fn lesson_check_cli_listing_is_read_only_and_lock_free() {
+        let (_dir, root) = init_repo();
+        write_lesson(&root, "m-one", "first lesson");
+        write_check(&root, "m-one", "orchestrator: checkable\n");
+
+        let pid = std::process::id();
+        let held_mission = root.join(".kranz").join("missions").join("m-held");
+        fs::create_dir_all(&held_mission).unwrap();
+        fs::write(held_mission.join("events.jsonl.lock"), pid.to_string()).unwrap();
+
+        let queue = root.join(".kranz").join("queue");
+        fs::create_dir_all(&queue).unwrap();
+        fs::write(queue.join(".mutate.lock"), pid.to_string()).unwrap();
+        fs::write(queue.join(".repo.busy.lock"), pid.to_string()).unwrap();
+        fs::write(queue.join(".repo.merge.lock"), pid.to_string()).unwrap();
+
+        fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+            let mut out = Vec::new();
+            fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+                for entry in fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, out);
+                    } else {
+                        out.push((path.clone(), fs::read(&path).unwrap()));
+                    }
+                }
+            }
+            walk(dir, &mut out);
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        }
+
+        let before = snapshot(&root);
+
+        for args in [
+            vec!["lessons", "list"],
+            vec!["lessons", "list", "--needs-check"],
+            vec!["lessons", "list", "--json"],
+        ] {
+            let output = run_kranz(&root, &args);
+            assert!(
+                output.status.success(),
+                "{args:?} stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let after = snapshot(&root);
+        assert_eq!(
+            before, after,
+            "listing must not create, modify or delete files"
+        );
+    }
+}

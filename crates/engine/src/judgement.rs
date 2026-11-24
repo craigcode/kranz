@@ -9,6 +9,7 @@
 use crate::error::Result;
 use crate::gate::{ArtefactRef, GateKind, GateOutcome, GateReport};
 use crate::git_ops::GitRepo;
+use crate::lesson_checks::CheckClass;
 use crate::lessons;
 use crate::orchestrator::{
     first_nonempty_line, run_outcome_summary, MissionEngine, JSON_RETRY_MSG,
@@ -293,38 +294,65 @@ impl MissionEngine {
 
     /// Fallible body of [`Self::capture_lesson`].
     async fn try_capture_lesson(&mut self) -> Result<Option<Vec<PathBuf>>> {
-        let Some(body) = self.prepare_lesson().await? else {
+        let Some(lesson) = self.prepare_lesson().await? else {
             return Ok(None);
         };
-        self.write_prepared_lesson(&body).map(Some)
+        self.write_prepared_lesson(&lesson).map(Some)
     }
 
     /// Prepare the lesson without changing the checkout, so finalization
     /// can verify review identity after its last model turn and before any
     /// intentional metadata writes.
-    pub(crate) async fn prepare_lesson(&mut self) -> Result<Option<String>> {
+    pub(crate) async fn prepare_lesson(&mut self) -> Result<Option<PreparedLesson>> {
         let message = format!(
             "MISSION GOAL:\n{}\n\nThe mission has just completed. Distill at most ONE \
              reusable lesson that a FUTURE mission in THIS repository would need — as a \
              short imperative note — or reply with the single word NONE if there is \
-             nothing worth carrying forward.",
+             nothing worth carrying forward. If you give a lesson, end your reply with \
+             one final line, exactly `CHECK: checkable` if a deterministic check (an \
+             approval-lint rule, a preflight rule, or a gate) could catch the same \
+             mistake, otherwise `CHECK: not-checkable`; omit that line if you reply NONE.",
             self.state.mission.goal
         );
         let text = self.orch_turn(&message).await?;
-        let trimmed = text.trim();
-        if trimmed.is_empty() || is_none_reply(trimmed) {
+        let (remaining, check) = extract_check_line(text.trim());
+        if remaining.is_empty() || is_none_reply(&remaining) {
             return Ok(None);
         }
-        Ok(Some(normalize_lesson_body(trimmed)))
+        Ok(Some(PreparedLesson {
+            body: normalize_lesson_body(&remaining),
+            check,
+        }))
     }
 
-    pub(crate) fn write_prepared_lesson(&self, body: &str) -> Result<Vec<PathBuf>> {
+    pub(crate) fn write_prepared_lesson(&self, lesson: &PreparedLesson) -> Result<Vec<PathBuf>> {
         // Written under active_paths (the integration worktree in worktree
         // mode) because these files are folded into write_mission_report's
         // commit, which commits via active_repo — see that method's doc note.
         let active_paths = self.active_paths();
         let mission_id = self.state.mission.id.clone();
-        lessons::write_lesson(&active_paths.repo_root, &mission_id, body)
+        let mut paths = lessons::write_lesson(&active_paths.repo_root, &mission_id, &lesson.body)?;
+        if let Some(check) = lesson.check {
+            let record = crate::lesson_checks::LessonCheckRecord {
+                orchestrator: Some(check),
+                operator: None,
+                link: None,
+            };
+            match crate::lesson_checks::write_check_record(
+                &active_paths.repo_root,
+                &mission_id,
+                &record,
+            ) {
+                Ok(path) => paths.push(path),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "lesson check record write failed; lesson still captured"
+                    );
+                }
+            }
+        }
+        Ok(paths)
     }
 
     // -----------------------------------------------------------------------
@@ -530,6 +558,52 @@ pub(crate) fn lesson_provenance_clean(repo: &GitRepo, filename: &str) -> bool {
     // no-follow open; a vanished file or a planted symlink must be unclean
     // here for the same reason it is unreadable there.
     crate::lessons::read_lesson_from_worktree(repo.root(), filename).is_some()
+}
+
+/// A prepared cross-mission lesson: the normalized body to write, plus the
+/// orchestrator's optional deterministic-checkability classification parsed
+/// off the capture-turn reply's trailing `CHECK:` line.
+pub(crate) struct PreparedLesson {
+    pub(crate) body: String,
+    pub(crate) check: Option<CheckClass>,
+}
+
+/// Strip a trailing `CHECK: <value>` line off a lesson-turn reply, if
+/// present, and parse its classification.
+///
+/// `text` is assumed already trimmed. If the last non-empty line, trimmed,
+/// starts with `CHECK:` (case-insensitive), that line is removed from the
+/// returned text regardless of its value. The value (trimmed,
+/// case-insensitive) is recognized as `checkable` or `not-checkable`; any
+/// other value leaves the classification `None` while still stripping the
+/// line so it never pollutes the lesson body.
+fn extract_check_line(text: &str) -> (String, Option<CheckClass>) {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    let Some(idx) = lines.iter().rposition(|line| !line.trim().is_empty()) else {
+        return (text.to_string(), None);
+    };
+    let line_trimmed = lines[idx].trim();
+    let Some(value) = strip_check_prefix(line_trimmed) else {
+        return (text.to_string(), None);
+    };
+    let classification = match value.trim().to_ascii_lowercase().as_str() {
+        "checkable" => Some(CheckClass::Checkable),
+        "not-checkable" => Some(CheckClass::NotCheckable),
+        _ => None,
+    };
+    lines.remove(idx);
+    (lines.join("\n").trim().to_string(), classification)
+}
+
+/// `line` with a case-insensitive `CHECK:` prefix removed, or `None` if it
+/// does not start with that prefix.
+fn strip_check_prefix(line: &str) -> Option<&str> {
+    const PREFIX_LEN: usize = "CHECK:".len();
+    if line.len() >= PREFIX_LEN && line[..PREFIX_LEN].eq_ignore_ascii_case("CHECK:") {
+        Some(&line[PREFIX_LEN..])
+    } else {
+        None
+    }
 }
 
 /// Whether a lesson-turn reply is the single word NONE (case-insensitive,
@@ -1123,5 +1197,85 @@ mod tests {
     fn lessons_normalize_body_keeps_short_first_line_as_is() {
         let text = "Short imperative note.\n\nMore context below.";
         assert_eq!(normalize_lesson_body(text), text);
+    }
+
+    #[tokio::test]
+    async fn lesson_check_capture_strips_check_line() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script("Do X.\n\nCHECK: checkable"),
+            ]));
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        let lesson = engine
+            .prepare_lesson()
+            .await
+            .unwrap()
+            .expect("a lesson was given");
+        assert_eq!(lesson.body, "Do X.");
+        assert_eq!(lesson.check, Some(CheckClass::Checkable));
+    }
+
+    #[tokio::test]
+    async fn lesson_check_capture_without_check_line_is_unclassified() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let reply = "Always check the plan for a base_branch override before assuming main.";
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script(reply),
+            ]));
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        let lesson = engine
+            .prepare_lesson()
+            .await
+            .unwrap()
+            .expect("a lesson was given");
+        assert_eq!(lesson.body, normalize_lesson_body(reply));
+        assert_eq!(lesson.check, None);
+    }
+
+    #[tokio::test]
+    async fn lesson_check_none_reply_with_check_line_is_none() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script("NONE\nCHECK: not-checkable"),
+            ]));
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        let lesson = engine.prepare_lesson().await.unwrap();
+        assert!(lesson.is_none(), "a NONE reply must capture nothing");
+    }
+
+    #[tokio::test]
+    async fn lesson_check_capture_malformed_check_line_is_stripped() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let backend: Arc<dyn AgentBackend> =
+            Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+                lesson_orch_script("Do Y.\n\nCHECK: maybe"),
+            ]));
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+
+        let lesson = engine
+            .prepare_lesson()
+            .await
+            .unwrap()
+            .expect("a lesson was given");
+        assert_eq!(lesson.body, "Do Y.");
+        assert_eq!(lesson.check, None);
     }
 }

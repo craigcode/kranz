@@ -269,6 +269,13 @@ pub enum Command {
     /// List this repo's missions
     Missions,
 
+    /// Work with captured lessons and their deterministic-check records
+    /// (read-only, no lock)
+    Lessons {
+        #[command(subcommand)]
+        command: LessonsCommand,
+    },
+
     /// Retire a mission: mark it ABANDONED (a terminal state, not a failure).
     ///
     /// Appends `mission.abandoned` to the event log. Git branches, tags, and
@@ -948,6 +955,23 @@ pub enum PermissionCommand {
         request_id: String,
         #[arg(long)]
         binding: String,
+    },
+}
+
+/// Subcommands under `kranz lessons`.
+#[derive(Subcommand, Debug)]
+pub enum LessonsCommand {
+    /// List lessons with whether a deterministic check could catch the
+    /// mistake.
+    List {
+        /// Emit the listing as JSON instead of text
+        #[arg(long)]
+        json: bool,
+
+        /// Show only lessons classified checkable with no linked check,
+        /// oldest first
+        #[arg(long)]
+        needs_check: bool,
     },
 }
 
