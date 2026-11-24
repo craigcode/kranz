@@ -7,7 +7,8 @@
 
 use crate::backlog;
 use crate::cli::{
-    Cli, Command, GrantCommand, PermissionCommand, QuestionCommand, RevisionCommand, TicketCommand,
+    Cli, Command, GrantCommand, LessonsCommand, PermissionCommand, QuestionCommand,
+    RevisionCommand, TicketCommand,
 };
 use crate::output::{self, ansi};
 use crate::planning_tui::PlanningOutcome;
@@ -20,6 +21,7 @@ use kranz_engine::control;
 use kranz_engine::corpus_export;
 use kranz_engine::cost;
 use kranz_engine::event_log::{EventLog, LockForce};
+use kranz_engine::lesson_checks;
 use kranz_engine::mission_catalog;
 use kranz_engine::orchestrator::{MissionEngine, PlanRequest};
 use kranz_engine::paths::MissionPaths;
@@ -427,6 +429,7 @@ pub async fn run_cli(cli: Cli) -> Result<i32> {
             print!("{}", cmd_missions(&repo)?);
             Ok(0)
         }
+        Command::Lessons { command } => dispatch_lessons(&repo, command),
         Command::Abandon { id, reason } => {
             // A positional id wins over the global --mission; otherwise fall
             // back to the usual auto-selection.
@@ -2277,6 +2280,67 @@ pub fn cmd_missions(repo: &Path) -> Result<String> {
         }
     }
     Ok(out)
+}
+
+fn dispatch_lessons(repo: &Path, command: LessonsCommand) -> Result<i32> {
+    match command {
+        LessonsCommand::List { json, needs_check } => cmd_lessons_list(repo, json, needs_check),
+    }
+}
+
+/// `kranz lessons list [--json] [--needs-check]`: read-only, no lock.
+fn cmd_lessons_list(repo: &Path, json: bool, needs_check_only: bool) -> Result<i32> {
+    let listing = lesson_checks::list_lessons(repo)?;
+    for warning in &listing.warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    let entries: Vec<&lesson_checks::LessonEntry> = if needs_check_only {
+        lesson_checks::needs_check(&listing)
+    } else {
+        listing.entries.iter().collect()
+    };
+
+    if json {
+        #[derive(serde::Serialize)]
+        struct LessonsJson<'a> {
+            lessons: Vec<&'a lesson_checks::LessonEntry>,
+            warnings: &'a [String],
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&LessonsJson {
+                lessons: entries,
+                warnings: &listing.warnings,
+            })?
+        );
+        return Ok(0);
+    }
+
+    if listing.entries.is_empty() {
+        println!("no lessons recorded");
+        return Ok(0);
+    }
+    if entries.is_empty() {
+        println!("no checkable lessons without a linked check");
+        return Ok(0);
+    }
+
+    for entry in entries {
+        let link = entry.link.as_deref().unwrap_or("-");
+        println!(
+            "{}  {} ({})  link: {link}  — {}",
+            entry.lesson,
+            entry.classification.as_str(),
+            match entry.source {
+                lesson_checks::CheckSource::Operator => "operator",
+                lesson_checks::CheckSource::Orchestrator => "orchestrator",
+                lesson_checks::CheckSource::None => "none",
+            },
+            entry.summary
+        );
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
