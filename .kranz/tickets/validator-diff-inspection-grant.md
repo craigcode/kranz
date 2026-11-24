@@ -33,14 +33,14 @@ The allow-set is built in `crates/engine/src/permissions.rs` (`command_allow_pat
 - The grant model is unchanged for everything else. Nothing is approved automatically and deny-default stays.
 - Children are hostile by default. A validator is prompt-injectable, so judge the new form by what the worst command matching the pattern can do, not by the command in this report.
 
-## D-X operator decision
+## D-X operator decision (DECIDED 2026-11-24: D-X1)
 
-What a validator does when a grant it asked for is denied by default.
+What a validator does when a grant it asked for is denied by default. The operator chose D-X1: nothing changes here, and this ticket ships only the sanctioned read-only diff. The options are kept for the record.
 
 - D-X1: unchanged. The milestone blocks and waits for an operator.
 - D-X2: the validator is told the request was denied and finishes its verdict without that command. The milestone blocks only if the verdict then fails or the validator says it cannot judge.
 
-D-X2 changes when a milestone blocks, so it is not part of this ticket unless the operator picks it.
+D-X2 changes when a milestone blocks. It is out of scope for this ticket.
 
 ## Acceptance hints
 
