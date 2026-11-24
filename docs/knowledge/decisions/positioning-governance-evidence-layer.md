@@ -15,6 +15,8 @@ verified_against:
   - crates/cli/src/ready.rs
 ---
 
+Rechecked 2026-11-24 (UTC) against `outcomes.rs`: `Outcomes` gained an `abandoned` field that reports abandoned missions beside the autonomy ratio without feeding it. This is evidence reporting; no positioning boundary moved.
+
 Rechecked 2026-11-16 (UTC) against the `ready.rs` change: `kranz ready` lists a missing Windows sandbox host preparation as a host blocker outside the score. It is a readiness report, not an execution primitive. The freeze and the retained surfaces are unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline (`docs/scoping/signal-intake.md`): verified external signals land in a sealed evidence ledger, deterministic triage proposes nonced-fenced `signal-proposal: unconsented` tickets behind explicit human consent, and `outcomes` reports read-only `signalConsentLatency`. No autonomous execution, code-generation, or prompt-optimization primitive is added.

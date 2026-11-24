@@ -2,13 +2,15 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-23
+last_verified: 2026-11-24
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-11-24 (UTC) against the invariants note's test-only `contract_lint.rs` recheck: no lesson changed.
 
 Rechecked 2026-11-23 (UTC) against the invariants note's contract command
 timeout recheck (a contract `command` assertion's wall-clock limit is now
