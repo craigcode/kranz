@@ -888,9 +888,35 @@ export interface OutcomeReasonReport {
   }[];
 }
 
+/** Operator interventions on one mission, by class (the autonomy ratio's set). */
+export interface InterventionCounts {
+  grantDecisions: number;
+  steers: number;
+  revisionRulings: number;
+  operatorUnblocks: number;
+}
+
+export interface AbandonedMissionRow {
+  missionId: string;
+  interventions: InterventionCounts;
+  totalInterventions: number;
+  featuresCompletedBeforeAbandon: number;
+  deliveredBeforeAbandon: boolean;
+}
+
+/** Abandoned missions, counted beside the autonomy ratio; they never feed it. */
+export interface AbandonedMissions {
+  missions: number;
+  deliveredBeforeAbandon: number;
+  totalInterventions: number;
+  rows: AbandonedMissionRow[];
+}
+
 export interface Outcomes {
   outcomeReasons?: OutcomeReasonReport;
   autonomyRatio: AutonomyRatio;
+  /** Absent from servers that predate the abandoned-missions fold. */
+  abandoned?: AbandonedMissions;
   grantLatency: GrantLatency;
   signalConsentLatency?: GrantLatency;
   escalations: EscalationRow[];
@@ -1014,6 +1040,8 @@ export interface LedgerRow {
 /** `GET /api/escalation-metrics` — the flight-surgeon console fold. */
 export interface EscalationMetrics {
   autonomy: AutonomyMetric;
+  /** Absent from servers that predate the abandoned-missions fold. */
+  abandoned?: AbandonedMissions;
   rubberStamp: RubberStamp;
   falseGreens: FalseGreens;
   ledger: LedgerRow[];

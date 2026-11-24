@@ -53,6 +53,12 @@ updates:
       # Same uuid floor as the root workspace (rust-version 1.88).
       - dependency-name: uuid
         versions: [">=1.27.0"]
+      # Patched copies under vendor/ (see vendor/README.md). A bump cannot
+      # apply: check-desktop-backports.py refuses any drift from the recorded
+      # hashes, so the tauri job fails by design. Update these by hand.
+      - dependency-name: glib
+      - dependency-name: glib-macros
+      - dependency-name: gtk3-macros
     groups:
       cargo-minor-patch:
         update-types:
