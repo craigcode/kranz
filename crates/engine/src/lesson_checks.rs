@@ -109,7 +109,11 @@ pub fn parse_check_record(text: &str) -> (LessonCheckRecord, Vec<String>) {
                             "line {line_no}: duplicate key 'orchestrator' overwrites earlier value"
                         ));
                     }
-                    record.orchestrator = Some(class);
+                    record.orchestrator = if class == CheckClass::Unclassified {
+                        None
+                    } else {
+                        Some(class)
+                    };
                 }
                 None => {
                     warnings.push(format!(
@@ -124,7 +128,11 @@ pub fn parse_check_record(text: &str) -> (LessonCheckRecord, Vec<String>) {
                             "line {line_no}: duplicate key 'operator' overwrites earlier value"
                         ));
                     }
-                    record.operator = Some(class);
+                    record.operator = if class == CheckClass::Unclassified {
+                        None
+                    } else {
+                        Some(class)
+                    };
                 }
                 None => {
                     warnings.push(format!(
@@ -272,7 +280,9 @@ pub fn list_lessons(repo_root: &Path) -> Result<LessonListing> {
         });
     }
 
-    for name in list_check_file_names(&lessons) {
+    let mut orphan_check_names = list_check_file_names(&lessons);
+    orphan_check_names.sort();
+    for name in orphan_check_names {
         let mission_id = name.strip_suffix(".check").unwrap_or(&name).to_string();
         if !known_mission_ids.contains(&mission_id) {
             warnings.push(format!(
@@ -493,6 +503,64 @@ mod tests {
         let entry = &listing.entries[0];
         assert_eq!(entry.classification, CheckClass::Unclassified);
         assert_eq!(entry.source, CheckSource::None);
+    }
+
+    #[test]
+    fn lesson_check_unclassified_value_is_unset() {
+        let (record, warnings) =
+            parse_check_record("orchestrator: checkable\noperator: unclassified\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(record.operator, None);
+        assert_eq!(
+            record.effective(),
+            (CheckClass::Checkable, CheckSource::Orchestrator)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        write_lesson(dir.path(), "m-one", "first lesson");
+        write_check(
+            dir.path(),
+            "m-one",
+            "orchestrator: checkable\noperator: unclassified\n",
+        );
+        let listing = list_lessons(dir.path()).unwrap();
+        assert!(listing.warnings.is_empty(), "{:?}", listing.warnings);
+        let needing = needs_check(&listing);
+        assert_eq!(needing.len(), 1, "{listing:?}");
+        assert_eq!(needing[0].mission_id, "m-one");
+
+        let (record2, warnings2) = parse_check_record("orchestrator: unclassified\n");
+        assert!(warnings2.is_empty(), "{warnings2:?}");
+        assert_eq!(
+            record2.effective(),
+            (CheckClass::Unclassified, CheckSource::None)
+        );
+    }
+
+    #[test]
+    fn lesson_check_orphan_records_warn_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let lessons_dir = dir.path().join(".kranz").join("lessons");
+        std::fs::create_dir_all(&lessons_dir).unwrap();
+        std::fs::write(lessons_dir.join("index.md"), "").unwrap();
+        write_check(dir.path(), "m-zz", "orchestrator: checkable\n");
+        write_check(dir.path(), "m-aa", "orchestrator: checkable\n");
+
+        let listing = list_lessons(dir.path()).unwrap();
+        let orphan_warnings: Vec<&String> = listing
+            .warnings
+            .iter()
+            .filter(|w| w.contains("orphan"))
+            .collect();
+        assert_eq!(orphan_warnings.len(), 2, "{:?}", listing.warnings);
+        assert!(
+            orphan_warnings[0].starts_with("m-aa.check"),
+            "{orphan_warnings:?}"
+        );
+        assert!(
+            orphan_warnings[1].starts_with("m-zz.check"),
+            "{orphan_warnings:?}"
+        );
     }
 
     #[test]
