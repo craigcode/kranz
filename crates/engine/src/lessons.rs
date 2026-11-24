@@ -61,7 +61,7 @@ fn write_lesson_in_dir(lessons: &Dir, mission_id: &str, body: &str) -> Result<()
     atomic_replace(lessons, "index.md", manifest.as_bytes())
 }
 
-fn open_lessons_dir(repo_root: &Path, create: bool) -> Result<Dir> {
+pub(crate) fn open_lessons_dir(repo_root: &Path, create: bool) -> Result<Dir> {
     let repo = Dir::open_ambient_dir(repo_root, ambient_authority())?;
     let kranz_metadata = repo.symlink_metadata(".kranz")?;
     if !kranz_metadata.file_type().is_dir() {
@@ -108,7 +108,7 @@ pub(crate) fn read_lesson_from_worktree(repo_root: &Path, filename: &str) -> Opt
     read_existing_regular(&lessons, filename).ok().flatten()
 }
 
-fn ensure_absent_or_regular(dir: &Dir, name: &str) -> Result<()> {
+pub(crate) fn ensure_absent_or_regular(dir: &Dir, name: &str) -> Result<()> {
     match dir.symlink_metadata(name) {
         Ok(metadata) if metadata.file_type().is_file() => Ok(()),
         Ok(_) => Err(unsafe_lessons_path(Path::new(name))),
@@ -117,7 +117,7 @@ fn ensure_absent_or_regular(dir: &Dir, name: &str) -> Result<()> {
     }
 }
 
-fn read_existing_regular(dir: &Dir, name: &str) -> Result<Option<String>> {
+pub(crate) fn read_existing_regular(dir: &Dir, name: &str) -> Result<Option<String>> {
     match dir.symlink_metadata(name) {
         Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => return Err(unsafe_lessons_path(Path::new(name))),
@@ -140,7 +140,7 @@ fn read_existing_regular(dir: &Dir, name: &str) -> Result<Option<String>> {
     }
 }
 
-fn atomic_replace(dir: &Dir, name: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_replace(dir: &Dir, name: &str, bytes: &[u8]) -> Result<()> {
     let tmp = format!(
         ".{name}.{}.{}.tmp",
         std::process::id(),
@@ -308,7 +308,7 @@ fn render_lessons_manifest_in_dir(
 /// filename and summary parts. Only a single `.md` basename is accepted:
 /// manifest contents are repository-controlled and must never escape the
 /// lessons directory when joined.
-fn parse_manifest_line(line: &str) -> Option<(String, String)> {
+pub(crate) fn parse_manifest_line(line: &str) -> Option<(String, String)> {
     let line = line.trim_start_matches('-').trim();
     let (filename, summary) = match line.split_once('·') {
         Some((filename, summary)) => (filename.trim(), summary.trim()),
@@ -327,7 +327,7 @@ fn parse_manifest_line(line: &str) -> Option<(String, String)> {
     Some((filename.to_string(), summary.to_string()))
 }
 
-fn first_nonempty_line(text: &str) -> Option<&str> {
+pub(crate) fn first_nonempty_line(text: &str) -> Option<&str> {
     text.lines().map(str::trim).find(|l| !l.is_empty())
 }
 

@@ -62,6 +62,7 @@ pub mod hook_status;
 pub mod hooks;
 pub mod judgement;
 pub mod knowledge;
+pub mod lesson_checks;
 pub mod lessons;
 pub mod live_permission;
 pub mod mechanical_maintenance;
