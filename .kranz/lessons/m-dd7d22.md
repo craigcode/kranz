@@ -1,0 +1,3 @@
+Pre-declare in `commandGrants` the read-only `git diff $KRANZ_BASE_SHA.. -- <files> | grep ...` inspection commands that scrutiny validator…
+
+Pre-declare in `commandGrants` the read-only `git diff $KRANZ_BASE_SHA.. -- <files> | grep ...` inspection commands that scrutiny validators will want. An unanswered validator grant request is denied by default after 3600s and blocks the milestone even when the work is sound.
