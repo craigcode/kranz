@@ -33,6 +33,16 @@ is trust being earned back by evidence.
 
 **Reproduce:** `kranz escalation-metrics --json` → `.autonomy`.
 
+**Companion: abandoned missions.** Abandoned missions are counted
+separately BESIDE the ratio and never feed it. Each one carries its
+operator interventions by class — grant decisions, steers, revision
+rulings, operator unblocks: the same set as the ratio — and whether any
+feature completed before the abandon. It exists so the missions that took
+the most human effort stay visible. Reproduce: `kranz escalation-metrics
+--json` → `.abandoned` (also `kranz outcomes --json` → `.abandoned`). Each
+mission report also now carries an `**Interventions:**` line drawn from
+the same set.
+
 **This repo, 2026-08-02:** 49 closed missions, 44 zero-intervention —
 **89.8%**.
 

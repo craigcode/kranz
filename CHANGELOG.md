@@ -5,6 +5,12 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: a mission report now carries an `Interventions:` line counting
+  operator interventions by class (grant decisions, steers, revision
+  rulings, operator unblocks). `kranz escalation-metrics` and
+  `kranz outcomes` now also report a separate count of abandoned missions
+  (JSON `.abandoned`), each with its interventions by class and whether any
+  feature had completed before the abandon. Neither autonomy ratio changes.
 - Fixed: a fix feature created after an operator-directed repair
   (`unblock-add-fix`) or after a tier escalation no longer reuses an existing
   fix feature id. The mission used to stop with "duplicate
