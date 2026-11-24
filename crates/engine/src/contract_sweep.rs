@@ -617,6 +617,18 @@ mod tests {
     }
 
     #[test]
+    fn lesson_check_sweep_does_not_exempt_record() {
+        let mission_id = "m-abc123";
+        for path in [
+            ".kranz/lessons/m-abc123.check",
+            ".kranz/lessons/evil.check",
+            ".kranz/lessons/m-other.check",
+        ] {
+            assert!(!is_mission_record_path(mission_id, path), "{path}");
+        }
+    }
+
+    #[test]
     fn engine_commit_exempt_meta_paths_never_flagged() {
         let mission_id = "m-abc123";
         assert!(is_meta_path(

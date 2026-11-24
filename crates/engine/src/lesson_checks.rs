@@ -7,13 +7,15 @@
 //! module only reads; it never writes, creates, or deletes anything, and it
 //! never follows a symlink.
 
-use crate::error::Result;
+use crate::error::{EngineError, Result};
 use crate::lessons::{
-    first_nonempty_line, open_lessons_dir, parse_manifest_line, read_existing_regular,
+    atomic_replace, ensure_absent_or_regular, first_nonempty_line, open_lessons_dir,
+    parse_manifest_line, read_existing_regular,
 };
+use crate::paths::MissionPaths;
 use cap_std::fs::Dir;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Classification of whether a deterministic check could have caught the
 /// mistake a lesson describes.
@@ -75,6 +77,31 @@ impl LessonCheckRecord {
         }
         (CheckClass::Unclassified, CheckSource::None)
     }
+}
+
+/// Write a `.check` companion record for `mission_id`, following the same
+/// no-follow, symlink-refusing, atomic-replace discipline as
+/// [`crate::lessons::write_lesson`]. Returns the path written.
+///
+/// Never used to clear an existing record: a symlink or other non-regular
+/// file already at `<mission_id>.check` is refused rather than replaced, the
+/// same as [`ensure_absent_or_regular`] refuses for lesson bodies.
+pub(crate) fn write_check_record(
+    repo_root: &Path,
+    mission_id: &str,
+    record: &LessonCheckRecord,
+) -> Result<PathBuf> {
+    if !MissionPaths::is_safe_id(mission_id) {
+        return Err(EngineError::InvalidState(format!(
+            "unsafe mission id for lesson check record: {mission_id}"
+        )));
+    }
+    let lessons = open_lessons_dir(repo_root, true)?;
+    let name = format!("{mission_id}.check");
+    ensure_absent_or_regular(&lessons, &name)?;
+    let text = render_check_record(record, mission_id);
+    atomic_replace(&lessons, &name, text.as_bytes())?;
+    Ok(repo_root.join(".kranz").join("lessons").join(name))
 }
 
 /// Parse a `.check` companion file's text.
@@ -560,6 +587,32 @@ mod tests {
         assert!(
             orphan_warnings[1].starts_with("m-zz.check"),
             "{orphan_warnings:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lesson_check_sidecar_write_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lessons_dir = dir.path().join(".kranz").join("lessons");
+        std::fs::create_dir_all(&lessons_dir).unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "original").unwrap();
+        symlink(&target, lessons_dir.join("m-one.check")).unwrap();
+
+        let record = LessonCheckRecord {
+            orchestrator: Some(CheckClass::Checkable),
+            operator: None,
+            link: None,
+        };
+        let result = write_check_record(dir.path(), "m-one", &record);
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "original",
+            "the symlink's target must be untouched"
         );
     }
 

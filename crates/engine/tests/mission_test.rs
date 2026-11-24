@@ -1561,6 +1561,102 @@ async fn happy_path_completes_mission_with_tag_and_contract_gate() {
     );
 }
 
+/// The capture turn's reply ends with a `CHECK: checkable` line: the
+/// companion `.check` record lands in the SAME report commit as the lesson
+/// and report, the committed lesson body carries no `CHECK:` line, and the
+/// read-only lesson-check listing picks the lesson up as needing a check.
+#[tokio::test(flavor = "multi_thread")]
+async fn lesson_check_capture_writes_sidecar_in_report_commit() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let contract = vec![
+        assertion("a-1", "the build command succeeds", Some("cd .")),
+        assertion("a-2", "error messages are actionable", None),
+    ];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            verdicts_pass(&["a-2"]),
+            "Always add a regression test alongside the fix it covers.\n\nCHECK: checkable"
+                .to_string(),
+        ]),
+        worker_pass(),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(2, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let mission_id = engine.mission_id().to_string();
+    drop(engine); // flush + release the lock before reading the worktree
+
+    let files = raw_git(&root, &["show", "--name-only", "--format=", "HEAD"]);
+    let mut files: Vec<&str> = files.lines().filter(|l| !l.trim().is_empty()).collect();
+    files.sort_unstable();
+    let mut expected = vec![
+        format!(".kranz/lessons/{mission_id}.check"),
+        ".kranz/lessons/index.md".to_string(),
+        format!(".kranz/lessons/{mission_id}.md"),
+        ".kranz/missions/index.md".to_string(),
+        format!(".kranz/missions/{mission_id}/report.md"),
+    ];
+    expected.sort_unstable();
+    assert_eq!(
+        files, expected,
+        "the check record lands in the same report commit"
+    );
+
+    let lesson_body = std::fs::read_to_string(
+        root.join(".kranz")
+            .join("lessons")
+            .join(format!("{mission_id}.md")),
+    )
+    .expect("lesson file written");
+    assert!(
+        !lesson_body.to_ascii_uppercase().contains("CHECK:"),
+        "the CHECK line must never pollute the committed lesson body: {lesson_body}"
+    );
+
+    let check_text = std::fs::read_to_string(
+        root.join(".kranz")
+            .join("lessons")
+            .join(format!("{mission_id}.check")),
+    )
+    .expect("check record written");
+    let (record, warnings) = kranz_engine::lesson_checks::parse_check_record(&check_text);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        record.orchestrator,
+        Some(kranz_engine::lesson_checks::CheckClass::Checkable)
+    );
+
+    let listing = kranz_engine::lesson_checks::list_lessons(&root).unwrap();
+    assert!(listing.warnings.is_empty(), "{:?}", listing.warnings);
+    let needing = kranz_engine::lesson_checks::needs_check(&listing);
+    assert!(
+        needing.iter().any(|entry| entry.mission_id == mission_id),
+        "{needing:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 1b. Frontier provenance: every real worker.spawned emit site (orchestrator
 // self-spawn + runner worker/validator spawns) records the frontier regime —
