@@ -1,0 +1,229 @@
+{
+  "goal": "Each mission report states how many times the operator intervened, split by class, and both `kranz escalation-metrics` and `kranz outcomes` show a separate count of abandoned missions, with each one's interventions by class and whether it had delivered features. Neither autonomy ratio changes.",
+  "validationContract": [
+    {
+      "id": "a1",
+      "statement": "A mission log with two steers after plan approval and one grant decision renders a report whose interventions line reads `**Interventions:** 3 (2 steers, 1 grant decision, 0 revision rulings, 0 operator unblocks)`.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --test report_test report_interventions_line_two_steers_one_grant_shows_three 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "milestone": "Mission report states operator interventions by class",
+      "timeoutSecs": 1200
+    },
+    {
+      "id": "a2",
+      "statement": "A mission with no interventions renders the interventions line with a zero count, `**Interventions:** 0 (0 steers, 0 grant decisions, 0 revision rulings, 0 operator unblocks)`, not a missing line.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --test report_test report_interventions_line_zero_renders_zero 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "milestone": "Mission report states operator interventions by class",
+      "timeoutSecs": 1200
+    },
+    {
+      "id": "a3",
+      "statement": "The per-class intervention fold in escalation_metrics.rs counts grant decisions, post-approval steers, revision rulings and operator unblocks separately, and its total equals the existing `interventions` count (engine-owned workspace-gate lifts and pre-approval messages still do not count).",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --lib intervention_classes_ 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "milestone": "Mission report states operator interventions by class",
+      "timeoutSecs": 1200
+    },
+    {
+      "id": "a4",
+      "statement": "Over one completed mission (no interventions) and one abandoned mission (one post-approval steer, one operator unblock, one feature completed before the abandon), `escalation-metrics` keeps its autonomy ratio at closed 1, zero-intervention 1, share 1.0, and its `abandoned` figure reports 1 mission with 2 interventions (1 steer, 1 operator unblock) that had delivered features.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --lib abandoned_missions_fold_escalation_ratio_unchanged 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "milestone": "Abandoned missions are visible beside the autonomy ratio",
+      "timeoutSecs": 1200
+    },
+    {
+      "id": "a5",
+      "statement": "Over the same two-mission fixture repo, `kranz outcomes`' autonomy ratio stays exactly as it is today (closed 2, total interventions 1, zero-intervention 1, share 0.5), and `Outcomes.abandoned` reports the abandoned mission with the same per-class counts and delivered flag as escalation-metrics.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --lib abandoned_missions_fold_outcomes_ratio_unchanged 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "milestone": "Abandoned missions are visible beside the autonomy ratio",
+      "timeoutSecs": 1200
+    },
+    {
+      "id": "a6",
+      "statement": "The abandoned-mission fold tests all pass: an abandoned mission with no completed feature reads as not delivered, a feature completed after the abandon does not count, and completed and failed missions never appear in the abandoned count.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --lib abandoned_missions_fold_ 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [3-9]|test result: ok\\. [1-9][0-9]+ passed'",
+      "milestone": "Abandoned missions are visible beside the autonomy ratio",
+      "timeoutSecs": 1200
+    },
+    {
+      "id": "a7",
+      "statement": "The text views of `kranz escalation-metrics` and `kranz outcomes` print an `Abandoned (outside the autonomy ratio)` section with the count and a per-mission row of interventions by class when any mission was abandoned, and print no such section when none was.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz --lib abandoned_missions_cli_ 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "milestone": "Abandoned missions are visible beside the autonomy ratio",
+      "timeoutSecs": 1800
+    },
+    {
+      "id": "a8",
+      "statement": "Anti-vacuity: none of the new test-name prefixes existed at the base commit, so every filter above matches only tests this mission added.",
+      "check": "command",
+      "command": "! git grep -qE 'fn (intervention_classes_|report_interventions_line_|abandoned_missions_fold_|abandoned_missions_cli_)' $KRANZ_BASE_SHA -- crates"
+    },
+    {
+      "id": "a9",
+      "statement": "The full kranz-engine library test suite passes, including every existing escalation_metrics and outcomes autonomy test, unchanged.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --lib 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "timeoutSecs": 2400
+    },
+    {
+      "id": "a10",
+      "statement": "The existing report renderer tests still pass.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --test report_test 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "timeoutSecs": 1200
+    },
+    {
+      "id": "a11",
+      "statement": "The CLI library tests, the Slack formatting tests and the server library tests (which build or serialize `Outcomes`) all pass.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz --lib 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed' && out=$(cargo test -p kranz-slack --test formatting 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed' && out=$(cargo test -p kranz-server --lib 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "timeoutSecs": 3600
+    },
+    {
+      "id": "a12",
+      "statement": "`events.rs` and `types.rs` are unchanged (D-X1: the count alone, no new event field).",
+      "check": "command",
+      "command": "git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/events.rs crates/engine/src/types.rs"
+    },
+    {
+      "id": "a13",
+      "statement": "The report renderer defines no intervention classification of its own: it holds no match on grant, revision, unblock or user-message event kinds and calls the escalation_metrics per-class fold instead.",
+      "check": "command",
+      "command": "! grep -qE 'EventKind::(GrantApproved|GrantDenied|PlanRevised|PlanRevisionRejected|MilestoneUnblocked|UserMessage)' crates/engine/src/report_render.rs && grep -q 'escalation_metrics::' crates/engine/src/report_render.rs"
+    },
+    {
+      "id": "a14",
+      "statement": "`docs/metrics.md` keeps the published autonomy-ratio denominator text and gains a companion entry for the abandoned count that names its reproduce path `.abandoned`.",
+      "check": "command",
+      "command": "grep -qF 'Closed missions (`completed` + `failed`). Abandoned' docs/metrics.md && grep -qF '.abandoned' docs/metrics.md && ! git diff --quiet $KRANZ_BASE_SHA -- docs/metrics.md"
+    },
+    {
+      "id": "a15",
+      "statement": "The D-X operator decision (whether an abandoned mission can be linked to the change that finished its work) and the existing divergence between the two autonomy ratios are each recorded as a ticket.",
+      "check": "command",
+      "command": "grep -q 'D-X' .kranz/tickets/abandoned-mission-delivery-link.md && grep -q 'delivered-by' .kranz/tickets/abandoned-mission-delivery-link.md && grep -q 'outcomes.rs' .kranz/tickets/outcomes-autonomy-ratio-divergence.md && grep -q 'escalation_metrics.rs' .kranz/tickets/outcomes-autonomy-ratio-divergence.md"
+    },
+    {
+      "id": "a16",
+      "statement": "Formatting and clippy are clean on the touched crates.",
+      "check": "command",
+      "command": "cargo fmt --all --check && cargo clippy -p kranz-engine -p kranz -p kranz-slack -p kranz-server --all-targets -- -D warnings",
+      "timeoutSecs": 2400
+    },
+    {
+      "id": "a17",
+      "statement": "The abandoned figures never enter either autonomy ratio's numerator or denominator, and the new report line and CLI section read honestly to an operator: they name the abandoned count as outside the ratio, and they don't present an abandoned mission as a completion or a failure.",
+      "check": "agent-judgement"
+    }
+  ],
+  "milestones": [
+    {
+      "title": "Mission report states operator interventions by class",
+      "features": [
+        {
+          "title": "Per-class intervention counts in the escalation fold",
+          "spec": "Repository: kranz (Rust workspace). File: `crates/engine/src/escalation_metrics.rs`. This module already defines the single operator-intervention set used by the published autonomy ratio. In `mission_escalation` (around lines 268-327) a loop increments one `interventions: u64` for four classes: (1) grant decisions, `EventKind::GrantApproved` / `GrantDenied`; (2) steers, `EventKind::UserMessage` whose seq is >= the first `PlanApproved` seq; (3) revision rulings, `PlanRevised` / `PlanRevisionRejected`; (4) operator unblocks, `MilestoneUnblocked` where `!is_engine_lift(reason, block_context.as_ref())`. Do NOT define a second intervention set anywhere, and do NOT change which events count.\n\nAdd, in this file:\n1. `#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = \"camelCase\")] pub struct InterventionCounts { pub grant_decisions: u64, pub steers: u64, pub revision_rulings: u64, pub operator_unblocks: u64 }` with `pub fn total(&self) -> u64` (the sum). Doc-comment each field with its class rule.\n2. `pub fn mission_interventions(mission_id: &str, events: &[Event]) -> InterventionCounts`. It filters to `mission_id` and classifies exactly as the existing loop does. Refactor `mission_escalation` so its classification comes from this one place (e.g. the loop increments the per-class struct and `interventions` becomes `counts.total()`; or `mission_escalation` calls `mission_interventions`). The steer ledger rows must still be produced exactly as now. Optionally keep the counts on `MissionEscalation` as a private field.\n3. `pub fn format_intervention_classes(counts: &InterventionCounts) -> String` returning exactly `\"{s} steer(s), {g} grant decision(s), {r} revision ruling(s), {u} operator unblock(s)\"`, singular when the count is 1 and plural otherwise. Examples: `2 steers, 1 grant decision, 0 revision rulings, 0 operator unblocks`; `0 steers, 0 grant decisions, 0 revision rulings, 0 operator unblocks`; `1 steer, 0 grant decisions, 0 revision rulings, 1 operator unblock`. The report and the CLI will both use this one renderer.\n\nTests go in the existing `#[cfg(test)] mod tests` of this file, reusing its `ev`, `created`, `sample_plan` helpers. EVERY new test name must start with `intervention_classes_` (that prefix must not already exist in the repo; check with grep). Do not rename or edit existing tests. Run `cargo test -p kranz-engine --lib intervention_classes_` and `cargo test -p kranz-engine --lib escalation_metrics` and show both outputs as evidence. Run `cargo fmt --all` and `cargo clippy -p kranz-engine --all-targets -- -D warnings`. Do not touch `events.rs` or `types.rs`.",
+          "validationCriteria": [
+            "intervention_classes_counts_each_class_separately: a log with plan.approved, 2 post-approval user.message, 1 grant.approved, 1 grant.denied, 1 plan.revised, 1 plan.revision.rejected and 1 operator milestone.unblocked yields steers 2, grant_decisions 2, revision_rulings 2, operator_unblocks 1, total 7",
+            "intervention_classes_exclude_engine_lift_and_drafting: a pre-approval user.message and a workspace-gate-lift milestone.unblocked (GATE_LIFT_REASON, no block_context) count zero in every class",
+            "intervention_classes_total_matches_mission_escalation: over the existing anti_vacuity_missions fixture and the revision/unblock fixtures, mission_interventions(..).total() equals mission_escalation(..).interventions for every mission",
+            "intervention_classes_format_pluralises: format_intervention_classes renders the three example strings in the spec exactly",
+            "all pre-existing escalation_metrics tests pass unchanged"
+          ]
+        },
+        {
+          "title": "Interventions line on the mission report",
+          "spec": "Repository: kranz (Rust workspace). File: `crates/engine/src/report_render.rs`, function `render_mission_report` (around line 532). After the `**Cost:** ...` line (around line 627-631) and before the `## Workspace` section, add one line:\n`**Interventions:** {total} ({classes})`\nwhere `counts = crate::escalation_metrics::mission_interventions(&state.mission.id, events)`, `total = counts.total()` and `classes = crate::escalation_metrics::format_intervention_classes(&counts)`. Both helpers and `InterventionCounts` already exist in `crates/engine/src/escalation_metrics.rs` (added by the previous feature; read that file first). The line is ALWAYS emitted, including when the total is 0: `**Interventions:** 0 (0 steers, 0 grant decisions, 0 revision rulings, 0 operator unblocks)`. report_render.rs must NOT match on GrantApproved/GrantDenied/PlanRevised/PlanRevisionRejected/MilestoneUnblocked/UserMessage itself. The classification lives only in escalation_metrics.rs. Update the doc comment on `render_mission_report` to mention the interventions line.\n\nTests go in `crates/engine/tests/report_test.rs`, reusing its helpers (`ev`, `plan`, `completed_state`, `estimate`; read how existing tests build state and events, e.g. via `reducer::fold`). Every new test name must start with `report_interventions_line_`. Required tests:\n- `report_interventions_line_two_steers_one_grant_shows_three`: the event log has plan.approved, then two `EventKind::UserMessage` after it, and one `EventKind::GrantApproved` (preceded by a matching `GrantRequested` if the fold requires it). The rendered report contains exactly the line `**Interventions:** 3 (2 steers, 1 grant decision, 0 revision rulings, 0 operator unblocks)`.\n- `report_interventions_line_zero_renders_zero`: a mission with no interventions renders `**Interventions:** 0 (0 steers, 0 grant decisions, 0 revision rulings, 0 operator unblocks)`.\n- `report_interventions_line_follows_cost`: the interventions line appears after the `**Cost:**` line and before `## Workspace`.\nDo not modify existing tests. If an existing test asserts exact report text and breaks, report that and fix only the expected text. Run `cargo test -p kranz-engine --test report_test` and show the output. Run `cargo fmt --all` and clippy on kranz-engine.",
+          "validationCriteria": [
+            "report_interventions_line_two_steers_one_grant_shows_three passes, asserting the exact line with count 3 split as 2 steers and 1 grant decision",
+            "report_interventions_line_zero_renders_zero passes, asserting the zero line is present (not missing)",
+            "report_interventions_line_follows_cost passes",
+            "report_render.rs contains no match arm on grant/revision/unblock/user-message event kinds and calls crate::escalation_metrics",
+            "the whole report_test target passes"
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Abandoned missions are visible beside the autonomy ratio",
+      "features": [
+        {
+          "title": "Abandoned-mission fold in escalation_metrics and EscalationMetrics.abandoned",
+          "spec": "Repository: kranz (Rust workspace). File: `crates/engine/src/escalation_metrics.rs`. It already has `TerminalOutcome::Abandoned` (an operator-retired mission, kept out of the autonomy denominator), `InterventionCounts`, `mission_interventions(mission_id, events)` and `format_intervention_classes`. Read the whole file first.\n\nAdd:\n1. `#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = \"camelCase\")] pub struct AbandonedMissionRow { pub mission_id: String, pub interventions: InterventionCounts, pub total_interventions: u64, pub features_completed_before_abandon: u64, pub delivered_before_abandon: bool }`. `features_completed_before_abandon` counts `EventKind::FeatureCompleted { .. }` events whose seq is lower than the FIRST `MissionAbandoned` event's seq. `delivered_before_abandon` = that count > 0.\n2. `#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all = \"camelCase\")] pub struct AbandonedMissions { pub missions: u64, pub delivered_before_abandon: u64, pub total_interventions: u64, pub rows: Vec<AbandonedMissionRow> }`, with rows sorted by mission_id. Doc-comment that this figure sits BESIDE the autonomy ratio and never feeds it.\n3. `pub fn abandoned_mission_row(mission_id: &str, events: &[Event]) -> Option<AbandonedMissionRow>`: None unless the mission's terminal outcome (same first-terminal rule as `mission_escalation`) is Abandoned. Interventions come from `mission_interventions`.\n4. `pub fn summarize_abandoned(rows: Vec<AbandonedMissionRow>) -> AbandonedMissions`: sorts the rows and sums them.\n5. Add `#[serde(default)] pub abandoned: AbandonedMissions` to `EscalationMetrics`. In `aggregate`, collect `abandoned_mission_row` for each mission and set the field. The `Some(TerminalOutcome::Abandoned) | None => {}` arm must still not touch any autonomy counter. Do NOT change `AutonomyMetric`, `closed_missions` or any existing computation.\nUpdate the module doc comment to list the abandoned figure as a companion to metric 1.\n\nTests go in this file's test module. Every new test name must start with `abandoned_missions_fold_`. Required:\n- `abandoned_missions_fold_escalation_ratio_unchanged`: missions m-1 (created, mission.completed, no interventions) and m-2 (created, plan.approved, one post-approval user.message, one `FeatureCompleted` event, an operator `MilestoneUnblocked` with a non-lift reason, then `MissionAbandoned`). Assert autonomy closed_missions 1, zero_intervention_missions 1, zero_intervention_share Some(1.0), completed.missions 1, failed.missions 0; and abandoned.missions 1, delivered_before_abandon 1, total_interventions 2, rows[0] = m-2 with steers 1, operator_unblocks 1, grant_decisions 0, revision_rulings 0, features_completed_before_abandon 1, delivered true.\n- `abandoned_missions_fold_no_feature_is_not_delivered`\n- `abandoned_missions_fold_feature_after_abandon_not_counted` (a FeatureCompleted with seq after the abandon is ignored)\n- `abandoned_missions_fold_completed_and_failed_excluded` (completed and failed missions produce no row; empty input gives AbandonedMissions::default())\nConstruct `EventKind::FeatureCompleted` with the fields defined in `crates/engine/src/events.rs` (around line 292). Read it, but do not edit events.rs or types.rs. Run `cargo test -p kranz-engine --lib abandoned_missions_fold_` and `cargo test -p kranz-engine --lib escalation_metrics`, and show the outputs. The REST handler in crates/server serializes EscalationMetrics, so run `cargo test -p kranz-server --lib` too and report the result. Run fmt and clippy on kranz-engine.",
+          "validationCriteria": [
+            "abandoned_missions_fold_escalation_ratio_unchanged passes with the exact autonomy and abandoned values in the spec",
+            "abandoned_missions_fold_no_feature_is_not_delivered passes",
+            "abandoned_missions_fold_feature_after_abandon_not_counted passes",
+            "abandoned_missions_fold_completed_and_failed_excluded passes",
+            "every pre-existing escalation_metrics test passes unchanged, including escalation_metrics_abandoned_is_not_a_closed_mission",
+            "kranz-server lib tests pass"
+          ]
+        },
+        {
+          "title": "Outcomes.abandoned through the memoized outcomes fold",
+          "spec": "Repository: kranz (Rust workspace). File: `crates/engine/src/outcomes.rs` (the `kranz outcomes` fold). IMPORTANT: this file has its OWN `AutonomyRatio` whose `is_closed` includes MissionAbandoned and whose intervention count omits unblocks. That is a known divergence, tracked separately. Do NOT change it: `AutonomyRatio`, `is_closed`, the `interventions` loop in `mission_outcomes` and every existing number must stay exactly as they are.\n\n`crates/engine/src/escalation_metrics.rs` already provides `AbandonedMissionRow`, `AbandonedMissions`, `abandoned_mission_row(mission_id, events) -> Option<AbandonedMissionRow>` and `summarize_abandoned(rows) -> AbandonedMissions`. Read them first and reuse them. Do not reimplement abandoned or intervention logic here.\n\nChanges:\n1. Add `pub abandoned: Option<crate::escalation_metrics::AbandonedMissionRow>` to `MissionOutcomes` (around line 296), set in `mission_outcomes` (struct literal around line 874) via `crate::escalation_metrics::abandoned_mission_row(mission_id, events)`. It then rides the existing per-(path,len,mtime) memo cache.\n2. Add `#[serde(default)] pub abandoned: crate::escalation_metrics::AbandonedMissions` to `Outcomes` (around line 117), placed right after `autonomy_ratio`, with a doc comment saying it sits beside the autonomy ratio and does not feed it. In `compute_outcomes_with_options` (around line 982), collect each mission's `abandoned` row and set the field via `summarize_abandoned`. Fix the struct literal at around line 1232.\n3. `crates/slack/tests/formatting.rs` builds `Outcomes { .. }` literals at around lines 436 and 541. Add `abandoned: Default::default()` to each. Do not change the Slack formatter (`crates/slack/src/format.rs`).\n\nTests go in outcomes.rs's existing fixture-repo test module (the one with `seed_mission` / `write_timed_log` / `created(goal)`, around lines 1960-2440). The new test name must start with `abandoned_missions_fold_`. Required: `abandoned_missions_fold_outcomes_ratio_unchanged`: m-1 is created then mission.completed with no interventions; m-2 is created, plan.approved, one post-approval user.message, one FeatureCompleted, an operator MilestoneUnblocked (non-lift reason), then mission.abandoned. Call `compute_outcomes_with_options` (or `compute_outcomes`, whichever existing tests use for hermetic runs). Assert `autonomy_ratio.closed_missions == 2`, `total_interventions == 1`, `zero_intervention_missions == 1`, `zero_intervention_share == 0.5` (today's behaviour, pinned), and `abandoned.missions == 1`, `abandoned.rows[0].mission_id == \"m-2\"`, steers 1, operator_unblocks 1, total_interventions 2, delivered_before_abandon true. Also add `abandoned_missions_fold_outcomes_json_field` asserting `serde_json::to_value(&outcomes)` has `abandoned.missions` and that an `Outcomes` JSON without `abandoned` still deserializes. Run `cargo test -p kranz-engine --lib outcomes`, `cargo test -p kranz-engine --lib abandoned_missions_fold_`, `cargo test -p kranz-slack --test formatting` and `cargo test -p kranz-server --lib`, and show the outputs. Run fmt and clippy on kranz-engine, kranz-slack and kranz-server.",
+          "validationCriteria": [
+            "abandoned_missions_fold_outcomes_ratio_unchanged passes, pinning closed 2 / interventions 1 / zero 1 / share 0.5 and the abandoned row",
+            "abandoned_missions_fold_outcomes_json_field passes (field present; legacy JSON without it deserializes)",
+            "all pre-existing outcomes tests pass unchanged",
+            "kranz-slack formatting tests and kranz-server lib tests pass"
+          ]
+        },
+        {
+          "title": "CLI text sections for abandoned missions",
+          "spec": "Repository: kranz (Rust workspace). File: `crates/cli/src/output.rs` (CLI package `kranz`, lib target `kranz_cli`). Two renderers: `render_outcomes(&Outcomes)` (around line 317) and `render_escalation_metrics(&EscalationMetrics)` (around line 655). Both structs now carry `abandoned: kranz_engine::escalation_metrics::AbandonedMissions` (fields: missions, delivered_before_abandon, total_interventions, rows: Vec<AbandonedMissionRow { mission_id, interventions: InterventionCounts, total_interventions, features_completed_before_abandon, delivered_before_abandon }>). There is also `kranz_engine::escalation_metrics::format_intervention_classes(&InterventionCounts) -> String`. Read `crates/engine/src/escalation_metrics.rs` first.\n\nIn BOTH renderers, immediately after the Autonomy section (before any empty-history early return), and ONLY when `abandoned.missions > 0`, emit:\n```\n\nAbandoned (outside the autonomy ratio)\n  abandoned missions: {missions} ({delivered_before_abandon} had completed features)   interventions: {total_interventions}\n  {mission_id}: {total} interventions ({format_intervention_classes}); features completed before abandon: {n}\n```\nwith one row line per abandoned mission. When `abandoned.missions == 0` emit nothing, so existing output and the existing empty-history tests stay byte-identical. Share one private helper between the two renderers. Do not change any other section.\n\nTests go in output.rs's existing `#[cfg(test)]` modules (see the `outcomes_cli_*` and `escalation_metrics_cli_*` tests around lines 1600-2250 for fixture patterns). Every new test name must start with `abandoned_missions_cli_`. Required: `abandoned_missions_cli_outcomes_section_lists_rows` and `abandoned_missions_cli_escalation_section_lists_rows` (fixtures with one abandoned mission: 1 steer + 1 operator unblock + 1 completed feature; assert the header, the count line and the row line text exactly), plus `abandoned_missions_cli_absent_when_none` (no section header in either renderer when nothing was abandoned). Run `cargo test -p kranz --lib abandoned_missions_cli_` and `cargo test -p kranz --lib`, and show the outputs. Run `cargo fmt --all` and `cargo clippy -p kranz --all-targets -- -D warnings`.",
+          "validationCriteria": [
+            "abandoned_missions_cli_outcomes_section_lists_rows passes with the exact header/count/row text",
+            "abandoned_missions_cli_escalation_section_lists_rows passes with the exact header/count/row text",
+            "abandoned_missions_cli_absent_when_none passes for both renderers",
+            "all pre-existing kranz --lib tests pass unchanged (existing text output byte-identical when nothing is abandoned)"
+          ]
+        },
+        {
+          "title": "metrics.md companion figure, changelog, and D-X / divergence tickets",
+          "spec": "Repository: kranz. Documentation only. No Rust changes.\n\n1. `docs/metrics.md` §1 Autonomy ratio: leave the Definition, Denominator, Read-it-as and the 2026-08-02 numbers text exactly as they are (the line beginning `**Denominator.** Closed missions (\\`completed\\` + \\`failed\\`). Abandoned` must remain). Add a short `**Companion: abandoned missions.**` paragraph after the Reproduce line. It says abandoned missions are counted separately BESIDE the ratio and never feed it, and that each carries its operator interventions by class (grant decisions, steers, revision rulings, operator unblocks: the same set as the ratio) and whether any feature completed before the abandon. It exists so the missions that took the most human effort stay visible. Reproduce: `kranz escalation-metrics --json` → `.abandoned` (also `kranz outcomes --json` → `.abandoned`). Do not publish new repo numbers. Also mention in one sentence that each mission report now carries an `**Interventions:**` line from the same set.\n2. `CHANGELOG.md` under `## Unreleased`: one `- Added:` entry in the file's plain style covering the report interventions line and the abandoned-missions count in `kranz escalation-metrics` / `kranz outcomes` (JSON `.abandoned`), stating that neither autonomy ratio changes.\n3. Create `.kranz/tickets/abandoned-mission-delivery-link.md`, copying the frontmatter shape of an existing ticket in `.kranz/tickets/` (read two first). Title: link an abandoned mission to the change that finished its work. Body: the D-X operator decision, with options D-X1 (count only, the shipped default), D-X2 (an optional `#[serde(default)]` field on `mission.abandoned`, set via `kranz abandon --delivered-by <branch|PR>`; forward-only, since an already-terminal mission cannot be re-abandoned; about 14 `MissionAbandoned { .. }` struct literals across engine/cli/server need a sweep feature of their own) and D-X3 (derive at fold time from `merged.rs` ancestry; reads unknown once the branch is deleted, as for m-caf631 and m-882080). The literal string `D-X` and `delivered-by` must appear.\n4. Create `.kranz/tickets/outcomes-autonomy-ratio-divergence.md` (same frontmatter shape). It records that `crates/engine/src/outcomes.rs` `AutonomyRatio` counts ABANDONED as closed (`is_closed` includes MissionAbandoned), omits operator unblocks from interventions, and classifies steers by timestamp, while `crates/engine/src/escalation_metrics.rs` (the published ratio in docs/metrics.md) excludes abandoned missions, counts unblocks and classifies by seq. The goal: an operator decision whether to align `kranz outcomes` with the published definition (this changes its numbers). Both file paths must appear literally.\nVerify with grep that the required strings are present, and show the commands and outputs.",
+          "validationCriteria": [
+            "docs/metrics.md still contains 'Closed missions (`completed` + `failed`). Abandoned' and now contains '.abandoned'",
+            "CHANGELOG.md Unreleased has an Added entry for the interventions line and the abandoned count",
+            ".kranz/tickets/abandoned-mission-delivery-link.md exists with valid frontmatter and contains 'D-X' and 'delivered-by'",
+            ".kranz/tickets/outcomes-autonomy-ratio-divergence.md exists with valid frontmatter and names both outcomes.rs and escalation_metrics.rs"
+          ]
+        }
+      ]
+    }
+  ],
+  "consideredAlternatives": {
+    "chosen": "Build one per-class intervention fold and one abandoned fold in escalation_metrics.rs. That file holds the published intervention set, and abandoned missions already sit outside its denominator. The report line and the `kranz outcomes` field read those same functions. Both existing ratios stay untouched, D-X1 (count only) keeps events.rs and types.rs unchanged, and the D-X options and the existing outcomes.rs divergence go to the operator as tickets.",
+    "rejected": [
+      {
+        "approach": "Align outcomes.rs's AutonomyRatio with the published definition in this mission (exclude abandoned, count unblocks, classify by seq).",
+        "tradeOff": "That changes `kranz outcomes` numbers, which the scoping answer ('keep the autonomy ratio unchanged') rules out without an operator decision."
+      },
+      {
+        "approach": "Implement D-X2 now: `kranz abandon --delivered-by` with an optional field on mission.abandoned.",
+        "tradeOff": "It is forward-only, so it can't link the motivating missions m-caf631 and m-882080. It also needs a 14-literal sweep across engine, cli and server (lesson m-777557), and the brief asks for this to be flagged, not decided."
+      },
+      {
+        "approach": "Count abandoned missions and interventions separately inside outcomes.rs and report_render.rs.",
+        "tradeOff": "That would create a second and third intervention definition, against the brief's 'reuse, do not define a second one'."
+      }
+    ]
+  },
+  "touchSet": [
+    "crates/engine/src/escalation_metrics.rs",
+    "crates/engine/src/report_render.rs",
+    "crates/engine/src/outcomes.rs",
+    "crates/engine/tests/report_test.rs",
+    "crates/cli/src/output.rs",
+    "crates/slack/tests/formatting.rs",
+    "docs/metrics.md",
+    "CHANGELOG.md",
+    ".kranz/tickets/abandoned-mission-delivery-link.md",
+    ".kranz/tickets/outcomes-autonomy-ratio-divergence.md"
+  ]
+}
