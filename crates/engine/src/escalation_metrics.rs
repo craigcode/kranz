@@ -22,6 +22,11 @@
 //!    - `milestone.unblocked` whose reason is an operator decision — i.e.
 //!      every unblock EXCEPT the workspace-gate lift
 //!      ([`crate::workspace_gate::GATE_LIFT_REASON`], which is engine-owned).
+//!
+//!    Companion figure: [`AbandonedMissions`] — abandoned missions with their
+//!    per-class intervention counts and whether they delivered a feature
+//!    before being retired. It sits BESIDE the autonomy ratio above and never
+//!    feeds its denominator or numerator.
 //! 2. **Rubber-stamp signal** — the park→grant latency distribution (p50/p90,
 //!    nearest-rank; and the count under 10s) over decided grant requests.
 //! 3. **False greens** — missions that closed COMPLETED with ≥1 defect ticket
@@ -148,11 +153,39 @@ pub struct LedgerRow {
     pub latency_ms: Option<u64>,
 }
 
+/// One abandoned mission's intervention counts and whether it delivered a
+/// feature before the operator retired it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbandonedMissionRow {
+    pub mission_id: String,
+    pub interventions: InterventionCounts,
+    pub total_interventions: u64,
+    pub features_completed_before_abandon: u64,
+    pub delivered_before_abandon: bool,
+}
+
+/// Abandoned missions, beside the autonomy ratio: operator-retired missions
+/// are kept out of [`AutonomyMetric`]'s denominator entirely, but still worth
+/// surfacing with their intervention counts and delivery status. This figure
+/// never feeds the autonomy ratio's numerator or denominator.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbandonedMissions {
+    pub missions: u64,
+    pub delivered_before_abandon: u64,
+    pub total_interventions: u64,
+    pub rows: Vec<AbandonedMissionRow>,
+}
+
 /// The full flight-surgeon aggregate over one host's missions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EscalationMetrics {
     pub autonomy: AutonomyMetric,
+    /// Abandoned missions, beside the autonomy ratio above (never feeds it).
+    #[serde(default)]
+    pub abandoned: AbandonedMissions,
     pub rubber_stamp: RubberStamp,
     pub false_greens: FalseGreens,
     pub ledger: Vec<LedgerRow>,
@@ -453,6 +486,62 @@ pub fn mission_escalation(mission_id: &str, events: &[Event]) -> MissionEscalati
     }
 }
 
+/// Fold one abandoned mission's row: `None` unless its terminal outcome (the
+/// same first-terminal rule as [`mission_escalation`]) is Abandoned.
+/// `features_completed_before_abandon` counts `feature.completed` events
+/// strictly before the FIRST `mission.abandoned` event's seq.
+pub fn abandoned_mission_row(mission_id: &str, events: &[Event]) -> Option<AbandonedMissionRow> {
+    let mission_events: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.mission_id == mission_id)
+        .collect();
+
+    let abandoned_seq = mission_events.iter().find_map(|e| match &e.kind {
+        EventKind::MissionAbandoned { .. } => Some(e.seq),
+        _ => None,
+    })?;
+
+    let terminal = mission_events.iter().find_map(|e| match &e.kind {
+        EventKind::MissionCompleted {} => Some(TerminalOutcome::Completed),
+        EventKind::MissionFailed { .. } => Some(TerminalOutcome::Failed),
+        EventKind::MissionAbandoned { .. } => Some(TerminalOutcome::Abandoned),
+        _ => None,
+    })?;
+    if terminal != TerminalOutcome::Abandoned {
+        return None;
+    }
+
+    let features_completed_before_abandon = mission_events
+        .iter()
+        .filter(|e| e.seq < abandoned_seq && matches!(e.kind, EventKind::FeatureCompleted { .. }))
+        .count() as u64;
+
+    let interventions = mission_interventions(mission_id, events);
+    Some(AbandonedMissionRow {
+        mission_id: mission_id.to_string(),
+        interventions,
+        total_interventions: interventions.total(),
+        features_completed_before_abandon,
+        delivered_before_abandon: features_completed_before_abandon > 0,
+    })
+}
+
+/// Sort and sum abandoned-mission rows into the [`AbandonedMissions`]
+/// aggregate.
+pub fn summarize_abandoned(mut rows: Vec<AbandonedMissionRow>) -> AbandonedMissions {
+    rows.sort_by(|a, b| a.mission_id.cmp(&b.mission_id));
+    let missions = rows.len() as u64;
+    let delivered_before_abandon =
+        rows.iter().filter(|r| r.delivered_before_abandon).count() as u64;
+    let total_interventions = rows.iter().map(|r| r.total_interventions).sum();
+    AbandonedMissions {
+        missions,
+        delivered_before_abandon,
+        total_interventions,
+        rows,
+    }
+}
+
 /// Nearest-rank percentile over a sorted ascending slice: the value at rank
 /// `ceil(p/100 * n)` (1-indexed, clamped to `n`). None for an empty
 /// population. Deterministic and exact for the small n these folds see.
@@ -484,8 +573,12 @@ pub fn aggregate(
     // Completed missions by intervention arm, for the false-green join.
     let mut completed_with_interventions: Vec<&str> = Vec::new();
     let mut completed_clean: Vec<&str> = Vec::new();
+    let mut abandoned_rows = Vec::new();
 
     for (mission_id, events) in missions {
+        if let Some(row) = abandoned_mission_row(mission_id, events) {
+            abandoned_rows.push(row);
+        }
         let fold = mission_escalation(mission_id, events);
         match fold.terminal {
             Some(TerminalOutcome::Completed) => {
@@ -557,6 +650,7 @@ pub fn aggregate(
     ledger.sort_by_key(|row| std::cmp::Reverse(row.ts));
 
     EscalationMetrics {
+        abandoned: summarize_abandoned(abandoned_rows),
         autonomy: AutonomyMetric {
             closed_missions,
             zero_intervention_missions,
@@ -1381,6 +1475,168 @@ mod tests {
         let fold = mission_escalation("m-1", &unblock_events);
         let counts = mission_interventions("m-1", &unblock_events);
         assert_eq!(counts.total(), fold.interventions);
+    }
+
+    #[test]
+    fn abandoned_missions_fold_escalation_ratio_unchanged() {
+        let m1 = vec![
+            ev(1, "m-1", 0, created()),
+            ev(2, "m-1", 1_000, EventKind::MissionCompleted {}),
+        ];
+        let m2 = vec![
+            ev(1, "m-2", 0, created()),
+            ev(
+                2,
+                "m-2",
+                1_000,
+                EventKind::PlanApproved {
+                    plan: sample_plan(),
+                    base_sha: None,
+                },
+            ),
+            ev(
+                3,
+                "m-2",
+                2_000,
+                EventKind::UserMessage {
+                    text: "steer it".into(),
+                    interrupt: false,
+                },
+            ),
+            ev(
+                4,
+                "m-2",
+                3_000,
+                EventKind::FeatureCompleted {
+                    feature_id: "f-1".into(),
+                    commits: vec!["abc123".into()],
+                },
+            ),
+            ev(
+                5,
+                "m-2",
+                4_000,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "user skipped findings".into(),
+                    validator_guidance: None,
+                },
+            ),
+            ev(
+                6,
+                "m-2",
+                5_000,
+                EventKind::MissionAbandoned {
+                    reason: "operator retired it".into(),
+                },
+            ),
+        ];
+        let missions = vec![("m-1".to_string(), m1), ("m-2".to_string(), m2)];
+        let metrics = aggregate(&missions, &[]);
+
+        let autonomy = &metrics.autonomy;
+        assert_eq!(autonomy.closed_missions, 1);
+        assert_eq!(autonomy.zero_intervention_missions, 1);
+        assert_eq!(autonomy.zero_intervention_share, Some(1.0));
+        assert_eq!(autonomy.completed.missions, 1);
+        assert_eq!(autonomy.failed.missions, 0);
+
+        let abandoned = &metrics.abandoned;
+        assert_eq!(abandoned.missions, 1);
+        assert_eq!(abandoned.delivered_before_abandon, 1);
+        assert_eq!(abandoned.total_interventions, 2);
+        assert_eq!(abandoned.rows.len(), 1);
+        let row = &abandoned.rows[0];
+        assert_eq!(row.mission_id, "m-2");
+        assert_eq!(row.interventions.steers, 1);
+        assert_eq!(row.interventions.operator_unblocks, 1);
+        assert_eq!(row.interventions.grant_decisions, 0);
+        assert_eq!(row.interventions.revision_rulings, 0);
+        assert_eq!(row.total_interventions, 2);
+        assert_eq!(row.features_completed_before_abandon, 1);
+        assert!(row.delivered_before_abandon);
+    }
+
+    #[test]
+    fn abandoned_missions_fold_no_feature_is_not_delivered() {
+        let events = vec![
+            ev(1, "m-1", 0, created()),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::MissionAbandoned {
+                    reason: "operator retired it".into(),
+                },
+            ),
+        ];
+        let row = abandoned_mission_row("m-1", &events).unwrap();
+        assert_eq!(row.features_completed_before_abandon, 0);
+        assert!(!row.delivered_before_abandon);
+
+        let metrics = aggregate(&[("m-1".to_string(), events)], &[]);
+        assert_eq!(metrics.abandoned.missions, 1);
+        assert_eq!(metrics.abandoned.delivered_before_abandon, 0);
+    }
+
+    #[test]
+    fn abandoned_missions_fold_feature_after_abandon_not_counted() {
+        let events = vec![
+            ev(1, "m-1", 0, created()),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::MissionAbandoned {
+                    reason: "operator retired it".into(),
+                },
+            ),
+            ev(
+                3,
+                "m-1",
+                2_000,
+                EventKind::FeatureCompleted {
+                    feature_id: "f-1".into(),
+                    commits: vec!["abc123".into()],
+                },
+            ),
+        ];
+        let row = abandoned_mission_row("m-1", &events).unwrap();
+        assert_eq!(row.features_completed_before_abandon, 0);
+        assert!(!row.delivered_before_abandon);
+    }
+
+    #[test]
+    fn abandoned_missions_fold_completed_and_failed_excluded() {
+        let completed = vec![
+            ev(1, "m-1", 0, created()),
+            ev(2, "m-1", 1_000, EventKind::MissionCompleted {}),
+        ];
+        assert_eq!(abandoned_mission_row("m-1", &completed), None);
+
+        let failed = vec![
+            ev(1, "m-2", 0, created()),
+            ev(
+                2,
+                "m-2",
+                1_000,
+                EventKind::MissionFailed {
+                    reason: "honest failure".into(),
+                },
+            ),
+        ];
+        assert_eq!(abandoned_mission_row("m-2", &failed), None);
+
+        let metrics = aggregate(
+            &[("m-1".to_string(), completed), ("m-2".to_string(), failed)],
+            &[],
+        );
+        assert_eq!(metrics.abandoned, AbandonedMissions::default());
+
+        assert_eq!(summarize_abandoned(vec![]), AbandonedMissions::default());
+        let metrics_empty = aggregate(&[], &[]);
+        assert_eq!(metrics_empty.abandoned, AbandonedMissions::default());
     }
 
     #[test]
