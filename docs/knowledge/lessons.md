@@ -6,9 +6,16 @@ last_verified: 2026-11-23
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
+  - crates/engine/src/lesson_checks.rs
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-11-23 (UTC): lessons gained an optional companion check record
+(`.kranz/lessons/<mission-id>.check`) and a read-only `kranz lessons list
+[--json] [--needs-check]` listing (see
+[Could a check catch it?](#could-a-check-catch-it) below). Lesson bytes,
+`index.md` and planning injection are unchanged.
 
 Rechecked 2026-11-23 (UTC) against the invariants note's contract command
 timeout recheck (a contract `command` assertion's wall-clock limit is now
@@ -108,6 +115,66 @@ absorb it. Per the [scoping decision](../scoping/repo-knowledge-store.md)
 - One file per mission: `.kranz/lessons/<mission>.md`.
 - Injected into planning via the engine's lessons channel, with its own byte
   budget, separate from the shipped ranked knowledge-vault block.
+
+## Could a check catch it?
+
+Each captured lesson may have a companion record,
+`.kranz/lessons/<mission-id>.check`, that says whether a deterministic check
+(an approval-lint rule, a preflight rule, or a gate) could catch the same
+mistake. It is a plain `key: value` text file — deliberately **not**
+`.md`, so it can never be mistaken for a lesson body and the renderer that
+injects lessons into planning never reads it:
+
+```
+# Lesson check record for m-2026-example.
+orchestrator: checkable
+operator: not-checkable
+link: .kranz/tickets/add-lint-rule.md
+```
+
+Recognized keys are `orchestrator`, `operator`, and `link`; `#` starts a
+comment. `orchestrator` and `operator` take one of `checkable`,
+`not-checkable`, or `unclassified`. The **operator's value wins** over the
+orchestrator's when both are set; if neither is set, or the file doesn't
+exist, the lesson reads as `unclassified`. Every lesson captured before this
+record existed therefore reads as `unclassified` — there is no backfill.
+
+The record is a separate file, not a field inside the lesson or the index,
+so that writing or editing it can never change a lesson's bytes or its
+`index.md` line: provenance and the capped planning-injection budget stay
+exactly as before. The renderer that builds the planning-injection block
+(`render_lessons_manifest`) only ever reads `.md` names out of the index and
+never looks at `.check` files.
+
+The orchestrator *proposes* a value at lesson capture: it ends its lesson
+reply with a trailing `CHECK: checkable` or `CHECK: not-checkable` line,
+which the engine strips out of the saved lesson body and instead records as
+the initial `orchestrator:` value of the `.check` file. Operators classify or
+link a check by hand — editing the `.check` file directly and committing it,
+the same as any other repo file — setting `operator:` and/or `link:` (a path
+or ticket/rule reference, e.g. a line in `AGENTS.md` or the invariants note,
+or a ticket under `.kranz/tickets/`). This is decision **D-X**: both sides
+may classify a lesson, and when they disagree the operator's answer wins.
+
+`kranz lessons list [--json] [--needs-check]` lists lessons and their
+effective classification, oldest first, exactly as they appear in
+`index.md`. It is read-only and takes no engine lock. `--json` emits the
+listing as JSON; `--needs-check` narrows it to lessons classified
+`checkable` with no `link:` set — the ones still waiting for someone to
+write the check and link it here.
+
+Lesson checks stay a plain ticket/rule link rather than reusing
+`review_memory.rs`'s replay-suite-and-promotion route. That route promotes
+*rule text fed to a reviewer model* — prompt-shaping, which sits on the
+frozen side of the
+[positioning note](decisions/positioning-governance-evidence-layer.md) — and
+gates promotion on passing a replay suite of required/prohibited findings,
+which fits a model-judged rule, not a deterministic code check. A lesson
+check, by contrast, is ordinary Rust (or other deterministic) code that ships
+through a normal mission gate and PR review, which already supplies the
+human approval a replay suite exists to simulate. No lint rule is generated
+automatically from a `.check` record; writing the check, and linking it back
+here, remains a human task.
 
 ## Durable rules already promoted to standing docs
 

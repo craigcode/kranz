@@ -15,6 +15,13 @@ verified_against:
   - crates/cli/src/ready.rs
 ---
 
+Rechecked 2026-11-23 (UTC) against the lesson check record and listing
+(`crates/engine/src/lesson_checks.rs`, `kranz lessons list`): both are
+read-only evidence/record surfaces. The only new model-facing text is the
+capture-turn `CHECK:` question; no prompt-injection, lint-generation or
+execution primitive is added. The freeze and the retained surfaces are
+unchanged.
+
 Rechecked 2026-11-16 (UTC) against the `ready.rs` change: `kranz ready` lists a missing Windows sandbox host preparation as a host blocker outside the score. It is a readiness report, not an execution primitive. The freeze and the retained surfaces are unchanged.
 
 Rechecked 2026-11-02 (UTC) against the signal intake pipeline (`docs/scoping/signal-intake.md`): verified external signals land in a sealed evidence ledger, deterministic triage proposes nonced-fenced `signal-proposal: unconsented` tickets behind explicit human consent, and `outcomes` reports read-only `signalConsentLatency`. No autonomous execution, code-generation, or prompt-optimization primitive is added.
