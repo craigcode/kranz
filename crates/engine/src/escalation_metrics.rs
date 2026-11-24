@@ -22,6 +22,11 @@
 //!    - `milestone.unblocked` whose reason is an operator decision — i.e.
 //!      every unblock EXCEPT the workspace-gate lift
 //!      ([`crate::workspace_gate::GATE_LIFT_REASON`], which is engine-owned).
+//!
+//!    Companion figure: [`AbandonedMissions`] — abandoned missions with their
+//!    per-class intervention counts and whether they delivered a feature
+//!    before being retired. It sits BESIDE the autonomy ratio above and never
+//!    feeds its denominator or numerator.
 //! 2. **Rubber-stamp signal** — the park→grant latency distribution (p50/p90,
 //!    nearest-rank; and the count under 10s) over decided grant requests.
 //! 3. **False greens** — missions that closed COMPLETED with ≥1 defect ticket
@@ -148,11 +153,39 @@ pub struct LedgerRow {
     pub latency_ms: Option<u64>,
 }
 
+/// One abandoned mission's intervention counts and whether it delivered a
+/// feature before the operator retired it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbandonedMissionRow {
+    pub mission_id: String,
+    pub interventions: InterventionCounts,
+    pub total_interventions: u64,
+    pub features_completed_before_abandon: u64,
+    pub delivered_before_abandon: bool,
+}
+
+/// Abandoned missions, beside the autonomy ratio: operator-retired missions
+/// are kept out of [`AutonomyMetric`]'s denominator entirely, but still worth
+/// surfacing with their intervention counts and delivery status. This figure
+/// never feeds the autonomy ratio's numerator or denominator.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbandonedMissions {
+    pub missions: u64,
+    pub delivered_before_abandon: u64,
+    pub total_interventions: u64,
+    pub rows: Vec<AbandonedMissionRow>,
+}
+
 /// The full flight-surgeon aggregate over one host's missions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EscalationMetrics {
     pub autonomy: AutonomyMetric,
+    /// Abandoned missions, beside the autonomy ratio above (never feeds it).
+    #[serde(default)]
+    pub abandoned: AbandonedMissions,
     pub rubber_stamp: RubberStamp,
     pub false_greens: FalseGreens,
     pub ledger: Vec<LedgerRow>,
@@ -199,6 +232,92 @@ pub(crate) fn is_engine_lift(reason: &str, context: Option<&crate::types::BlockC
         Some(context) => context.is_workspace_gate(),
         None => reason == crate::workspace_gate::GATE_LIFT_REASON,
     }
+}
+
+/// Operator-intervention counts, split by class — the same single
+/// intervention set [`mission_escalation`] sums into `interventions`, broken
+/// out per class for reporting (mission report, `escalation-metrics`,
+/// `outcomes`). One classification rule, shared via [`mission_interventions`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterventionCounts {
+    /// `grant.approved` / `grant.denied` — any grant decision.
+    pub grant_decisions: u64,
+    /// `user.message` at/after `plan.approved` — control-command steers.
+    pub steers: u64,
+    /// `plan.revised` / `plan.revision.rejected` — a plan revision ruling.
+    pub revision_rulings: u64,
+    /// `milestone.unblocked` whose reason is an operator decision, not the
+    /// engine-owned workspace-gate lift.
+    pub operator_unblocks: u64,
+}
+
+impl InterventionCounts {
+    pub fn total(&self) -> u64 {
+        self.grant_decisions + self.steers + self.revision_rulings + self.operator_unblocks
+    }
+}
+
+/// Classify `mission_id`'s operator interventions by class — the single
+/// source of truth [`mission_escalation`] folds its `interventions` total
+/// from. `events` may contain other missions' events too (filtered out).
+pub fn mission_interventions(mission_id: &str, events: &[Event]) -> InterventionCounts {
+    let mission_events: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.mission_id == mission_id)
+        .collect();
+
+    let plan_approved_seq = mission_events
+        .iter()
+        .find(|e| matches!(e.kind, EventKind::PlanApproved { .. }))
+        .map(|e| e.seq);
+
+    let mut counts = InterventionCounts::default();
+    for e in &mission_events {
+        match &e.kind {
+            EventKind::UserMessage { .. } => {
+                if let Some(approved_seq) = plan_approved_seq {
+                    if e.seq >= approved_seq {
+                        counts.steers += 1;
+                    }
+                }
+            }
+            EventKind::GrantApproved { .. } | EventKind::GrantDenied { .. } => {
+                counts.grant_decisions += 1;
+            }
+            EventKind::PlanRevised { .. } | EventKind::PlanRevisionRejected { .. } => {
+                counts.revision_rulings += 1;
+            }
+            EventKind::MilestoneUnblocked {
+                reason,
+                block_context,
+                ..
+            } if !is_engine_lift(reason, block_context.as_ref()) => {
+                counts.operator_unblocks += 1;
+            }
+            _ => {}
+        }
+    }
+    counts
+}
+
+/// Render an [`InterventionCounts`] as the one human-readable summary shared
+/// by the mission report and the CLI (`escalation-metrics` / `outcomes`).
+pub fn format_intervention_classes(counts: &InterventionCounts) -> String {
+    fn plural(n: u64, noun: &str) -> String {
+        if n == 1 {
+            format!("{n} {noun}")
+        } else {
+            format!("{n} {noun}s")
+        }
+    }
+    format!(
+        "{}, {}, {}, {}",
+        plural(counts.steers, "steer"),
+        plural(counts.grant_decisions, "grant decision"),
+        plural(counts.revision_rulings, "revision ruling"),
+        plural(counts.operator_unblocks, "operator unblock"),
+    )
 }
 
 /// Pair each `grant.requested` (in seq order) with the `grant.approved` /
@@ -283,46 +402,31 @@ pub fn mission_escalation(mission_id: &str, events: &[Event]) -> MissionEscalati
         .find(|e| matches!(e.kind, EventKind::PlanApproved { .. }))
         .map(|e| e.seq);
 
-    let mut interventions: u64 = 0;
+    let counts = mission_interventions(mission_id, events);
+    let interventions = counts.total();
     let mut ledger = Vec::new();
 
-    // Steers and decision interventions (the autonomy numerator set).
+    // Steer ledger rows (the classification itself lives in
+    // [`mission_interventions`]; this just needs the matching text/ts).
     for e in &mission_events {
-        match &e.kind {
-            EventKind::UserMessage { text, .. } => {
-                // Classify by SEQUENCE, not wall clock (5th-pass review):
-                // the event log's seq is the order of truth — timestamps
-                // can tie or move backward across a clock step, and either
-                // would silently misclassify a steer as drafting.
-                if let Some(approved_seq) = plan_approved_seq {
-                    if e.seq >= approved_seq {
-                        interventions += 1;
-                        ledger.push(LedgerRow {
-                            ts: e.ts,
-                            mission_id: mission_id.to_string(),
-                            kind: LedgerKind::Steer,
-                            milestone_id: None,
-                            ask: text.clone(),
-                            decision: "steered".to_string(),
-                            latency_ms: None,
-                        });
-                    }
+        if let EventKind::UserMessage { text, .. } = &e.kind {
+            // Classify by SEQUENCE, not wall clock (5th-pass review):
+            // the event log's seq is the order of truth — timestamps
+            // can tie or move backward across a clock step, and either
+            // would silently misclassify a steer as drafting.
+            if let Some(approved_seq) = plan_approved_seq {
+                if e.seq >= approved_seq {
+                    ledger.push(LedgerRow {
+                        ts: e.ts,
+                        mission_id: mission_id.to_string(),
+                        kind: LedgerKind::Steer,
+                        milestone_id: None,
+                        ask: text.clone(),
+                        decision: "steered".to_string(),
+                        latency_ms: None,
+                    });
                 }
             }
-            EventKind::GrantApproved { .. }
-            | EventKind::GrantDenied { .. }
-            | EventKind::PlanRevised { .. }
-            | EventKind::PlanRevisionRejected { .. } => {
-                interventions += 1;
-            }
-            EventKind::MilestoneUnblocked {
-                reason,
-                block_context,
-                ..
-            } if !is_engine_lift(reason, block_context.as_ref()) => {
-                interventions += 1;
-            }
-            _ => {}
         }
     }
 
@@ -382,6 +486,62 @@ pub fn mission_escalation(mission_id: &str, events: &[Event]) -> MissionEscalati
     }
 }
 
+/// Fold one abandoned mission's row: `None` unless its terminal outcome (the
+/// same first-terminal rule as [`mission_escalation`]) is Abandoned.
+/// `features_completed_before_abandon` counts `feature.completed` events
+/// strictly before the FIRST `mission.abandoned` event's seq.
+pub fn abandoned_mission_row(mission_id: &str, events: &[Event]) -> Option<AbandonedMissionRow> {
+    let mission_events: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.mission_id == mission_id)
+        .collect();
+
+    let abandoned_seq = mission_events.iter().find_map(|e| match &e.kind {
+        EventKind::MissionAbandoned { .. } => Some(e.seq),
+        _ => None,
+    })?;
+
+    let terminal = mission_events.iter().find_map(|e| match &e.kind {
+        EventKind::MissionCompleted {} => Some(TerminalOutcome::Completed),
+        EventKind::MissionFailed { .. } => Some(TerminalOutcome::Failed),
+        EventKind::MissionAbandoned { .. } => Some(TerminalOutcome::Abandoned),
+        _ => None,
+    })?;
+    if terminal != TerminalOutcome::Abandoned {
+        return None;
+    }
+
+    let features_completed_before_abandon = mission_events
+        .iter()
+        .filter(|e| e.seq < abandoned_seq && matches!(e.kind, EventKind::FeatureCompleted { .. }))
+        .count() as u64;
+
+    let interventions = mission_interventions(mission_id, events);
+    Some(AbandonedMissionRow {
+        mission_id: mission_id.to_string(),
+        interventions,
+        total_interventions: interventions.total(),
+        features_completed_before_abandon,
+        delivered_before_abandon: features_completed_before_abandon > 0,
+    })
+}
+
+/// Sort and sum abandoned-mission rows into the [`AbandonedMissions`]
+/// aggregate.
+pub fn summarize_abandoned(mut rows: Vec<AbandonedMissionRow>) -> AbandonedMissions {
+    rows.sort_by(|a, b| a.mission_id.cmp(&b.mission_id));
+    let missions = rows.len() as u64;
+    let delivered_before_abandon =
+        rows.iter().filter(|r| r.delivered_before_abandon).count() as u64;
+    let total_interventions = rows.iter().map(|r| r.total_interventions).sum();
+    AbandonedMissions {
+        missions,
+        delivered_before_abandon,
+        total_interventions,
+        rows,
+    }
+}
+
 /// Nearest-rank percentile over a sorted ascending slice: the value at rank
 /// `ceil(p/100 * n)` (1-indexed, clamped to `n`). None for an empty
 /// population. Deterministic and exact for the small n these folds see.
@@ -413,8 +573,12 @@ pub fn aggregate(
     // Completed missions by intervention arm, for the false-green join.
     let mut completed_with_interventions: Vec<&str> = Vec::new();
     let mut completed_clean: Vec<&str> = Vec::new();
+    let mut abandoned_rows = Vec::new();
 
     for (mission_id, events) in missions {
+        if let Some(row) = abandoned_mission_row(mission_id, events) {
+            abandoned_rows.push(row);
+        }
         let fold = mission_escalation(mission_id, events);
         match fold.terminal {
             Some(TerminalOutcome::Completed) => {
@@ -486,6 +650,7 @@ pub fn aggregate(
     ledger.sort_by_key(|row| std::cmp::Reverse(row.ts));
 
     EscalationMetrics {
+        abandoned: summarize_abandoned(abandoned_rows),
         autonomy: AutonomyMetric {
             closed_missions,
             zero_intervention_missions,
@@ -1111,5 +1276,392 @@ mod tests {
         assert_eq!(metrics.rubber_stamp.under_ten_seconds, 1);
         assert_eq!(metrics.ledger.len(), 1);
         assert_eq!(metrics.ledger[0].decision, "approved");
+    }
+
+    #[test]
+    fn intervention_classes_counts_each_class_separately() {
+        let events = vec![
+            ev(1, "m-1", 0, created()),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::PlanApproved {
+                    plan: sample_plan(),
+                    base_sha: None,
+                },
+            ),
+            ev(
+                3,
+                "m-1",
+                2_000,
+                EventKind::UserMessage {
+                    text: "steer one".into(),
+                    interrupt: false,
+                },
+            ),
+            ev(
+                4,
+                "m-1",
+                3_000,
+                EventKind::UserMessage {
+                    text: "steer two".into(),
+                    interrupt: false,
+                },
+            ),
+            ev(
+                5,
+                "m-1",
+                4_000,
+                EventKind::GrantApproved {
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+            ),
+            ev(
+                6,
+                "m-1",
+                5_000,
+                EventKind::GrantDenied {
+                    kind: GrantKind::Command,
+                    command: "cargo build".into(),
+                    reason: "not needed".into(),
+                },
+            ),
+            ev(
+                7,
+                "m-1",
+                6_000,
+                EventKind::PlanRevised {
+                    revision: 1,
+                    plan: sample_plan(),
+                },
+            ),
+            ev(
+                8,
+                "m-1",
+                7_000,
+                EventKind::PlanRevisionRejected {
+                    revision: 2,
+                    reason: "too risky".into(),
+                },
+            ),
+            ev(
+                9,
+                "m-1",
+                8_000,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "user skipped findings".into(),
+                    validator_guidance: None,
+                },
+            ),
+        ];
+        let counts = mission_interventions("m-1", &events);
+        assert_eq!(counts.steers, 2);
+        assert_eq!(counts.grant_decisions, 2);
+        assert_eq!(counts.revision_rulings, 2);
+        assert_eq!(counts.operator_unblocks, 1);
+        assert_eq!(counts.total(), 7);
+    }
+
+    #[test]
+    fn intervention_classes_exclude_engine_lift_and_drafting() {
+        let events = vec![
+            ev(
+                1,
+                "m-1",
+                0,
+                EventKind::UserMessage {
+                    text: "pre-approval drafting".into(),
+                    interrupt: false,
+                },
+            ),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: crate::workspace_gate::GATE_LIFT_REASON.to_string(),
+                    validator_guidance: None,
+                },
+            ),
+        ];
+        let counts = mission_interventions("m-1", &events);
+        assert_eq!(counts, InterventionCounts::default());
+        assert_eq!(counts.total(), 0);
+    }
+
+    #[test]
+    fn intervention_classes_total_matches_mission_escalation() {
+        for (mission_id, events) in anti_vacuity_missions() {
+            let fold = mission_escalation(&mission_id, &events);
+            let counts = mission_interventions(&mission_id, &events);
+            assert_eq!(counts.total(), fold.interventions, "mission {mission_id}");
+        }
+
+        let revision_events = vec![
+            ev(
+                1,
+                "m-1",
+                0,
+                EventKind::PlanRevised {
+                    revision: 1,
+                    plan: sample_plan(),
+                },
+            ),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::PlanRevisionRejected {
+                    revision: 2,
+                    reason: "too risky".into(),
+                },
+            ),
+            ev(3, "m-1", 2_000, EventKind::MissionCompleted {}),
+        ];
+        let fold = mission_escalation("m-1", &revision_events);
+        let counts = mission_interventions("m-1", &revision_events);
+        assert_eq!(counts.total(), fold.interventions);
+
+        let unblock_events = vec![
+            ev(
+                1,
+                "m-1",
+                0,
+                EventKind::MilestoneBlocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "workspace gate: bootstrap failed".into(),
+                },
+            ),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: crate::workspace_gate::GATE_LIFT_REASON.to_string(),
+                    validator_guidance: None,
+                },
+            ),
+            ev(
+                3,
+                "m-1",
+                2_000,
+                EventKind::MilestoneBlocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "fix-cycle cap".into(),
+                },
+            ),
+            ev(
+                4,
+                "m-1",
+                3_000,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "user skipped findings".into(),
+                    validator_guidance: None,
+                },
+            ),
+        ];
+        let fold = mission_escalation("m-1", &unblock_events);
+        let counts = mission_interventions("m-1", &unblock_events);
+        assert_eq!(counts.total(), fold.interventions);
+    }
+
+    #[test]
+    fn abandoned_missions_fold_escalation_ratio_unchanged() {
+        let m1 = vec![
+            ev(1, "m-1", 0, created()),
+            ev(2, "m-1", 1_000, EventKind::MissionCompleted {}),
+        ];
+        let m2 = vec![
+            ev(1, "m-2", 0, created()),
+            ev(
+                2,
+                "m-2",
+                1_000,
+                EventKind::PlanApproved {
+                    plan: sample_plan(),
+                    base_sha: None,
+                },
+            ),
+            ev(
+                3,
+                "m-2",
+                2_000,
+                EventKind::UserMessage {
+                    text: "steer it".into(),
+                    interrupt: false,
+                },
+            ),
+            ev(
+                4,
+                "m-2",
+                3_000,
+                EventKind::FeatureCompleted {
+                    feature_id: "f-1".into(),
+                    commits: vec!["abc123".into()],
+                },
+            ),
+            ev(
+                5,
+                "m-2",
+                4_000,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "user skipped findings".into(),
+                    validator_guidance: None,
+                },
+            ),
+            ev(
+                6,
+                "m-2",
+                5_000,
+                EventKind::MissionAbandoned {
+                    reason: "operator retired it".into(),
+                },
+            ),
+        ];
+        let missions = vec![("m-1".to_string(), m1), ("m-2".to_string(), m2)];
+        let metrics = aggregate(&missions, &[]);
+
+        let autonomy = &metrics.autonomy;
+        assert_eq!(autonomy.closed_missions, 1);
+        assert_eq!(autonomy.zero_intervention_missions, 1);
+        assert_eq!(autonomy.zero_intervention_share, Some(1.0));
+        assert_eq!(autonomy.completed.missions, 1);
+        assert_eq!(autonomy.failed.missions, 0);
+
+        let abandoned = &metrics.abandoned;
+        assert_eq!(abandoned.missions, 1);
+        assert_eq!(abandoned.delivered_before_abandon, 1);
+        assert_eq!(abandoned.total_interventions, 2);
+        assert_eq!(abandoned.rows.len(), 1);
+        let row = &abandoned.rows[0];
+        assert_eq!(row.mission_id, "m-2");
+        assert_eq!(row.interventions.steers, 1);
+        assert_eq!(row.interventions.operator_unblocks, 1);
+        assert_eq!(row.interventions.grant_decisions, 0);
+        assert_eq!(row.interventions.revision_rulings, 0);
+        assert_eq!(row.total_interventions, 2);
+        assert_eq!(row.features_completed_before_abandon, 1);
+        assert!(row.delivered_before_abandon);
+    }
+
+    #[test]
+    fn abandoned_missions_fold_no_feature_is_not_delivered() {
+        let events = vec![
+            ev(1, "m-1", 0, created()),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::MissionAbandoned {
+                    reason: "operator retired it".into(),
+                },
+            ),
+        ];
+        let row = abandoned_mission_row("m-1", &events).unwrap();
+        assert_eq!(row.features_completed_before_abandon, 0);
+        assert!(!row.delivered_before_abandon);
+
+        let metrics = aggregate(&[("m-1".to_string(), events)], &[]);
+        assert_eq!(metrics.abandoned.missions, 1);
+        assert_eq!(metrics.abandoned.delivered_before_abandon, 0);
+    }
+
+    #[test]
+    fn abandoned_missions_fold_feature_after_abandon_not_counted() {
+        let events = vec![
+            ev(1, "m-1", 0, created()),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::MissionAbandoned {
+                    reason: "operator retired it".into(),
+                },
+            ),
+            ev(
+                3,
+                "m-1",
+                2_000,
+                EventKind::FeatureCompleted {
+                    feature_id: "f-1".into(),
+                    commits: vec!["abc123".into()],
+                },
+            ),
+        ];
+        let row = abandoned_mission_row("m-1", &events).unwrap();
+        assert_eq!(row.features_completed_before_abandon, 0);
+        assert!(!row.delivered_before_abandon);
+    }
+
+    #[test]
+    fn abandoned_missions_fold_completed_and_failed_excluded() {
+        let completed = vec![
+            ev(1, "m-1", 0, created()),
+            ev(2, "m-1", 1_000, EventKind::MissionCompleted {}),
+        ];
+        assert_eq!(abandoned_mission_row("m-1", &completed), None);
+
+        let failed = vec![
+            ev(1, "m-2", 0, created()),
+            ev(
+                2,
+                "m-2",
+                1_000,
+                EventKind::MissionFailed {
+                    reason: "honest failure".into(),
+                },
+            ),
+        ];
+        assert_eq!(abandoned_mission_row("m-2", &failed), None);
+
+        let metrics = aggregate(
+            &[("m-1".to_string(), completed), ("m-2".to_string(), failed)],
+            &[],
+        );
+        assert_eq!(metrics.abandoned, AbandonedMissions::default());
+
+        assert_eq!(summarize_abandoned(vec![]), AbandonedMissions::default());
+        let metrics_empty = aggregate(&[], &[]);
+        assert_eq!(metrics_empty.abandoned, AbandonedMissions::default());
+    }
+
+    #[test]
+    fn intervention_classes_format_pluralises() {
+        assert_eq!(
+            format_intervention_classes(&InterventionCounts {
+                steers: 2,
+                grant_decisions: 1,
+                revision_rulings: 0,
+                operator_unblocks: 0,
+            }),
+            "2 steers, 1 grant decision, 0 revision rulings, 0 operator unblocks"
+        );
+        assert_eq!(
+            format_intervention_classes(&InterventionCounts::default()),
+            "0 steers, 0 grant decisions, 0 revision rulings, 0 operator unblocks"
+        );
+        assert_eq!(
+            format_intervention_classes(&InterventionCounts {
+                steers: 1,
+                grant_decisions: 0,
+                revision_rulings: 0,
+                operator_unblocks: 1,
+            }),
+            "1 steer, 0 grant decisions, 0 revision rulings, 1 operator unblock"
+        );
     }
 }

@@ -273,7 +273,7 @@ impl MissionEngine {
             Some(text),
         )?;
 
-        let cycle = self.state.mission.milestones[mi].fix_cycles + 1;
+        let cycle = next_fix_cycle(&self.state.mission.milestones[mi]);
         for (i, spec) in specs.into_iter().enumerate() {
             // Belt and braces: both sources (the orchestrator turn text and
             // validator findings) are already scrubbed, but these strings are
@@ -301,6 +301,25 @@ impl MissionEngine {
         }
         Ok(())
     }
+}
+
+/// Next-free fix-id cycle for a milestone: `max(fix_cycles + 1, 1 + the
+/// highest existing `{milestone_id}-fix-<c>-*` cycle on this milestone)`.
+/// Mirrors the re-plan cycle computation (orchestrator.rs, re-plan ids) so a
+/// repair or a tier escalation — which leave `fix_cycles` unchanged or reset
+/// — still mint an id past whatever fix features already exist, instead of
+/// colliding with one the reducer would then reject as a duplicate.
+fn next_fix_cycle(milestone: &Milestone) -> u32 {
+    let prefix = format!("{}-fix-", milestone.id);
+    let highest_existing = milestone
+        .features
+        .iter()
+        .filter_map(|f| f.id.strip_prefix(&prefix))
+        .filter_map(|rest| rest.split('-').next())
+        .filter_map(|c| c.parse::<u32>().ok())
+        .max()
+        .map_or(0, |m| m + 1);
+    (milestone.fix_cycles + 1).max(highest_existing)
 }
 
 // ---------------------------------------------------------------------------
@@ -497,5 +516,173 @@ mod tests {
             FindingsConversion::Fix { .. } => panic!("a full waiver should still waive"),
             FindingsConversion::Escalate { .. } => panic!("no command-assertion finding here"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // f-1-1: next-free-cycle rule for fix feature ids
+    // -----------------------------------------------------------------------
+
+    fn fix_feature(id: &str, status: FeatureStatus) -> Feature {
+        Feature {
+            id: id.to_string(),
+            title: "t".to_string(),
+            spec: "s".to_string(),
+            validation_criteria: Vec::new(),
+            origin: FeatureOrigin::Fix,
+            status,
+            worker_runs: Vec::new(),
+            commits: Vec::new(),
+            respawns: 0,
+        }
+    }
+
+    fn milestone(id: &str, fix_cycles: u32, features: Vec<Feature>) -> Milestone {
+        Milestone {
+            id: id.to_string(),
+            title: "m".to_string(),
+            features,
+            status: MilestoneStatus::Active,
+            fix_cycles,
+            start_sha: None,
+            validator_guidance: None,
+        }
+    }
+
+    #[test]
+    fn fix_id_unique_rule_never_reuses_existing_id() {
+        // No existing fixes, fix_cycles 0 → first cycle, same as the old formula.
+        let ms = milestone("ms-1", 0, vec![]);
+        assert_eq!(next_fix_cycle(&ms), 1);
+
+        // Existing fix-1-* and fix_cycles 1 → next cycle, same as the old formula.
+        let ms = milestone(
+            "ms-1",
+            1,
+            vec![fix_feature("ms-1-fix-1-1", FeatureStatus::Complete)],
+        );
+        assert_eq!(next_fix_cycle(&ms), 2);
+
+        // Repair case: an operator-directed repair added `ms-1-fix-1-1` but
+        // fix_cycles is still 0 (the repair spends no fix cycle). The next
+        // fix must not reuse cycle 1.
+        let ms = milestone(
+            "ms-1",
+            0,
+            vec![fix_feature("ms-1-fix-1-1", FeatureStatus::Pending)],
+        );
+        let cycle = next_fix_cycle(&ms);
+        assert_eq!(cycle, 2);
+        assert!(
+            ms.features
+                .iter()
+                .all(|f| f.id != format!("{}-fix-{cycle}-1", ms.id)),
+            "new id must not collide with an existing feature id"
+        );
+
+        // Post-escalation case: fix-1-* and fix-2-* exist but fix_cycles was
+        // reset to 0 by the tier escalation.
+        let ms = milestone(
+            "ms-1",
+            0,
+            vec![
+                fix_feature("ms-1-fix-1-1", FeatureStatus::Complete),
+                fix_feature("ms-1-fix-2-1", FeatureStatus::Complete),
+            ],
+        );
+        let cycle = next_fix_cycle(&ms);
+        assert_eq!(cycle, 3);
+        assert!(
+            ms.features
+                .iter()
+                .all(|f| f.id != format!("{}-fix-{cycle}-1", ms.id)),
+            "new id must not collide with an existing feature id"
+        );
+
+        // A different milestone id that shares a prefix (ms-10 vs ms-1) must
+        // not influence ms-1's cycle — strip_prefix("ms-1-fix-") on an
+        // ms-10-fix-* id does not match, so this is really just confirming
+        // the filter is milestone-scoped.
+        let ms10_features = vec![fix_feature("ms-10-fix-5-1", FeatureStatus::Complete)];
+        let ms1 = milestone("ms-1", 0, ms10_features.clone());
+        assert_eq!(
+            next_fix_cycle(&ms1),
+            1,
+            "ms-10's fix ids must not affect ms-1's cycle"
+        );
+        let ms10 = milestone("ms-10", 0, ms10_features);
+        let cycle10 = next_fix_cycle(&ms10);
+        assert_eq!(cycle10, 6);
+        assert!(ms10
+            .features
+            .iter()
+            .all(|f| f.id != format!("{}-fix-{cycle10}-1", ms10.id)));
+    }
+
+    #[test]
+    fn fix_id_unique_legacy_log_replays_unchanged() {
+        use crate::events::Event;
+
+        let plan: Plan = serde_json::from_value(serde_json::json!({
+            "goal": "legacy replay",
+            "validationContract": [],
+            "milestones": [{
+                "title": "one",
+                "features": [{"title": "f", "spec": "s", "validationCriteria": []}]
+            }]
+        }))
+        .unwrap();
+
+        let event = |seq: u64, kind: EventKind| Event {
+            seq,
+            ts: chrono::Utc::now(),
+            mission_id: "m-legacy".to_string(),
+            kind,
+        };
+
+        let logged_fix_feature = fix_feature("ms-1-fix-1-1", FeatureStatus::Pending);
+        let events = vec![
+            event(
+                1,
+                EventKind::MissionCreated {
+                    goal: plan.goal.clone(),
+                    base_branch: "main".to_string(),
+                    mission_branch: "kranz/mission-m-legacy".to_string(),
+                    config: MissionConfig::default(),
+                },
+            ),
+            event(
+                2,
+                EventKind::PlanApproved {
+                    plan,
+                    base_sha: Some("base".to_string()),
+                },
+            ),
+            event(
+                3,
+                EventKind::MilestoneValidating {
+                    milestone_id: "ms-1".to_string(),
+                },
+            ),
+            event(
+                4,
+                EventKind::FixFeatureCreated {
+                    milestone_id: "ms-1".to_string(),
+                    feature: logged_fix_feature.clone(),
+                },
+            ),
+        ];
+
+        let state = crate::reducer::fold(&events).unwrap();
+        let ms = &state.mission.milestones[0];
+        let ids: Vec<&str> = ms.features.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["f-1-1", "ms-1-fix-1-1"]);
+        assert_eq!(ms.fix_cycles, 1);
+
+        // The next validator-driven fix (milestone back in Validating) must
+        // land on cycle 2, not reuse cycle 1.
+        let mut back_in_validating = ms.clone();
+        back_in_validating.status = MilestoneStatus::Validating;
+        let cycle = next_fix_cycle(&back_in_validating);
+        assert_eq!(format!("{}-fix-{cycle}-1", ms.id), "ms-1-fix-2-1");
     }
 }

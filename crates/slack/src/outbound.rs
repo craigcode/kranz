@@ -373,7 +373,9 @@ mod tests {
                 statement: "429 beyond N/min".into(),
                 check: AssertionCheck::Command,
                 command: Some("pytest".into()),
+                milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {
@@ -413,7 +415,9 @@ mod tests {
                 statement: "429 beyond N/min".into(),
                 check: AssertionCheck::Command,
                 command: Some("pytest".into()),
+                milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {

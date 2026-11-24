@@ -2,8 +2,12 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-18
+last_verified: 2026-11-24
 verified_against:
+  - crates/engine/src/contract_timeout.rs
+  - crates/engine/src/contract_lint.rs
+  - crates/engine/src/contract_scope.rs
+  - crates/engine/src/events.rs
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
@@ -22,6 +26,25 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-24 (UTC) against a test-only change in `contract_lint.rs`: the lint timeout summary test gives its second run its own scratch directory, so the copied Windows sleep fixture is not overwritten while still open. No term changed.
+
+Rechecked 2026-11-23 (UTC) against the configurable contract-command timeout
+(`contract_timeout.rs`, `contract_lint.rs`, `types.rs`, `orchestrator.rs`,
+`config.rs`, `planning.rs`, `contract_scope.rs`): added
+`contractCommandTimeoutSecs` to the "Operator-only config keys" entry below;
+it joins the `CONFIG_TRUST_RULES`-enforced keys refused from the project
+layer and from runtime config-change patches. No other term changed.
+
+Rechecked 2026-11-23 (UTC) against the fix-id change: `findings.rs` picks a fix feature's id cycle as the next free one on the milestone (`next_fix_cycle`), so a repair or a tier escalation no longer reuses an id; `orchestrator.rs` gained comments and tests only. No term changed.
+
+Rechecked 2026-11-22 (UTC) against `contract_scope.rs`: the `#[allow(dead_code)]` lines on `due_index` and `is_due` are removed, since the validation round calls both. No term changed.
+
+Rechecked 2026-11-21 (UTC) against the worker `git stash` deny: `docs/design.md` lists `Bash(git stash*)` in the worker deny set and says how each backend matches a deny rule on a compound command line; `backend_acp.rs` and `backend_acp/terminals.rs` gained tests only. No term changed.
+
+Rechecked 2026-11-19 (UTC) against `contract_scope.rs`, `orchestrator.rs`,
+`planning.rs` and `types.rs`: added the "Not-yet-due assertion" entry below.
+No existing term changed.
 
 Rechecked 2026-11-18 (UTC) against `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`. No term changed.
 
@@ -112,6 +135,13 @@ Project vocabulary. Terms link to the note that explains them in depth.
   is a `Command` (a build/test/lint invocation), `AgentJudgement`
   (a validator/orchestrator verdict), or `PtyScript` (an interactive terminal check). See
   [gates](validation/gates.md).
+- **Not-yet-due assertion** — a `command`/`pty_script` assertion whose
+  `milestone` names a plan milestone later than the one currently
+  validating. It still runs every round, but its result and any finding
+  citing it are recorded record-only (`validation.assertion.notdue` /
+  `validation.finding.notdue`) instead of blocking. The final gate runs it
+  regardless of due-ness. See
+  [milestone-scoped assertions](validation/gates.md#milestone-scoped-assertions).
 - **Baseline/candidate pair** — opt-in advisory observations at two actual
   revisions, with approved expectations, separately identified checker overlay
   and source/environment configuration bindings. A recorded pair is not a
@@ -165,7 +195,9 @@ Project vocabulary. Terms link to the note that explains them in depth.
   engine runs, an endpoint it talks to outside the sandbox, a credential, or a
   containment escape: `claudeBinary`, `packDir`, `contractEnvPassthrough`,
   `slack`, `hookStatus`, `<role>.baseUrl`, `<role>.acpProfile`, the `<role>.sandbox.*` widening
-  keys, and the `dangerouslyAllowAll` family. They are settable from the global
+  keys, the `dangerouslyAllowAll` family, and `contractCommandTimeoutSecs`
+  (the wall-clock limit an engine-run contract `command` assertion gets when
+  it carries no `timeoutSecs` of its own). They are settable from the global
   layer only. A repository may RAISE `sandbox.enforce`, never lower it, and
   may set `orchestrator.backend` only to `claude`, since orchestrator sessions
   run at the primary checkout without a sandbox.

@@ -2,8 +2,11 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-18
+last_verified: 2026-11-24
 verified_against:
+  - crates/engine/src/contract_timeout.rs
+  - crates/engine/src/contract_lint.rs
+  - crates/engine/src/contract_scope.rs
   - crates/acp/src/lib.rs
   - crates/acp/src/terminal.rs
   - crates/engine/src/acp_terminal.rs
@@ -36,6 +39,29 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-24 (UTC) against a test-only change in `contract_lint.rs`: the lint timeout summary test gives its second run its own scratch directory, so the copied Windows sleep fixture is not overwritten while still open. No invariant changed.
+
+Rechecked 2026-11-23 (UTC) against the configurable contract-command timeout
+(`contract_timeout.rs`, `contract_lint.rs`, `reducer.rs`, `planning.rs`,
+`orchestrator.rs`, `orchestrator/finalization.rs`, `types.rs`): a contract
+`command` assertion's wall-clock limit is now resolved from its own
+`timeoutSecs`, else the operator-only `contractCommandTimeoutSecs` config,
+else 600 seconds, capped at 14400; a timeout still produces a critical
+`command-assertion` finding, never a pass. `MissionConfig` gains one
+additive `#[serde(default)]` key. No invariant changed.
+
+Rechecked 2026-11-23 (UTC) against the fix-id change: `findings.rs` picks a fix feature's id cycle as the next free one on the milestone (`next_fix_cycle`), so a repair or a tier escalation no longer reuses an id; `orchestrator.rs` gained comments and tests only. No invariant changed.
+
+Rechecked 2026-11-22 (UTC) against `contract_scope.rs`: the `#[allow(dead_code)]` lines on `due_index` and `is_due` are removed, since the validation round calls both. No invariant changed.
+
+Rechecked 2026-11-21 (UTC) against the worker `git stash` deny: `docs/design.md` lists `Bash(git stash*)` in the worker deny set and says how each backend matches a deny rule on a compound command line; `backend_acp.rs` and `backend_acp/terminals.rs` gained tests only. No invariant changed.
+
+Rechecked 2026-11-19 (UTC) against `contract_scope.rs`, `orchestrator.rs` and
+`types.rs`: `Assertion` gains one optional, additive `milestone` field, and
+not-yet-due command/pty results and findings are recorded via two new
+record-only event kinds instead of reaching `contract_results` or
+`convert_findings`. No invariant changed.
 
 Rechecked 2026-11-18 (UTC) against two small changes: `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`, and a test in `sandbox.rs` measures the canonical temp path for its unix-socket length guard. No invariant changed.
 

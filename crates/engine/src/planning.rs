@@ -506,6 +506,13 @@ pub(crate) fn validate_revised_plan_for_gate(mission: &Mission, plan: &Plan) -> 
         )));
     }
     crate::contract_controls::validate(&plan.validation_contract)?;
+    crate::contract_timeout::validate(&plan.validation_contract)?;
+    let milestone_titles: Vec<&str> = plan.milestones.iter().map(|m| m.title.as_str()).collect();
+    crate::contract_scope::validate_milestone_refs(
+        &plan.validation_contract,
+        &milestone_titles,
+        "revised plan",
+    )?;
     validate_contract_extends(&mission.validation_contract, &plan.validation_contract)?;
     validate_vec_extends(
         "commandGrants",
@@ -557,6 +564,8 @@ fn validate_contract_extends(existing: &[Assertion], revised: &[Assertion]) -> R
             || old.check != new.check
             || old.command != new.command
             || old.negative_control != new.negative_control
+            || old.milestone != new.milestone
+            || old.timeout_secs != new.timeout_secs
         {
             return Err(EngineError::InvalidState(format!(
                 "revised plan changes validation assertion '{}'",
@@ -674,7 +683,9 @@ fn plan_schema() -> serde_json::Value {
                 "statement": { "type": "string" },
                 "check": { "type": "string", "enum": ["command", "agent-judgement", "pty-script"] },
                 "command": { "type": "string" },
+                "milestone": { "type": "string", "description": "Optional. The exact title of the plan milestone that must deliver this assertion. Validation rounds for earlier milestones still run it and record the result, but do not treat a failure as a finding. Omit it for checks that must hold at every milestone (format, lint, the full test suite). The final gate always checks every assertion." },
                 "negativeControl": negative_control,
+                "timeoutSecs": { "type": "integer", "minimum": 1, "maximum": 14400, "description": "Wall-clock limit in seconds for this assertion's command, applies only when check=command. Wins over the operator-only contractCommandTimeoutSecs config, which wins over the engine default." },
                 "ptyScript": {
                     "type": "object",
                     "additionalProperties": false,
@@ -841,8 +852,10 @@ mod tests {
             statement: "s".to_string(),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            milestone: None,
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }
     }
 
@@ -857,6 +870,30 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn assertion_due_schema_plan_schema_describes_milestone() {
+        let schema = plan_schema();
+        let item = &schema["properties"]["validationContract"]["items"];
+        let milestone = &item["properties"]["milestone"];
+        assert_eq!(milestone["type"], serde_json::json!("string"));
+        let description = milestone["description"].as_str().unwrap_or_default();
+        assert!(!description.is_empty());
+    }
+
+    #[test]
+    fn contract_timeout_schema_plan_schema_bounds_timeout_secs() {
+        let schema = plan_schema();
+        let item = &schema["properties"]["validationContract"]["items"];
+        let timeout_secs = &item["properties"]["timeoutSecs"];
+        assert_eq!(timeout_secs["type"], serde_json::json!("integer"));
+        assert_eq!(timeout_secs["minimum"], serde_json::json!(1));
+        assert_eq!(timeout_secs["maximum"], serde_json::json!(14400));
+        assert!(!item["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("timeoutSecs")));
     }
 
     #[test]
@@ -894,6 +931,20 @@ mod tests {
             .unwrap()
             .get("negativeControl")
             .is_none());
+    }
+
+    #[test]
+    fn contract_timeout_schema_revision_freezes_timeout_secs() {
+        let mut old = assertion("a-1");
+        old.check = AssertionCheck::Command;
+        old.command = Some("cargo test".to_string());
+        old.timeout_secs = Some(1800);
+        let mut new = old.clone();
+        new.timeout_secs = Some(3600);
+        assert!(
+            validate_contract_extends(std::slice::from_ref(&old), std::slice::from_ref(&new))
+                .is_err()
+        );
     }
 
     #[test]
@@ -965,8 +1016,10 @@ mod tests {
                 statement: "s".into(),
                 check: AssertionCheck::Command,
                 command: Some("true".into()),
+                milestone: None,
                 pty_script: None,
                 negative_control: None,
+                timeout_secs: None,
             }],
             milestones: vec![PlanMilestone {
                 title: "m".into(),

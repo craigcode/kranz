@@ -895,7 +895,9 @@ mod tests {
             statement: "the check passes".to_string(),
             check: AssertionCheck::Command,
             command: Some(command.to_string()),
+            milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }
     }

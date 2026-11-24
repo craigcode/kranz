@@ -2,7 +2,7 @@
 title: Slack /kranz command surface
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-17
+last_verified: 2026-11-23
 verified_against:
   - crates/slack/src/catalog.rs
   - crates/slack/src/inbound.rs
@@ -17,6 +17,19 @@ verified_against:
   - crates/engine/src/planning.rs
   - 'command: cargo test -p kranz-slack'
 ---
+
+Rechecked 2026-11-23 (UTC) against the configurable contract-command
+timeout: `bridge.rs`'s touch is one existing `Assertion` test literal
+gaining `timeout_secs: None`, and `planning.rs` only adds the
+`timeoutSecs` plan-schema field, its validation and the no-change-on-
+revision rule for it (all plan-approval behaviour, not Slack). No command,
+route, card or authorization changed.
+
+Rechecked 2026-11-19 (UTC) against the milestone-scoped assertions change:
+`bridge.rs`'s touch is one existing `Assertion` literal gaining
+`milestone: None`, and `planning.rs` only adds the revised-plan milestone
+check and the no-change-on-revision rule for that field (both plan-approval
+behaviour, not Slack). No command, route, card or authorization changed.
 
 Rechecked 2026-11-17 (UTC) against the temp-directory cleanup: in `crates/server/src/host.rs` the `ask` session's scratch home is removed when the session ends, and the abandon and delete routes now also remove the mission's worktrees that hold only committed files, through `mission_catalog`. Commands, routing and authorization are unchanged.
 

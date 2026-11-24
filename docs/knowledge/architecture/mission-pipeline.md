@@ -2,8 +2,11 @@
 title: Mission pipeline & event-sourced core
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-17
+last_verified: 2026-11-24
 verified_against:
+  - crates/engine/src/contract_timeout.rs
+  - crates/engine/src/contract_lint.rs
+  - crates/engine/src/contract_scope.rs
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
@@ -40,6 +43,30 @@ verified_against:
   - crates/engine/tests/reducer_test.rs
   - docs/design.md
 ---
+
+Rechecked 2026-11-24 (UTC) against a test-only change in `contract_lint.rs`: the lint timeout summary test gives its second run its own scratch directory, so the copied Windows sleep fixture is not overwritten while still open. No pipeline behaviour changed.
+
+Rechecked 2026-11-23 (UTC) against the configurable contract-command timeout
+(`contract_timeout.rs`, `contract_lint.rs`, `reducer.rs`, `planning.rs`,
+`orchestrator.rs`, `orchestrator/finalization.rs`, `types.rs`): a contract
+`command` assertion may carry `timeoutSecs` (1-14400), validated at plan
+approval and every revision alongside the existing contract-controls check,
+and a revision may not change an assertion's `timeoutSecs` once approved —
+the same extends-only rule as its other fields. `PlanApproved`/`PlanRevised`
+folding and `dry_run_revised_plan` gained this one extra validation call
+each; no event, stage or pipeline order changed.
+
+Rechecked 2026-11-23 (UTC) against the fix-id change: `findings.rs` picks a fix feature's id cycle as the next free one on the milestone (`next_fix_cycle`), so a repair or a tier escalation no longer reuses an id; `orchestrator.rs` gained comments and tests only. Pipeline stages, fix-cycle spending and event schemas are unchanged.
+
+Rechecked 2026-11-22 (UTC) against `contract_scope.rs`: the `#[allow(dead_code)]` lines on `due_index` and `is_due` are removed, since the validation round calls both. Pipeline stages and event schemas are unchanged.
+
+Rechecked 2026-11-21 (UTC) against the worker `git stash` deny: `docs/design.md` lists `Bash(git stash*)` in the worker deny set and says how each backend matches a deny rule on a compound command line; `backend_acp.rs` and `backend_acp/terminals.rs` gained tests only. Pipeline stages and event schemas are unchanged.
+
+Rechecked 2026-11-19 (UTC) against `contract_scope.rs`: `validation_round` now
+notes that a contract assertion may be scoped to a plan milestone, and that a
+not-yet-due assertion still runs each round but is recorded record-only
+rather than blocking. Pipeline stages, their order and the event schema are
+otherwise unchanged.
 
 Rechecked 2026-11-17 (UTC) against the foreground command limit in `runner.rs` and `types.rs`: worker and validator session specs now carry `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`, set from config `agentCommandTimeoutSecs` (absent means 1800 seconds, `0` sets neither), so the Claude CLI keeps a long command in the foreground instead of moving it to the background after two minutes. Pipeline stages, their order and the event schema are unchanged.
 
@@ -319,7 +346,11 @@ recorded in the [contract change](../../reviews/2026-09-05-feature-progress-cont
 `validation_round` runs scrutiny + functional validators (skippable only when
 the approved policy permits) plus a deterministic out-of-contract-write sweep,
 converts findings to fix-features or waives them (blocking at
-`max_fix_cycles_per_milestone`);
+`max_fix_cycles_per_milestone`). A contract assertion may name the plan
+milestone that must satisfy it; a round still runs an assertion not yet due
+by that round, but records its result and any citing finding record-only
+(`validation.assertion.notdue` / `validation.finding.notdue`) instead of
+letting it block — see [milestone-scoped assertions](../validation/gates.md#milestone-scoped-assertions).
 `final_gate` fails an empty deliverable outright, runs `check:"command"`
 assertions itself and sends `agent-judgement` assertions to the orchestrator
 against the `base_sha..HEAD` diff. Roles: `Orchestrator`, `Worker`,

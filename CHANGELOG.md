@@ -5,6 +5,41 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: a mission report now carries an `Interventions:` line counting
+  operator interventions by class (grant decisions, steers, revision
+  rulings, operator unblocks). `kranz escalation-metrics` and
+  `kranz outcomes` now also report a separate count of abandoned missions
+  (JSON `.abandoned`), each with its interventions by class and whether any
+  feature had completed before the abandon. Neither autonomy ratio changes.
+- Fixed: on Windows, an acquire of the mission lock that raced another
+  process stealing a stale lock could fail with "Access is denied" where it
+  should report that the mission is locked. The engine already waited out
+  Windows' delete-pending window when creating the lock file; it now does
+  the same for the file-type check before the acquire and for the remove
+  inside the steal. A lock file that really cannot be accessed still
+  reports the denial.
+- Fixed: a fix feature created after an operator-directed repair
+  (`unblock-add-fix`) or after a tier escalation no longer reuses an existing
+  fix feature id. The mission used to stop with "duplicate
+  fixfeature.created ... with a different payload". The id's cycle number is
+  now the next one free on the milestone. Ids in existing event logs, and
+  when a fix cycle is spent, are unchanged.
+- Added: a contract assertion may name the plan milestone that must satisfy
+  it, in the optional field `milestone`. A validation round holds a
+  milestone only to the assertions due by it. An assertion that is not yet
+  due still runs, and its result is logged as `validation.assertion.notdue`;
+  a validator finding that cites it is logged as `validation.finding.notdue`
+  and creates no fix feature. The final gate still runs every assertion.
+  Approval refuses a plan whose assertion names an unknown milestone, and
+  plans without the field behave as before.
+- Changed: workers may not run `git stash`. It is in the built-in worker
+  deny list as one rule, `Bash(git stash*)`, which covers `list` and `show`
+  too, and an operator can lift it with a worker-deny grant. Workers had
+  used `git stash push -u` to check a build against a clean tree, which
+  moves a feature's uncommitted work out of the worktree until it is popped.
+  The grant offer now also names a denied rule when the command follows
+  `;`, `&&`, `||`, `|` or a newline. The ACP permission check still matches
+  only the start of a command line; a test records that gap.
 - Changed: worker and validator sessions on the Claude backend may keep a
   shell command in the foreground for 30 minutes, up from the agent CLI's
   two. A workspace test run that outlasted two minutes was moved to the
@@ -359,6 +394,17 @@ Notable user-visible changes are documented here. This project follows
 - Fixed: the secret scan skipped added lines that begin with `++`, and
   flagged ordinary prose after the words "basic" or "bearer".
 - Fixed: `kranz config set` leaves the config file owner-only.
+- Added: the wall-clock limit on an engine-run contract `command` assertion
+  is configurable. A per-assertion `timeoutSecs` (1-14400) in the plan wins;
+  otherwise the operator-only config `contractCommandTimeoutSecs` in
+  `~/.kranz/config.json` wins; otherwise the limit stays 600 seconds. Every
+  value is capped at 14400 seconds regardless of source. Validation rounds
+  and the final gate resolve and enforce the same limit, and a timed-out
+  command is still a critical, non-waivable `command-assertion` finding but
+  its evidence says it timed out, names the resolved limit and its source,
+  and validation-round evidence shows a `TIMEOUT` verdict rather than
+  `PASS`/`FAIL`. The approval-time contract lint now lists timed-out
+  commands on their own line, separate from author-bug suspects.
 
 ## 0.5.0 - 2026-11-08
 

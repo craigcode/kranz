@@ -78,6 +78,7 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
                 return Ok(());
             }
             crate::contract_controls::validate(&plan.validation_contract)?;
+            crate::contract_timeout::validate(&plan.validation_contract)?;
             state.mission.base_sha = base_sha.clone();
             state.mission.goal = plan.goal.clone();
             state.mission.validation_contract = plan.validation_contract.clone();
@@ -459,6 +460,31 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             // emit time — the evidence pass is engine-run — so only the
             // milestone reference is validated as a corruption guard.
             milestone_mut(state, milestone_id)?;
+        }
+
+        EventKind::ValidationAssertionNotDue { milestone_id, .. } => {
+            // Audit-only record (contract-scope due-at rule): a not-yet-due
+            // assertion's result never drives a state transition — only its
+            // own milestone can act on it, later. Validate the milestone
+            // reference as a corruption guard only (mirrors
+            // validation.pty.transcript).
+            milestone_mut(state, milestone_id)?;
+        }
+
+        EventKind::ValidationFindingNotDue {
+            milestone_id,
+            run_id,
+            ..
+        } => {
+            // Audit-only record: a finding diverted from validation.finding
+            // because its subject named a not-yet-due assertion. No fix
+            // feature, no fix-cycle bump — those only ever follow
+            // validation.finding. Validate references as a corruption
+            // guard (mirrors validation.finding).
+            milestone_mut(state, milestone_id)?;
+            if run_id != ENGINE_RUN_ID {
+                run_mut(state, run_id)?;
+            }
         }
 
         EventKind::GateResult { .. } => {
@@ -967,11 +993,18 @@ fn take_pending_question(
 
 fn apply_revised_plan(state: &mut MissionState, plan: &Plan, revision: u32) -> Result<()> {
     crate::contract_controls::validate(&plan.validation_contract)?;
+    crate::contract_timeout::validate(&plan.validation_contract)?;
     if plan.reviewer_independence != state.mission.reviewer_independence {
         return Err(EngineError::Config(
             "plan.revised cannot replace the approved reviewerIndependence policy".into(),
         ));
     }
+    let milestone_titles: Vec<&str> = plan.milestones.iter().map(|m| m.title.as_str()).collect();
+    crate::contract_scope::validate_milestone_refs(
+        &plan.validation_contract,
+        &milestone_titles,
+        "plan.revised",
+    )?;
     ensure_contract_extends(
         &state.mission.validation_contract,
         &plan.validation_contract,
@@ -1063,6 +1096,8 @@ fn ensure_contract_extends(existing: &[Assertion], revised: &[Assertion]) -> Res
             || old.check != new.check
             || old.command != new.command
             || old.negative_control != new.negative_control
+            || old.milestone != new.milestone
+            || old.timeout_secs != new.timeout_secs
         {
             return Err(EngineError::InvalidState(format!(
                 "plan.revised weakens or changes validation assertion '{}'",
@@ -1484,6 +1519,43 @@ mod negative_control_tests {
             .command = "new".into();
         crate::planning::validate_revised_plan_for_gate(&state.mission, &revised).unwrap();
         dry_run_revised_plan(&state, &revised, 1).unwrap();
+    }
+
+    #[test]
+    fn assertion_due_approval_revision_refuses_milestone_change() {
+        let mut plan = plan();
+        plan.validation_contract[0].milestone = Some("one".to_string());
+        let state = approved(&plan).unwrap();
+        dry_run_revised_plan(&state, &plan, 1).unwrap();
+
+        let mut changed = plan.clone();
+        changed.validation_contract[0].milestone = None;
+        assert!(
+            crate::planning::validate_revised_plan_for_gate(&state.mission, &changed).is_err(),
+            "pre-emit gate must refuse a changed milestone field"
+        );
+        assert!(
+            dry_run_revised_plan(&state, &changed, 1).is_err(),
+            "reducer must refuse a changed milestone field"
+        );
+    }
+
+    #[test]
+    fn assertion_due_approval_revision_refuses_unknown_milestone() {
+        let mut plan = plan();
+        plan.validation_contract[0].milestone = Some("one".to_string());
+        let state = approved(&plan).unwrap();
+
+        let mut unknown = plan;
+        unknown.validation_contract[0].milestone = Some("nope".to_string());
+        assert!(
+            crate::planning::validate_revised_plan_for_gate(&state.mission, &unknown).is_err(),
+            "pre-emit gate must refuse an unknown milestone"
+        );
+        assert!(
+            dry_run_revised_plan(&state, &unknown, 1).is_err(),
+            "reducer must refuse an unknown milestone"
+        );
     }
 }
 

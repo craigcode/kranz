@@ -2326,6 +2326,51 @@ mod tests {
         assert_eq!(decide_permission(&ro, &read), PermissionDecision::Allow);
     }
 
+    /// Pins how this seam treats `git stash` after a shell operator: a lone
+    /// stash call is denied, but `decide_permission` matches the whole
+    /// command string from its start (see `wildcard_match`), so a stash call
+    /// that is NOT first on the line is not denied here. This is a known
+    /// gap for this path; the Sgian terminal path (`terminals.rs`) splits on
+    /// shell operators and does catch these (see docs/design.md).
+    #[test]
+    fn acp_permission_git_stash_compound_behaviour() {
+        let spec = spec_with(true, &["Bash(git stash*)"]);
+
+        for cmd in ["git stash push -u", "git stash"] {
+            let call = ToolCallInfo {
+                kind: "execute".to_string(),
+                title: cmd.to_string(),
+                subject: vec![cmd.to_string()],
+            };
+            assert!(
+                matches!(
+                    decide_permission(&spec, &call),
+                    PermissionDecision::Deny(ref reason) if reason.contains("Bash(git stash*)")
+                ),
+                "expected deny for {cmd:?}"
+            );
+        }
+
+        // Known gap: a stash call after `;`, `&&` or a newline is allowed
+        // because the subject string is matched from its start.
+        for cmd in [
+            "cargo build; git stash push -u",
+            "cargo build && git stash push -u",
+            "cargo build\ngit stash push -u",
+        ] {
+            let call = ToolCallInfo {
+                kind: "execute".to_string(),
+                title: cmd.to_string(),
+                subject: vec![cmd.to_string()],
+            };
+            assert_eq!(
+                decide_permission(&spec, &call),
+                PermissionDecision::Allow,
+                "expected allow (known gap) for {cmd:?}"
+            );
+        }
+    }
+
     /// The permission seam used to fail OPEN when the peer omitted the
     /// subject: `wildcard_match("git push*", "")` is false, so no deny fired
     /// and the decision was Allow. Every glob-carrying deny rule was

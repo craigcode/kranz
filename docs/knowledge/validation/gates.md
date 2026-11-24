@@ -2,8 +2,11 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-18
+last_verified: 2026-11-24
 verified_against:
+  - crates/engine/src/contract_timeout.rs
+  - crates/engine/src/contract_lint.rs
+  - crates/engine/src/contract_scope.rs
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
   - crates/engine/src/container_egress.rs
@@ -63,6 +66,21 @@ verified_against:
   - docs/tickets.md
   - crates/engine/src/git_ops.rs
 ---
+
+Rechecked 2026-11-24 (UTC) against a test-only change in `contract_lint.rs`: the lint timeout summary test gives its second run its own scratch directory, so the copied Windows sleep fixture is not overwritten while still open. No gate behaviour changed.
+
+Rechecked 2026-11-23 (UTC) against the fix-id change: `findings.rs` picks a fix feature's id cycle as the next free one on the milestone (`next_fix_cycle`), so a repair or a tier escalation no longer reuses an id; `orchestrator.rs` gained comments and tests only. No gate changed.
+
+Rechecked 2026-11-22 (UTC) against `contract_scope.rs`: the `#[allow(dead_code)]` lines on `due_index` and `is_due` are removed, since the validation round calls both. No gate changed.
+
+Rechecked 2026-11-21 (UTC) against the worker `git stash` deny: `docs/design.md` lists `Bash(git stash*)` in the worker deny set and says how each backend matches a deny rule on a compound command line; `backend_acp.rs` and `backend_acp/terminals.rs` gained tests only. No gate changed.
+
+Rechecked 2026-11-19 (UTC): added the "Milestone-scoped assertions" section
+below, describing `contract_scope.rs`'s due-at rule — an assertion may name a
+plan milestone, approval/revision refuse an unknown or ambiguous title and
+revisions may not change it, a not-yet-due assertion still runs each round
+but is recorded via `validation.assertion.notdue`/`validation.finding.notdue`
+instead of blocking, and the final gate runs every assertion regardless.
 
 Rechecked 2026-11-18 (UTC) against `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`, the same check CI runs. No gate changed.
 
@@ -480,9 +498,22 @@ Once all milestones complete, `final_gate()` runs the mission's
   branch). When enforcement is enabled, the resolved worker sandbox also wraps
   the gate. Qualified ACP profiles derive an offline gate policy with the same
   pinned image and no selected provider login; `off` keeps the environment-only
-  posture. The timeout is 10 minutes
-  (`COMMAND_TIMEOUT`). A non-zero exit produces a critical, non-waivable
-  `command-assertion` finding.
+  posture. The wall-clock limit for each command assertion is resolved by
+  [`contract_timeout::resolve`](../../../crates/engine/src/contract_timeout.rs):
+  the assertion's own `timeoutSecs` wins, else the operator-only
+  `contractCommandTimeoutSecs` in `~/.kranz/config.json`, else 600 seconds
+  (`DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS`); every value is clamped to
+  1..=14400 seconds (`MAX_CONTRACT_COMMAND_TIMEOUT_SECS`) so no plan or
+  config can disable the limit. Validation rounds resolve and enforce the
+  same per-assertion limit before the final gate ever runs. A timeout stays
+  a critical, non-waivable `command-assertion` finding — it is never treated
+  as a pass — but its evidence says the command timed out, states the
+  resolved limit and which source it came from (`plan timeoutSecs`, `config
+  contractCommandTimeoutSecs`, or `default`), and points at raising the
+  limit. Validation-round evidence for a timed-out assertion shows a
+  `TIMEOUT after <n>s (limit from <source>)` verdict instead of `PASS`/`FAIL`.
+  A non-zero exit that is not a timeout produces an ordinary critical,
+  non-waivable `command-assertion` finding.
 - **`agent-judgement` assertions** get one orchestrator verdicts turn, shown
   the `diff_stat(base, "HEAD")` where `base` is the pinned `base_sha` (falls
   back to `base_branch` only for legacy missions with no pinned sha).
@@ -508,6 +539,34 @@ failing-command evidence attached, spending no fix cycle. The guard in
 `convert_findings` honors this verdict only for findings whose
 `class == "command-assertion"`; a mislabelled non-command finding falls
 through to the normal fix/waive handling.
+
+## Milestone-scoped assertions
+
+A contract `command` or `pty_script` assertion may carry `milestone`, naming
+a plan milestone title ([`contract_scope.rs`](../../../crates/engine/src/contract_scope.rs),
+matched via `norm_title` after trimming and ignoring case). `approve_plan`
+refuses a plan whose contract names an unknown or ambiguous milestone title,
+naming the offending assertion's id in the error; the same check runs on
+every plan revision, and a revision may not change an assertion's
+`milestone` field once approved. An unscoped assertion (`milestone: None`)
+behaves exactly as before this feature.
+
+At validation round `round_index` (0-based, aligned to milestone position),
+an assertion is **due** when it is unscoped, or when its named milestone is
+at or before that round; otherwise it is **not yet due**. A not-yet-due
+assertion still runs every round — engine-side, exactly like a due one — but
+its result is recorded as a `validation.assertion.notdue` event instead of
+feeding the validators' evidence or `contract_results`, so a failure there
+cannot become a blocking finding before the assertion's own milestone. A
+validator finding whose `subject` names a not-yet-due assertion is diverted
+to a `validation.finding.notdue` event instead of `validation.finding`: it
+never reaches `convert_findings`, so it raises no fix feature, no fix-cycle
+bump and no milestone block. Both events are additive and record-only;
+pre-field logs simply never scoped a contract to milestones.
+
+Final-gate judgement (below) is unaffected by due-at scoping: it runs every
+`command` and `agent-judgement` assertion in the approved
+`validation_contract`, due or not, exactly as it always has.
 
 ## What a validator is allowed to run
 

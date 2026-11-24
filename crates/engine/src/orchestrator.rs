@@ -1338,7 +1338,15 @@ impl MissionEngine {
                 empty.title
             )));
         }
+        let milestone_titles: Vec<&str> =
+            plan.milestones.iter().map(|m| m.title.as_str()).collect();
+        crate::contract_scope::validate_milestone_refs(
+            &plan.validation_contract,
+            &milestone_titles,
+            "plan",
+        )?;
         crate::contract_controls::validate(&plan.validation_contract)?;
+        crate::contract_timeout::validate(&plan.validation_contract)?;
 
         // Resolve the moving base branch exactly once, before any base-owned
         // contract/policy read or mission-branch side effect. Every approval
@@ -1550,6 +1558,7 @@ impl MissionEngine {
                                 &[],
                                 &sandbox,
                                 &shell,
+                                &self.state.config,
                             )
                         } else {
                             skipped()
@@ -1812,16 +1821,28 @@ impl MissionEngine {
         // contract_health's lint counters keep classifying it.
         if !contract_lint_report.is_empty() {
             let suspect_count = contract_lint_report.suspects().len();
+            let timed_out_count = contract_lint_report.timed_out().len();
             let skipped = contract_lint_report.not_linted().len();
             let mut headline = if skipped == contract_lint_report.results.len() {
                 format!(
                     "contract lint skipped: {skipped} command assertion(s) were not run on \
                      the base (no containment available or budget spent)"
                 )
+            } else if suspect_count > 0 && timed_out_count > 0 {
+                format!(
+                    "contract lint: {suspect_count} author-bug suspect assertion(s) already \
+                     pass on the untouched base, and {timed_out_count} command assertion(s) \
+                     timed out on the untouched base — see plan.md"
+                )
             } else if suspect_count > 0 {
                 format!(
                     "contract lint: {suspect_count} author-bug suspect assertion(s) already \
                      pass on the untouched base — see plan.md"
+                )
+            } else if timed_out_count > 0 {
+                format!(
+                    "contract lint: {timed_out_count} command assertion(s) timed out on the \
+                     untouched base — see plan.md"
                 )
             } else {
                 "contract lint: all command assertions correctly fail on the untouched base"
@@ -2609,6 +2630,7 @@ impl MissionEngine {
             ));
         }
         crate::contract_controls::validate(&plan.validation_contract)?;
+        crate::contract_timeout::validate(&plan.validation_contract)?;
 
         // (1) The completed milestones, in current order, must be reproduced
         // unchanged and first in the revised plan.
@@ -2812,7 +2834,9 @@ impl MissionEngine {
         // Added features enter as fix-origin features on the target milestone —
         // the only event that can add a feature. Ids reuse the fix-feature
         // shape but on a "re-plan" cycle namespace so they never collide with
-        // validation fix ids (which are ms-<id>-fix-<cycle>-<n>).
+        // validation fix ids (which are ms-<id>-fix-<cycle>-<n>, where <cycle>
+        // is the next free fix-id cycle on the milestone — see
+        // `findings::next_fix_cycle`).
         for (i, pf) in to_add.into_iter().enumerate() {
             let feature = Feature {
                 id: format!("{target_id}-replan-{replan_cycle}-{}", i + 1),
@@ -3417,7 +3441,10 @@ impl MissionEngine {
                 // — resuming validation unchanged would just fail again. The
                 // reducer's fix-cycle guard only increments from Validating
                 // status, so this repair does not spend a fix cycle; it is
-                // not validator-finding loop churn.
+                // not validator-finding loop churn. It still takes the next
+                // free fix-id cycle (`findings::next_fix_cycle`), so repeated
+                // repairs — or a repair followed by a validator finding —
+                // never mint a colliding fix id.
                 let reason = if note.is_empty() {
                     action.clone()
                 } else {
@@ -5952,27 +5979,46 @@ impl MissionEngine {
         env: &HashMap<String, String>,
         sandbox: &crate::command_exec::GateSandbox,
         shell: &crate::contract_shell::HostShell,
+        config: &MissionConfig,
     ) -> Option<String> {
-        let command_assertions: Vec<(String, Option<String>)> = contract
+        let command_assertions: Vec<Assertion> = contract
             .iter()
             .filter(|a| a.check == AssertionCheck::Command)
-            .map(|a| (a.id.clone(), a.command.clone()))
+            .cloned()
             .collect();
         if command_assertions.is_empty() {
             return None;
         }
         let mut rendered = String::new();
-        for (id, command) in command_assertions {
-            match command.as_deref() {
+        for assertion in command_assertions {
+            let id = &assertion.id;
+            match assertion.command.as_deref() {
                 Some(command) => {
-                    let (ok, output) = crate::command_exec::run_contract_command_sandboxed(
-                        root, command, env, sandbox, shell,
+                    let limit = crate::contract_timeout::resolve(&assertion, config);
+                    let run = crate::command_exec::run_contract_command_timed(
+                        root,
+                        command,
+                        limit.duration(),
+                        env,
+                        sandbox,
+                        shell,
                     )
                     .await;
-                    let verdict = if ok { "PASS" } else { "FAIL" };
+                    let verdict = if run.timed_out {
+                        format!(
+                            "TIMEOUT after {}s (limit from {})",
+                            limit.secs,
+                            limit.source.label()
+                        )
+                    } else if run.code == Some(0) {
+                        "PASS".to_string()
+                    } else {
+                        "FAIL".to_string()
+                    };
                     // The verdict line is the engine's. The output is whatever
                     // the mission's own code printed, so it goes in a fence.
-                    let tail = crate::presentation::fence_command_output(&scrub::scrub(&output));
+                    let tail =
+                        crate::presentation::fence_command_output(&scrub::scrub(&run.output));
                     rendered.push_str(&format!(
                         "- [{id}] `{command}` → {verdict} (shell: {})\n{tail}",
                         shell.label()
@@ -5984,6 +6030,63 @@ impl MissionEngine {
             }
         }
         Some(rendered)
+    }
+
+    /// Run a NOT-YET-DUE contract's command assertions engine-side with the
+    /// exact same env/sandbox/shell/timeout the due commands run under
+    /// (contract-scope due-at rule, module [`crate::contract_scope`]), but
+    /// return per-assertion verdicts instead of a rendered evidence block:
+    /// a not-due result never joins `contract_results`, it only feeds the
+    /// round's `validation.assertion.notdue` events.
+    async fn run_contract_commands_notdue(
+        contract: &[Assertion],
+        root: &std::path::Path,
+        env: &HashMap<String, String>,
+        sandbox: &crate::command_exec::GateSandbox,
+        shell: &crate::contract_shell::HostShell,
+        config: &MissionConfig,
+    ) -> Vec<(String, bool, String)> {
+        let command_assertions: Vec<Assertion> = contract
+            .iter()
+            .filter(|a| a.check == AssertionCheck::Command)
+            .cloned()
+            .collect();
+        let mut results = Vec::new();
+        for assertion in command_assertions {
+            let id = assertion.id.clone();
+            match assertion.command.as_deref() {
+                Some(command) => {
+                    let limit = crate::contract_timeout::resolve(&assertion, config);
+                    let run = crate::command_exec::run_contract_command_timed(
+                        root,
+                        command,
+                        limit.duration(),
+                        env,
+                        sandbox,
+                        shell,
+                    )
+                    .await;
+                    let mut detail =
+                        crate::presentation::fence_command_output(&scrub::scrub(&run.output));
+                    if run.timed_out {
+                        detail = format!(
+                            "TIMEOUT after {}s (limit from {})\n{}",
+                            limit.secs,
+                            limit.source.label(),
+                            detail
+                        );
+                    }
+                    let ok = !run.timed_out && run.code == Some(0);
+                    results.push((id, ok, detail));
+                }
+                None => results.push((
+                    id,
+                    false,
+                    "(check=command but no command — cannot run)".to_string(),
+                )),
+            }
+        }
+        results
     }
 
     /// Called for the resolved primary, retry and confirmation before any
@@ -6061,6 +6164,33 @@ impl MissionEngine {
             roles.push(Role::ValidatorFunctional);
         }
 
+        // Contract-scope due-at rule (module `crate::contract_scope`): hold
+        // this round to only the assertions due by it. An unscoped plan (no
+        // assertion names a milestone) partitions with everything due —
+        // byte-for-byte today's behavior.
+        let milestone_titles: Vec<&str> = self
+            .state
+            .mission
+            .milestones
+            .iter()
+            .map(|m| m.title.as_str())
+            .collect();
+        let (due_contract, not_due_contract): (Vec<Assertion>, Vec<Assertion>) = self
+            .state
+            .mission
+            .validation_contract
+            .iter()
+            .cloned()
+            .partition(|a| crate::contract_scope::is_due(a, &milestone_titles, mi));
+        let notdue_due_milestone: HashMap<String, String> = not_due_contract
+            .iter()
+            .map(|a| {
+                let idx = crate::contract_scope::due_index(a, &milestone_titles)
+                    .expect("a not-due assertion must resolve to exactly one milestone");
+                (a.id.clone(), self.state.mission.milestones[idx].id.clone())
+            })
+            .collect();
+
         let mut findings: Vec<(String, Finding)> = Vec::new();
 
         // Engine-run contract commands (validator repair 3/5): executed once
@@ -6068,7 +6198,7 @@ impl MissionEngine {
         // contract env — and handed to the functional validator as
         // authoritative evidence.
         let contract_results = if roles.contains(&Role::ValidatorFunctional) {
-            let contract = self.state.mission.validation_contract.clone();
+            let contract = due_contract.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let root = self.active_root().to_path_buf();
             let env = self.contract_command_env(base_sha.as_deref())?;
@@ -6084,6 +6214,7 @@ impl MissionEngine {
                 &env,
                 &gate_sandbox,
                 &shell,
+                &self.state.config,
             )
             .await;
             // Pty-script assertions (ticket pty-functional-validation): the
@@ -6159,6 +6290,89 @@ impl MissionEngine {
                 (base, None) => base,
                 (None, pty) => pty,
             };
+
+            // Not-yet-due assertions (contract-scope due-at rule): run with
+            // the exact same env/sandbox/shell/timeout as the due ones, so
+            // the result is no less real — but it never joins
+            // `contract_results` and is recorded only as
+            // `validation.assertion.notdue`, never a blocking finding.
+            if !not_due_contract.is_empty() {
+                let notdue_commands = Self::run_contract_commands_notdue(
+                    &not_due_contract,
+                    &root,
+                    &env,
+                    &gate_sandbox,
+                    &shell,
+                    &self.state.config,
+                )
+                .await;
+                for (assertion_id, ok, detail) in notdue_commands {
+                    let due_milestone_id = notdue_due_milestone
+                        .get(&assertion_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Err(error) = self.emit(EventKind::ValidationAssertionNotDue {
+                        milestone_id: milestone_id.clone(),
+                        assertion_id,
+                        due_milestone_id,
+                        verdict: if ok {
+                            crate::gate::GateVerdict::Pass
+                        } else {
+                            crate::gate::GateVerdict::Fail
+                        },
+                        detail,
+                    }) {
+                        gate_sandbox.cleanup()?;
+                        return Err(error);
+                    }
+                }
+
+                let notdue_pty_run = crate::pty_harness::run_pty_assertions(
+                    &not_due_contract,
+                    &root,
+                    &env,
+                    &gate_sandbox,
+                    &self.paths.runs_dir(),
+                )
+                .await;
+                for artifact in &notdue_pty_run.artifacts {
+                    let due_milestone_id = notdue_due_milestone
+                        .get(&artifact.assertion_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Err(error) = self.emit(EventKind::ValidationAssertionNotDue {
+                        milestone_id: milestone_id.clone(),
+                        assertion_id: artifact.assertion_id.clone(),
+                        due_milestone_id,
+                        verdict: if artifact.pass {
+                            crate::gate::GateVerdict::Pass
+                        } else {
+                            crate::gate::GateVerdict::Fail
+                        },
+                        detail: artifact.detail.clone(),
+                    }) {
+                        gate_sandbox.cleanup()?;
+                        return Err(error);
+                    }
+                }
+                for skip in &notdue_pty_run.skipped {
+                    let due_milestone_id = notdue_due_milestone
+                        .get(&skip.assertion_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Err(error) = self.emit(EventKind::ValidationAssertionNotDue {
+                        milestone_id: milestone_id.clone(),
+                        assertion_id: skip.assertion_id.clone(),
+                        due_milestone_id,
+                        verdict: crate::gate::GateVerdict::Fail,
+                        detail: skip.note.clone(),
+                    }) {
+                        gate_sandbox.cleanup()?;
+                        return Err(error);
+                    }
+                }
+            }
+
             gate_sandbox.cleanup()?;
             combined
         } else {
@@ -6172,10 +6386,7 @@ impl MissionEngine {
         // and a byte-identical validator task. The runner owns the untrusted
         // warning/delimiters; this helper supplies scrubbed, bounded data.
         let runtime_evidence = if roles.contains(&Role::ValidatorFunctional)
-            && self
-                .state
-                .mission
-                .validation_contract
+            && due_contract
                 .iter()
                 .any(|assertion| assertion.check == AssertionCheck::AgentJudgement)
         {
@@ -6192,7 +6403,7 @@ impl MissionEngine {
 
         for role in roles {
             let milestone = self.state.mission.milestones[mi].clone();
-            let contract = self.state.mission.validation_contract.clone();
+            let contract = due_contract.clone();
             let base_sha = self.state.mission.base_sha.clone();
             let grants = self.state.mission.command_grants.clone();
             let egress_grants = self.state.mission.egress_grants.clone();
@@ -6537,6 +6748,31 @@ impl MissionEngine {
         // saturates the cap and lets the write flow to the fix/waive path below.
         if self.maybe_park_for_touch_grant(&milestone_id, &findings)? {
             return Ok(());
+        }
+
+        // Deterministic backstop (contract-scope due-at rule): any finding
+        // whose subject names a not-yet-due assertion — from the primary,
+        // the retry, or the frontier confirmation, whichever produced it —
+        // is diverted here instead of becoming a blocking validation.finding.
+        // It never reaches `convert_findings`: no fix feature, no fix-cycle
+        // bump, no milestone block before the assertion's own milestone.
+        let (due_findings, notdue_findings) =
+            findings.into_iter().partition::<Vec<_>, _>(|(_, finding)| {
+                !notdue_due_milestone.contains_key(finding.subject.trim())
+            });
+        let findings = due_findings;
+
+        for (run_id, finding) in &notdue_findings {
+            let due_milestone_id = notdue_due_milestone
+                .get(finding.subject.trim())
+                .cloned()
+                .unwrap_or_default();
+            self.emit(EventKind::ValidationFindingNotDue {
+                milestone_id: milestone_id.clone(),
+                run_id: run_id.clone(),
+                due_milestone_id,
+                finding: finding.clone(),
+            })?;
         }
 
         for (run_id, finding) in &findings {
@@ -11185,8 +11421,10 @@ pub(crate) mod tests {
             statement: "the worker report and denied egress prove the runtime boundary".to_string(),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            milestone: None,
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }];
         engine.state.mission.milestones.push(Milestone {
             id: "ms-1".to_string(),
@@ -11977,6 +12215,90 @@ pub(crate) mod tests {
         );
     }
 
+    /// A tier escalation resets `fix_cycles` to 0 but the milestone already
+    /// carries completed fix features from the exhausted cycles — before
+    /// this fix, the post-escalation fix id formula (`fix_cycles + 1`)
+    /// reused the first one's id and the reducer would reject it as a
+    /// duplicate with a different payload. `findings::next_fix_cycle` must
+    /// skip past both existing ids.
+    #[tokio::test]
+    async fn fix_id_unique_after_tier_escalation() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let mut cfg = MissionConfig {
+            skip_functional: true,
+            max_fix_cycles_per_milestone: 2,
+            validator_allow_uncontained_degrade: true,
+            ..MissionConfig::default()
+        };
+        cfg.worker.backend = Some("local".to_string());
+        cfg.worker.base_url = Some("http://localhost:8080".to_string());
+        cfg.worker.context_budget = Some(8192);
+        cfg.allow_below_default_worker_model = true;
+
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            tier_escalation_finding_script("part 1 works"),
+            tier_escalation_orch_script(1),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine = MissionEngine::create(backend, &root, "goal", cfg).expect("create engine");
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![
+                fix_feature_for_test("ms-1-fix-1-1", FeatureStatus::Complete),
+                fix_feature_for_test("ms-1-fix-2-1", FeatureStatus::Complete),
+            ],
+            status: MilestoneStatus::Active,
+            fix_cycles: 2,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        });
+        assert_eq!(engine.state.executor_tier(), ExecutorTier::Local);
+
+        let result = engine.validation_round(0).await;
+        assert!(result.is_ok(), "escalation round must succeed: {result:?}");
+
+        let events = EventLog::read_events(&engine.paths.events_file()).expect("read events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.kind, EventKind::TierEscalated { milestone_id, .. } if milestone_id == "ms-1")),
+            "expected tier.escalated: {:?}",
+            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+
+        let fix_ids: Vec<&str> = engine.state.mission.milestones[0]
+            .features
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        assert!(
+            fix_ids.contains(&"ms-1-fix-3-1"),
+            "expected the post-escalation fix to land on the next free cycle: {fix_ids:?}"
+        );
+        assert_eq!(
+            fix_ids.iter().filter(|id| **id == "ms-1-fix-3-1").count(),
+            1,
+            "fix id must be unique within the milestone: {fix_ids:?}"
+        );
+    }
+
+    fn fix_feature_for_test(id: &str, status: FeatureStatus) -> Feature {
+        Feature {
+            id: id.to_string(),
+            title: "t".to_string(),
+            spec: "s".to_string(),
+            validation_criteria: Vec::new(),
+            origin: FeatureOrigin::Fix,
+            status,
+            worker_runs: Vec::new(),
+            commits: Vec::new(),
+            respawns: 0,
+        }
+    }
+
     // ---------------------------------------------------------------------------
     // Declared pty-script that never executed (ticket
     // pty-script-skip-vacuous-green): the final-gate backstop
@@ -11994,12 +12316,14 @@ pub(crate) mod tests {
             statement: "s".to_string(),
             check: AssertionCheck::PtyScript,
             command: None,
+            milestone: None,
             pty_script: Some(PtyScript {
                 command: "./repl".to_string(),
                 steps: Vec::new(),
                 timeout_secs: None,
             }),
             negative_control: None,
+            timeout_secs: None,
         };
         let contract = vec![
             pty("a-pty"),
@@ -12009,8 +12333,10 @@ pub(crate) mod tests {
                 statement: "s".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("true".to_string()),
+                milestone: None,
                 pty_script: None,
                 negative_control: None,
+                timeout_secs: None,
             },
         ];
         let transcript_event = |id: &str, verdict: crate::gate::GateVerdict, seq: u64| Event {
@@ -12133,8 +12459,10 @@ pub(crate) mod tests {
             statement: "the build passes".to_string(),
             check: AssertionCheck::Command,
             command: Some("true".to_string()),
+            milestone: None,
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }];
         engine.state.mission.milestones.push(Milestone {
             id: "ms-1".to_string(),
@@ -12254,8 +12582,10 @@ pub(crate) mod tests {
             statement: "the diff reads correct".to_string(),
             check: AssertionCheck::AgentJudgement,
             command: None,
+            milestone: None,
             pty_script: None,
             negative_control: None,
+            timeout_secs: None,
         }];
         // The local backend cannot apply the resolved sandbox profile, so
         // mandatory validator containment fails closed without the explicit
@@ -12535,6 +12865,100 @@ pub(crate) mod tests {
             events.iter().any(|e| matches!(&e.kind, EventKind::MilestoneBlocked { milestone_id, .. } if milestone_id == "ms-1")),
             "frontier tier must still block at the cap: {:?}",
             events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// Streams one `unblock-add-fix` decision per round on the long-lived
+    /// orchestrator session (mirrors `tier_escalation_orch_script`).
+    fn unblock_add_fix_orch_script(decisions: Vec<String>) -> crate::backend_mock::MockScript {
+        use crate::backend_mock::{mock_init, mock_result_text, mock_text};
+        crate::backend_mock::MockScript::streaming(vec![
+            mock_init("orch-session"),
+            mock_result_text("ready"),
+        ])
+        .responding(
+            decisions
+                .into_iter()
+                .map(|reply| vec![mock_text(&reply), mock_result_text(&reply)])
+                .collect(),
+        )
+    }
+
+    /// Two operator-directed `unblock-add-fix` repairs on the same milestone
+    /// — neither spends a fix cycle (the reducer only increments fix_cycles
+    /// on a `fixfeature.created` folded while Validating), so before this
+    /// fix the second repair's id formula (`fix_cycles + 1`) always
+    /// reproduced the first repair's id and the reducer rejected it as a
+    /// duplicate with a different payload. `findings::next_fix_cycle` takes
+    /// the next free cycle instead, so the second repair gets its own id
+    /// even though fix_cycles never moved.
+    #[tokio::test]
+    async fn fix_id_unique_two_repairs_get_distinct_ids() {
+        let Some((_dir, root)) = lessons_test_repo() else {
+            return;
+        };
+        let decision = |title: &str| {
+            serde_json::json!({
+                "action": "unblock-add-fix",
+                "note": "operator-directed repair",
+                "fix": {
+                    "title": title,
+                    "spec": format!("repair: {title}"),
+                    "validationCriteria": []
+                }
+            })
+            .to_string()
+        };
+        let mock = Arc::new(crate::backend_mock::MockBackend::with_scripts(vec![
+            unblock_add_fix_orch_script(vec![decision("first repair"), decision("second repair")]),
+        ]));
+        let backend: Arc<dyn AgentBackend> = mock;
+        let mut engine =
+            MissionEngine::create(backend, &root, "goal", MissionConfig::default()).unwrap();
+        engine.state.mission.milestones.push(Milestone {
+            id: "ms-1".to_string(),
+            title: "m".to_string(),
+            features: vec![],
+            status: MilestoneStatus::Blocked,
+            fix_cycles: 0,
+            start_sha: Some(engine.repo.head_sha().unwrap()),
+            validator_guidance: None,
+        });
+
+        let fix_cycles_before = engine.state.mission.milestones[0].fix_cycles;
+
+        engine
+            .emit(EventKind::UserMessage {
+                text: "repair it".into(),
+                interrupt: false,
+            })
+            .unwrap();
+        engine.handle_blocked(0).await.unwrap();
+
+        // The milestone must still be blockable for a second operator-directed
+        // repair, exactly as it would be if the re-run validation failed again.
+        engine.state.mission.milestones[0].status = MilestoneStatus::Blocked;
+        engine
+            .emit(EventKind::UserMessage {
+                text: "repair it again".into(),
+                interrupt: false,
+            })
+            .unwrap();
+        engine.handle_blocked(0).await.unwrap();
+
+        let fix_ids: Vec<&str> = engine.state.mission.milestones[0]
+            .features
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        assert_eq!(fix_ids.len(), 2, "both repairs must land: {fix_ids:?}");
+        assert_ne!(
+            fix_ids[0], fix_ids[1],
+            "the two repairs must get distinct fix ids: {fix_ids:?}"
+        );
+        assert_eq!(
+            engine.state.mission.milestones[0].fix_cycles, fix_cycles_before,
+            "an operator-directed repair must never spend a fix cycle"
         );
     }
 
@@ -16744,7 +17168,9 @@ pub(crate) mod tests {
                 statement: "the pinned base is x".to_string(),
                 check: AssertionCheck::Command,
                 command: Some(r#"test "$KRANZ_BASE_SHA" = x"#.to_string()),
+                milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {
@@ -16828,7 +17254,9 @@ pub(crate) mod tests {
             statement: "exits zero".to_string(),
             check: AssertionCheck::Command,
             command: Some("exit 0".to_string()),
+            milestone: None,
             negative_control: None,
+            timeout_secs: None,
             pty_script: None,
         }];
         let root = tempfile::tempdir().unwrap();
@@ -16845,6 +17273,7 @@ pub(crate) mod tests {
             &env,
             &sandbox,
             &shell,
+            &MissionConfig::default(),
         )
         .await
         .expect("one command assertion renders a line");

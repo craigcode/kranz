@@ -3,7 +3,9 @@
 //! so tests can assert on the exact output.
 
 use kranz_engine::cost::{Confidence, CostEstimate, MIN_CALIBRATION_MISSIONS};
-use kranz_engine::escalation_metrics::EscalationMetrics;
+use kranz_engine::escalation_metrics::{
+    format_intervention_classes, AbandonedMissions, EscalationMetrics,
+};
 use kranz_engine::gate::{GateKind, GateSurface, GateVerdict};
 use kranz_engine::gate_scores::GateScoreSeries;
 use kranz_engine::outcomes::Outcomes;
@@ -307,6 +309,32 @@ pub fn render_cost_estimate(estimate: &CostEstimate, missions_used: usize) -> St
     }
 }
 
+/// Render the "Abandoned (outside the autonomy ratio)" section shared by
+/// `render_outcomes` and `render_escalation_metrics`: empty when nothing was
+/// abandoned, so existing output stays byte-identical.
+fn render_abandoned_section(abandoned: &AbandonedMissions) -> String {
+    if abandoned.missions == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str("Abandoned (outside the autonomy ratio)\n");
+    out.push_str(&format!(
+        "  abandoned missions: {} ({} had completed features)   interventions: {}\n",
+        abandoned.missions, abandoned.delivered_before_abandon, abandoned.total_interventions
+    ));
+    for row in &abandoned.rows {
+        out.push_str(&format!(
+            "  {}: {} interventions ({}); features completed before abandon: {}\n",
+            row.mission_id,
+            row.total_interventions,
+            format_intervention_classes(&row.interventions),
+            row.features_completed_before_abandon
+        ));
+    }
+    out
+}
+
 /// Render `kranz outcomes`'s default text view: an Autonomy section always,
 /// then Grant latency and Escalation ledger sections — unless there is no
 /// history at all (no closed missions, no escalations, no decided grants,
@@ -332,6 +360,15 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
     if let Some(reasons) = &outcomes.outcome_reasons {
         out.push('\n');
         out.push_str(&kranz_engine::outcomes::reasons::render_text(reasons));
+    }
+
+    out.push_str(&render_abandoned_section(&outcomes.abandoned));
+    if outcomes.abandoned.missions > 0 {
+        out.push_str(
+            "  note: the autonomy ratio above still counts abandoned missions as closed; \
+             the published ratio (kranz escalation-metrics) excludes them. See \
+             .kranz/tickets/outcomes-autonomy-ratio-divergence.md\n",
+        );
     }
 
     let has_history = ratio.closed_missions > 0
@@ -673,6 +710,8 @@ pub fn render_escalation_metrics(metrics: &EscalationMetrics) -> String {
         autonomy.failed.zero_intervention,
         autonomy.failed.missions
     ));
+
+    out.push_str(&render_abandoned_section(&metrics.abandoned));
 
     let has_history = autonomy.closed_missions > 0
         || !metrics.ledger.is_empty()
@@ -1549,7 +1588,9 @@ mod tests {
                     statement: "holds\u{1b}[2A".into(),
                     check: AssertionCheck::Command,
                     command: Some("cargo test\u{1b}[K".into()),
+                    milestone: None,
                     negative_control: None,
+                    timeout_secs: None,
                     pty_script: None,
                 }],
                 considered_alternatives: None,
@@ -1673,6 +1714,118 @@ mod tests {
             assert!(text.contains("Cost per change"));
             assert!(text.contains("Cycle time"));
             assert!(text.contains("Escalation ledger"));
+        }
+
+        fn sample_plan() -> Plan {
+            Plan {
+                goal: "ship it".into(),
+                validation_contract: vec![],
+                considered_alternatives: None,
+                milestones: vec![],
+                command_grants: vec![],
+                touch_set: vec![],
+                standards_manifest: None,
+                reviewer_independence: None,
+            }
+        }
+
+        #[test]
+        fn abandoned_missions_cli_outcomes_section_lists_rows() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-abandoned",
+                vec![
+                    created("goal"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::UserMessage {
+                        text: "steer it".into(),
+                        interrupt: false,
+                    },
+                    EventKind::FeatureCompleted {
+                        feature_id: "f-1".into(),
+                        commits: vec!["abc123".into()],
+                    },
+                    EventKind::MilestoneUnblocked {
+                        milestone_id: "ms-1".into(),
+                        reason: "user skipped findings".into(),
+                        block_context: None,
+                        validator_guidance: None,
+                    },
+                    EventKind::MissionAbandoned {
+                        reason: "operator retired it".into(),
+                    },
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(
+                text.contains("Abandoned (outside the autonomy ratio)\n"),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "  abandoned missions: 1 (1 had completed features)   interventions: 2\n"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "  m-abandoned: 2 interventions (1 steer, 0 grant decisions, 0 revision \
+                     rulings, 1 operator unblock); features completed before abandon: 1\n"
+                ),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn abandoned_missions_cli_outcomes_notes_ratio_divergence() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-abandoned",
+                vec![
+                    created("goal"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::UserMessage {
+                        text: "steer it".into(),
+                        interrupt: false,
+                    },
+                    EventKind::FeatureCompleted {
+                        feature_id: "f-1".into(),
+                        commits: vec!["abc123".into()],
+                    },
+                    EventKind::MilestoneUnblocked {
+                        milestone_id: "ms-1".into(),
+                        reason: "user skipped findings".into(),
+                        block_context: None,
+                        validator_guidance: None,
+                    },
+                    EventKind::MissionAbandoned {
+                        reason: "operator retired it".into(),
+                    },
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(
+                text.contains(
+                    "  note: the autonomy ratio above still counts abandoned missions as \
+                     closed; the published ratio (kranz escalation-metrics) excludes them. \
+                     See .kranz/tickets/outcomes-autonomy-ratio-divergence.md\n"
+                ),
+                "{text}"
+            );
         }
 
         #[test]
@@ -2057,6 +2210,155 @@ mod tests {
             assert!(text.contains("traced: defect-regression → m-1"));
             assert!(text.contains("command: cargo test"));
         }
+
+        #[test]
+        fn abandoned_missions_cli_escalation_section_lists_rows() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-abandoned",
+                vec![
+                    created(),
+                    EventKind::PlanApproved {
+                        plan: kranz_engine::types::Plan {
+                            goal: "ship it".into(),
+                            validation_contract: vec![],
+                            considered_alternatives: None,
+                            milestones: vec![],
+                            command_grants: vec![],
+                            touch_set: vec![],
+                            standards_manifest: None,
+                            reviewer_independence: None,
+                        },
+                        base_sha: None,
+                    },
+                    EventKind::UserMessage {
+                        text: "steer it".into(),
+                        interrupt: false,
+                    },
+                    EventKind::FeatureCompleted {
+                        feature_id: "f-1".into(),
+                        commits: vec!["abc123".into()],
+                    },
+                    EventKind::MilestoneUnblocked {
+                        milestone_id: "ms-1".into(),
+                        reason: "user skipped findings".into(),
+                        block_context: None,
+                        validator_guidance: None,
+                    },
+                    EventKind::MissionAbandoned {
+                        reason: "operator retired it".into(),
+                    },
+                ],
+            );
+
+            let metrics = compute_escalation_metrics(root).unwrap();
+            let text = render_escalation_metrics(&metrics);
+            assert!(
+                text.contains("Abandoned (outside the autonomy ratio)\n"),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "  abandoned missions: 1 (1 had completed features)   interventions: 2\n"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "  m-abandoned: 2 interventions (1 steer, 0 grant decisions, 0 revision \
+                     rulings, 1 operator unblock); features completed before abandon: 1\n"
+                ),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn abandoned_missions_cli_escalation_has_no_divergence_note() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-abandoned",
+                vec![
+                    created(),
+                    EventKind::PlanApproved {
+                        plan: kranz_engine::types::Plan {
+                            goal: "ship it".into(),
+                            validation_contract: vec![],
+                            considered_alternatives: None,
+                            milestones: vec![],
+                            command_grants: vec![],
+                            touch_set: vec![],
+                            standards_manifest: None,
+                            reviewer_independence: None,
+                        },
+                        base_sha: None,
+                    },
+                    EventKind::UserMessage {
+                        text: "steer it".into(),
+                        interrupt: false,
+                    },
+                    EventKind::FeatureCompleted {
+                        feature_id: "f-1".into(),
+                        commits: vec!["abc123".into()],
+                    },
+                    EventKind::MilestoneUnblocked {
+                        milestone_id: "ms-1".into(),
+                        reason: "user skipped findings".into(),
+                        block_context: None,
+                        validator_guidance: None,
+                    },
+                    EventKind::MissionAbandoned {
+                        reason: "operator retired it".into(),
+                    },
+                ],
+            );
+
+            let metrics = compute_escalation_metrics(root).unwrap();
+            let text = render_escalation_metrics(&metrics);
+            assert!(
+                text.contains("Abandoned (outside the autonomy ratio)\n"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("still counts abandoned missions as closed"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn abandoned_missions_cli_absent_when_none() {
+        use kranz_engine::escalation_metrics::compute_escalation_metrics;
+        use kranz_engine::event_log::{EventLog, LockForce};
+        use kranz_engine::outcomes::compute_outcomes;
+        use kranz_engine::paths::MissionPaths;
+        use kranz_engine::types::MissionConfig;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let paths = MissionPaths::new(root, "m-1");
+        let mut log = EventLog::acquire(&paths, "m-1", Duration::ZERO, LockForce::No).unwrap();
+        log.append(EventKind::MissionCreated {
+            goal: "goal".into(),
+            base_branch: "main".into(),
+            mission_branch: "kranz/mission-x".into(),
+            config: MissionConfig::default(),
+        })
+        .unwrap();
+        log.append(EventKind::MissionCompleted {}).unwrap();
+
+        let outcomes = compute_outcomes(root).unwrap();
+        let outcomes_text = render_outcomes(&outcomes);
+        assert!(!outcomes_text.contains("Abandoned (outside the autonomy ratio)"));
+
+        let metrics = compute_escalation_metrics(root).unwrap();
+        let metrics_text = render_escalation_metrics(&metrics);
+        assert!(!metrics_text.contains("Abandoned (outside the autonomy ratio)"));
     }
 
     mod provenance_cli {
@@ -2506,7 +2808,9 @@ mod tests {
                 statement: "cargo test passes".to_string(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".to_string()),
+                milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {

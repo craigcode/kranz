@@ -92,6 +92,7 @@ fn assertion(checker: &str) -> Assertion {
         statement: "An invalid credential cannot authorize a mutation".into(),
         check: AssertionCheck::Command,
         command: Some("sh check.sh".into()),
+        milestone: None,
         pty_script: None,
         negative_control: Some(ControlSpec {
             checker_files: vec![ControlFile {
@@ -110,6 +111,7 @@ fn assertion(checker: &str) -> Assertion {
             timeout_seconds: 5,
             baseline_pair: None,
         }),
+        timeout_secs: None,
     }
 }
 

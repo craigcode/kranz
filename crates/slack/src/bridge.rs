@@ -5339,7 +5339,9 @@ mod tests {
                 statement: "cargo test passes".into(),
                 check: AssertionCheck::Command,
                 command: Some("cargo test".into()),
+                milestone: None,
                 negative_control: None,
+                timeout_secs: None,
                 pty_script: None,
             }],
             milestones: vec![PlanMilestone {

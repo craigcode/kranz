@@ -58,3 +58,8 @@ Approved plans, newest last.
 - 2026-11-14 · [m-7886d9](m-7886d9/plan.md) — Make the hint printed for a parked draft name a route that accepts it: add answers to the ticket, then `kranz abandon <i… [truncated]
 - 2026-11-15 · [m-c22294](m-c22294/plan.md) — Run the engine's existing secret scan over each feature's own commit range when the worker's run ends, using the allowli… [truncated] · [report](m-c22294/report.md)
 - 2026-11-16 · [m-2a80fd](m-2a80fd/plan.md) — On Windows, run validation-contract commands under an absolute, worker-unwritable Git-for-Windows POSIX sh when it is av… [truncated]
+- 2026-11-19 · [m-882080](m-882080/plan.md) — Make each milestone validation round judge the milestone only against contract assertions due by that milestone: an asse… [truncated]
+- 2026-11-19 · [m-caf631](m-caf631/plan.md) — Add `git stash` to the built-in worker deny list as one rule that an operator can lift with a grant. Make the worker-den… [truncated]
+- 2026-11-23 · [m-ec06f2](m-ec06f2/plan.md) — Make every fix feature id unique within its milestone, whatever created it (validator finding, final gate, tier escalati… [truncated] · [report](m-ec06f2/report.md)
+- 2026-11-23 · [m-777557](m-777557/plan.md) — Make the limit on engine-run contract `command` assertions configurable: a per-assertion `timeoutSecs` in the plan wins … [truncated] · [report](m-777557/report.md)
+- 2026-11-24 · [m-dd7d22](m-dd7d22/plan.md) — Each mission report states how many times the operator intervened, split by class, and both `kranz escalation-metrics` a… [truncated] · [report](m-dd7d22/report.md)

@@ -2,7 +2,7 @@
 title: Child containment (children are hostile by default)
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-18
+last_verified: 2026-11-23
 verified_against:
   - AGENTS.md
   - crates/engine/src/agent_env.rs
@@ -16,6 +16,17 @@ verified_against:
   - crates/engine/src/validator_snapshot.rs
   - docs/acp-containment.md
 ---
+
+Rechecked 2026-11-23 (UTC) by an agent under the human-note rule in
+`CONVENTIONS.md`: `command_exec.rs` splits its bounded-execution core into a
+typed `BoundedOutcome` (`Completed`/`TimedOut`) and adds
+`run_contract_command_timed`/`run_contract_command_timed_blocking`, so a
+contract `command` assertion's timeout is reported as a timeout instead of an
+ordinary failure, with the wall-clock limit now configurable per assertion
+(`timeoutSecs`) or operator config (`contractCommandTimeoutSecs`). Child
+spawn, the armed process-group kill on timeout and teardown, and the
+sandbox/shell wrap are unchanged. No containment rule, sandbox profile or
+gate signal policy changed, and nothing this note states changed.
 
 Rechecked 2026-11-18 (UTC) by an agent under the human-note rule in `CONVENTIONS.md`: `AGENTS.md`'s Even G2 command line now runs `scripts/check-npm-audit.py` in place of `npm audit --audit-level=high`, and the macOS test `sandbox_fs_tier_reaches_only_its_own_unix_sockets` in `sandbox.rs` now measures the canonical temp path before its socket-length check, so a short symlink to a long directory no longer makes the bind fail. Test code only. No containment rule, sandbox profile or gate signal policy changed, and nothing this note states changed.
 

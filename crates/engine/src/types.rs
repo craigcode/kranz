@@ -616,6 +616,12 @@ pub struct Assertion {
     pub check: AssertionCheck,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// The title of the plan milestone that must satisfy this assertion.
+    /// `None` (every pre-field contract) means the assertion is due at
+    /// every milestone, as before. Additive: skip_serializing_if keeps
+    /// old plans byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<String>,
     /// The scripted terminal session when `check` is `pty-script`
     /// ([`AssertionCheck::PtyScript`]); ignored for every other check.
     /// Additive: `None` in every pre-field contract, and
@@ -626,6 +632,14 @@ pub struct Assertion {
     /// Absent in legacy plans; controls produce advisory evidence only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negative_control: Option<crate::contract_controls::ControlSpec>,
+    /// The wall-clock limit for this command assertion at validation rounds
+    /// and the final gate; applies only when `check` is
+    /// [`AssertionCheck::Command`]. Wins over the operator-only
+    /// `contractCommandTimeoutSecs` config, which wins over the engine
+    /// default. Additive: `None` in every pre-field contract, and
+    /// `skip_serializing_if` keeps old plans byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 /// One scripted terminal session against an interactive target — the
@@ -1792,6 +1806,13 @@ pub struct MissionConfig {
     /// ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_command_timeout_secs: Option<u64>,
+    /// The default wall-clock limit for contract `command` assertions that
+    /// set no per-assertion `timeoutSecs`, in seconds. Absent means 600s
+    /// (`DEFAULT_CONTRACT_COMMAND_TIMEOUT_SECS`); range 1..=14400
+    /// (`MAX_CONTRACT_COMMAND_TIMEOUT_SECS`). Operator-only: it sets how
+    /// long engine-run contract commands may run before they are killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_command_timeout_secs: Option<u64>,
 }
 
 impl Default for MissionConfig {
@@ -1886,6 +1907,7 @@ impl Default for MissionConfig {
             local_backend_allowed_hosts: Vec::new(),
             grant_request_timeout_secs: None,
             agent_command_timeout_secs: None,
+            contract_command_timeout_secs: None,
         }
     }
 }
@@ -2023,6 +2045,24 @@ pub enum ControlCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assertion_due_schema_legacy_roundtrip_is_byte_identical() {
+        let json = r#"{"id":"a1","statement":"the build passes","check":"command","command":"cargo test"}"#;
+        let assertion: Assertion = serde_json::from_str(json).unwrap();
+        assert_eq!(assertion.milestone, None);
+        let reserialized = serde_json::to_string(&assertion).unwrap();
+        assert_eq!(reserialized, json);
+    }
+
+    #[test]
+    fn assertion_due_schema_milestone_roundtrips() {
+        let json = r#"{"id":"a1","statement":"the build passes","check":"command","command":"cargo test","milestone":"M2"}"#;
+        let assertion: Assertion = serde_json::from_str(json).unwrap();
+        assert_eq!(assertion.milestone.as_deref(), Some("M2"));
+        let reserialized = serde_json::to_string(&assertion).unwrap();
+        assert_eq!(reserialized, json);
+    }
 
     #[test]
     fn commands_run_backcompat_defaults_empty() {

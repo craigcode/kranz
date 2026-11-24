@@ -244,22 +244,44 @@ impl MissionEngine {
                 });
                 continue;
             };
-            let (ok, output) = crate::command_exec::run_contract_command_sandboxed(
+            let limit = crate::contract_timeout::resolve(assertion, &self.state.config);
+            let run = crate::command_exec::run_contract_command_timed(
                 &gate_root,
                 command,
+                limit.duration(),
                 &env,
                 &gate_sandbox,
                 &contract_shell,
             )
             .await;
-            if !ok {
+            if run.timed_out {
+                findings.push(Finding {
+                    subject: assertion.id.clone(),
+                    severity: "critical".to_string(),
+                    evidence: scrub::scrub(&format!(
+                        "command timed out after {secs}s (limit for {id}: {secs}s from {source}; \
+                         raise it with the assertion's timeoutSecs or the operator's \
+                         contractCommandTimeoutSecs in ~/.kranz/config.json, at most 14400s) — \
+                         the command did not finish; no failure was observed (shell: {shell}): \
+                         {command}\n{output}",
+                        secs = limit.secs,
+                        id = assertion.id,
+                        source = limit.source.label(),
+                        shell = contract_shell.label(),
+                        output = run.output,
+                    )),
+                    suggested_fix: String::new(),
+                    class: "command-assertion".to_string(),
+                    rule: None,
+                });
+            } else if run.code != Some(0) {
                 findings.push(Finding {
                     subject: assertion.id.clone(),
                     severity: "critical".to_string(),
                     evidence: scrub::scrub(&command_failed_evidence(
                         &contract_shell.label(),
                         command,
-                        &output,
+                        &run.output,
                     )),
                     suggested_fix: String::new(),
                     class: "command-assertion".to_string(),

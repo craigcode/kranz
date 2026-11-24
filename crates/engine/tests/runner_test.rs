@@ -104,7 +104,9 @@ fn assertion(id: &str, command: Option<&str>) -> Assertion {
             AssertionCheck::AgentJudgement
         },
         command: command.map(str::to_string),
+        milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     }
 }
@@ -193,6 +195,7 @@ fn worker_profile_denies_push_publish_network_and_config_extras() {
     for expected in [
         "Bash(git push*)",
         "Bash(git remote add*)",
+        "Bash(git stash*)",
         "Bash(npm publish*)",
         "Bash(yarn publish*)",
         "Bash(pnpm publish*)",

@@ -840,7 +840,9 @@ fn judgement_assertion(id: &str) -> Assertion {
         statement: "orchestrator judges the full diff".into(),
         check: AssertionCheck::AgentJudgement,
         command: None,
+        milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     }
 }
@@ -851,7 +853,9 @@ fn command_assertion(id: &str, command: &str) -> Assertion {
         statement: "a command gate".into(),
         check: AssertionCheck::Command,
         command: Some(command.into()),
+        milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     }
 }

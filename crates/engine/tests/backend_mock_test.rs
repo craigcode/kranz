@@ -583,7 +583,9 @@ async fn scrutiny_task_and_permissions_carry_no_contract_commands() {
         statement: "the build succeeds".into(),
         check: AssertionCheck::Command,
         command: Some("cargo test --workspace".into()),
+        milestone: None,
         negative_control: None,
+        timeout_secs: None,
         pty_script: None,
     }];
 

@@ -560,6 +560,11 @@ const CONFIG_TRUST_RULES: &[ConfigTrustRule] = &[
         runtime: PatchClass::Never,
         reason: "a repository may strengthen reviewer independence, never weaken it",
     },
+    ConfigTrustRule::operator_only(
+        "contractCommandTimeoutSecs",
+        PatchClass::Never,
+        "it sets how long engine-run contract commands may run before they are killed",
+    ),
 ];
 
 fn config_trust_rule(normalized: &str) -> Option<&'static ConfigTrustRule> {
@@ -1446,6 +1451,15 @@ pub fn validate(cfg: &MissionConfig) -> Result<()> {
                 "orchestrator effective model {effective:?} (configured as {:?}) on backend {:?} is below the frontier-model floor",
                 role_cfg.model,
                 kind.as_str()
+            )));
+        }
+    }
+
+    if let Some(timeout) = cfg.contract_command_timeout_secs {
+        if timeout == 0 || timeout > crate::contract_timeout::MAX_CONTRACT_COMMAND_TIMEOUT_SECS {
+            return Err(EngineError::Config(format!(
+                "contractCommandTimeoutSecs must be in 1..={}, got {timeout}",
+                crate::contract_timeout::MAX_CONTRACT_COMMAND_TIMEOUT_SECS
             )));
         }
     }
@@ -3033,6 +3047,53 @@ mod tests {
             "the operator's own layer may still choose it: {:?}",
             as_operator.err()
         );
+    }
+
+    #[test]
+    fn contract_timeout_config_global_layer_parses_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.json");
+        std::fs::write(
+            &global,
+            serde_json::json!({ "contractCommandTimeoutSecs": 5400 }).to_string(),
+        )
+        .unwrap();
+        let cfg = load_layers(&[global]).unwrap();
+        assert_eq!(cfg.contract_command_timeout_secs, Some(5400));
+    }
+
+    #[test]
+    fn contract_timeout_config_project_layer_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project.json");
+        std::fs::write(
+            &project,
+            serde_json::json!({ "contractCommandTimeoutSecs": 7200 }).to_string(),
+        )
+        .unwrap();
+        let err = load_layers_with_roles(&[(project, Layer::Project)])
+            .expect_err("contractCommandTimeoutSecs must be refused from the project layer");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("contractCommandTimeoutSecs"),
+            "the refusal must name the key: {msg}"
+        );
+    }
+
+    #[test]
+    fn contract_timeout_config_validate_rejects_out_of_range() {
+        for bad in [0u64, 14_401] {
+            let cfg = MissionConfig {
+                contract_command_timeout_secs: Some(bad),
+                ..MissionConfig::default()
+            };
+            let err = validate(&cfg)
+                .expect_err(&format!("contractCommandTimeoutSecs {bad} must be refused"));
+            let msg = err.to_string();
+            assert!(msg.contains("contractCommandTimeoutSecs"), "{msg}");
+            assert!(msg.contains(&bad.to_string()), "{msg}");
+            assert!(msg.contains("1..=14400"), "{msg}");
+        }
     }
 
     trait RoleConfigTestExt {

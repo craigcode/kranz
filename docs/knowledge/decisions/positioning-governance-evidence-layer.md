@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-11-16
+last_verified: 2026-11-24
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -14,6 +14,8 @@ verified_against:
   - crates/engine/src/trace_export.rs
   - crates/cli/src/ready.rs
 ---
+
+Rechecked 2026-11-24 (UTC) against `outcomes.rs`: `Outcomes` gained an `abandoned` field that reports abandoned missions beside the autonomy ratio without feeding it. This is evidence reporting; no positioning boundary moved.
 
 Rechecked 2026-11-16 (UTC) against the `ready.rs` change: `kranz ready` lists a missing Windows sandbox host preparation as a host blocker outside the score. It is a readiness report, not an execution primitive. The freeze and the retained surfaces are unchanged.
 
