@@ -20,13 +20,15 @@ So the tag still points at `9742e3a1`, the commit that validation went on to rej
 
 This is the documented behaviour, not a crash. `tag_milestone` in `crates/engine/src/orchestrator.rs` says a pre-existing tag "downgrades to `None` rather than failing the mission". The second completion event is honest about being untagged. What is missing is any sign on the first tag that it was superseded, and any ref for the final state. The warning also reads like a failure when it is the expected path.
 
-## D-X operator decision
+## D-X operator decision (DECIDED 2026-11-24: D-X2)
+
+The operator chose D-X2: write a second tag for each later completion and never move or delete a tag the engine created. The options are kept for the record.
 
 - D-X1: leave the tag where it is. Record the supersession: the later `milestone.completed` carries the commit it completed at, and the report says the tag names an earlier completion.
 - D-X2: write a second tag for each later completion, for example `kranz/<mission>/<milestone>.2`. Every completion keeps a ref and nothing is moved.
 - D-X3: move the tag to the latest completion. This rewrites a ref the engine created. Tags are part of the audit trail, so this needs a stated reason.
 
-D-X2 keeps the most evidence and never rewrites a ref, so it is the suggested default.
+The first completion keeps the plain name `kranz/<mission>/<milestone>`. Later completions take a numbered suffix starting at `.2`. Each `milestone.completed` records the tag it wrote.
 
 ## Scoping answers
 
@@ -38,6 +40,6 @@ D-X2 keeps the most evidence and never rewrites a ref, so it is the suggested de
 
 ## Acceptance hints
 
-- A mission test that completes a milestone, reopens it with a finding, and completes it again. It asserts the chosen behaviour: which refs exist, which commits they name, and what the second `milestone.completed` records.
+- A mission test that completes a milestone, reopens it with a finding, and completes it again. It asserts that both tags exist, that the first still names the first completion's commit, that the second names the later one, and that the second `milestone.completed` records the second tag.
 - A test that a real tag failure still completes the milestone untagged.
 - Anti-vacuity: the test filter matches only the new tests.
