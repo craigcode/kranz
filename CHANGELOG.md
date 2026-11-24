@@ -5,6 +5,12 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: a mission report now carries an `Interventions:` line counting
+  operator interventions by class (grant decisions, steers, revision
+  rulings, operator unblocks). `kranz escalation-metrics` and
+  `kranz outcomes` now also report a separate count of abandoned missions
+  (JSON `.abandoned`), each with its interventions by class and whether any
+  feature had completed before the abandon. Neither autonomy ratio changes.
 - Fixed: on Windows, an acquire of the mission lock that raced another
   process stealing a stale lock could fail with "Access is denied" where it
   should report that the mission is locked. The engine already waited out

@@ -442,6 +442,7 @@ fn outcomes_slack_card_shows_ratio_buckets_and_escalation_count() {
             zero_intervention_missions: 1,
             zero_intervention_share: 0.25,
         },
+        abandoned: Default::default(),
         grant_latency: GrantLatency {
             buckets: vec![
                 LatencyBucket {
@@ -547,6 +548,7 @@ fn outcomes_slack_card_empty_history_renders_gracefully() {
             zero_intervention_missions: 0,
             zero_intervention_share: 0.0,
         },
+        abandoned: Default::default(),
         grant_latency: GrantLatency {
             buckets: vec![
                 LatencyBucket {
