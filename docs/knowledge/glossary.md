@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-23
+last_verified: 2026-11-24
 verified_against:
   - crates/engine/src/contract_timeout.rs
   - crates/engine/src/contract_lint.rs
@@ -26,6 +26,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-24 (UTC) against a test-only change in `contract_lint.rs`: the lint timeout summary test gives its second run its own scratch directory, so the copied Windows sleep fixture is not overwritten while still open. No term changed.
 
 Rechecked 2026-11-23 (UTC) against the configurable contract-command timeout
 (`contract_timeout.rs`, `contract_lint.rs`, `types.rs`, `orchestrator.rs`,

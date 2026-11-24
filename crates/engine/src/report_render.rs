@@ -529,6 +529,11 @@ fn latest_decision_summary<'a>(events: &'a [Event], prefix: &str) -> Option<&'a 
 /// present, else the last event's, since the engine renders the report just
 /// before emitting mission.completed). No scrubbing happens here: all
 /// model-authored text in `state`/`events` was scrubbed at emit time.
+///
+/// Also states the operator-intervention count, split by class (steers,
+/// grant decisions, revision rulings, operator unblocks), via
+/// [`crate::escalation_metrics::mission_interventions`] — the single
+/// classification rule shared with `escalation-metrics` and `outcomes`.
 pub fn render_mission_report(
     state: &MissionState,
     events: &[Event],
@@ -628,6 +633,13 @@ pub fn render_mission_report(
         md,
         "**Cost:** ${:.2} actual{cost_note} vs ${:.2}–${:.2} estimated (expected ${:.2})",
         state.total_cost_usd, estimate.low_usd, estimate.high_usd, estimate.expected_usd
+    );
+    let intervention_counts = crate::escalation_metrics::mission_interventions(&mission.id, events);
+    let _ = writeln!(
+        md,
+        "**Interventions:** {} ({})",
+        intervention_counts.total(),
+        crate::escalation_metrics::format_intervention_classes(&intervention_counts)
     );
 
     let _ = writeln!(md, "\n## Workspace");

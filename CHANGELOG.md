@@ -5,6 +5,19 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: a mission report now carries an `Interventions:` line counting
+  operator interventions by class (grant decisions, steers, revision
+  rulings, operator unblocks). `kranz escalation-metrics` and
+  `kranz outcomes` now also report a separate count of abandoned missions
+  (JSON `.abandoned`), each with its interventions by class and whether any
+  feature had completed before the abandon. Neither autonomy ratio changes.
+- Fixed: on Windows, an acquire of the mission lock that raced another
+  process stealing a stale lock could fail with "Access is denied" where it
+  should report that the mission is locked. The engine already waited out
+  Windows' delete-pending window when creating the lock file; it now does
+  the same for the file-type check before the acquire and for the remove
+  inside the steal. A lock file that really cannot be accessed still
+  reports the denial.
 - Fixed: a fix feature created after an operator-directed repair
   (`unblock-add-fix`) or after a tier escalation no longer reuses an existing
   fix feature id. The mission used to stop with "duplicate

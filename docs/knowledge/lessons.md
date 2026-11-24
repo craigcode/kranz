@@ -2,7 +2,7 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-23
+last_verified: 2026-11-24
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
@@ -11,11 +11,13 @@ verified_against:
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
 
-Rechecked 2026-11-23 (UTC): lessons gained an optional companion check record
+Rechecked 2026-11-24 (UTC): lessons gained an optional companion check record
 (`.kranz/lessons/<mission-id>.check`) and a read-only `kranz lessons list
 [--json] [--needs-check]` listing (see
 [Could a check catch it?](#could-a-check-catch-it) below). Lesson bytes,
 `index.md` and planning injection are unchanged.
+
+Rechecked 2026-11-24 (UTC) against the invariants note's test-only `contract_lint.rs` recheck: no lesson changed.
 
 Rechecked 2026-11-23 (UTC) against the invariants note's contract command
 timeout recheck (a contract `command` assertion's wall-clock limit is now
