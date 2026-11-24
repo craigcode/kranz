@@ -751,14 +751,19 @@ mod tests {
         );
 
         // lint cap (1s) < gate limit (600s, default) -> the gate allows more
-        // time than the lint used.
+        // time than the lint used. A fresh directory: on Windows the sleep
+        // fixture is a copied executable, and the first run's timed-out copy
+        // can still be mapped when this one is written, which fails the copy
+        // with a sharing violation.
+        let scratch2 = tempfile::tempdir().unwrap();
+        let shell2 = resolve_test_shell(&[scratch2.path()]);
         let contract2 = vec![command_assertion(
             "a2",
-            &sleep_for(&shell, scratch.path(), 5_000),
+            &sleep_for(&shell2, scratch2.path(), 5_000),
         )];
         let report2 = run_contract_lint_with_limits(
-            scratch.path(),
-            scratch.path(),
+            scratch2.path(),
+            scratch2.path(),
             None,
             &contract2,
             true,
@@ -766,7 +771,7 @@ mod tests {
             Duration::from_secs(600),
             &[],
             &crate::command_exec::GateSandbox::Disabled,
-            &shell,
+            &shell2,
             &MissionConfig::default(),
         );
         let summary2 = report2.summary();
