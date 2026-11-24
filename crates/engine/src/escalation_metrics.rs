@@ -201,6 +201,92 @@ pub(crate) fn is_engine_lift(reason: &str, context: Option<&crate::types::BlockC
     }
 }
 
+/// Operator-intervention counts, split by class — the same single
+/// intervention set [`mission_escalation`] sums into `interventions`, broken
+/// out per class for reporting (mission report, `escalation-metrics`,
+/// `outcomes`). One classification rule, shared via [`mission_interventions`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterventionCounts {
+    /// `grant.approved` / `grant.denied` — any grant decision.
+    pub grant_decisions: u64,
+    /// `user.message` at/after `plan.approved` — control-command steers.
+    pub steers: u64,
+    /// `plan.revised` / `plan.revision.rejected` — a plan revision ruling.
+    pub revision_rulings: u64,
+    /// `milestone.unblocked` whose reason is an operator decision, not the
+    /// engine-owned workspace-gate lift.
+    pub operator_unblocks: u64,
+}
+
+impl InterventionCounts {
+    pub fn total(&self) -> u64 {
+        self.grant_decisions + self.steers + self.revision_rulings + self.operator_unblocks
+    }
+}
+
+/// Classify `mission_id`'s operator interventions by class — the single
+/// source of truth [`mission_escalation`] folds its `interventions` total
+/// from. `events` may contain other missions' events too (filtered out).
+pub fn mission_interventions(mission_id: &str, events: &[Event]) -> InterventionCounts {
+    let mission_events: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.mission_id == mission_id)
+        .collect();
+
+    let plan_approved_seq = mission_events
+        .iter()
+        .find(|e| matches!(e.kind, EventKind::PlanApproved { .. }))
+        .map(|e| e.seq);
+
+    let mut counts = InterventionCounts::default();
+    for e in &mission_events {
+        match &e.kind {
+            EventKind::UserMessage { .. } => {
+                if let Some(approved_seq) = plan_approved_seq {
+                    if e.seq >= approved_seq {
+                        counts.steers += 1;
+                    }
+                }
+            }
+            EventKind::GrantApproved { .. } | EventKind::GrantDenied { .. } => {
+                counts.grant_decisions += 1;
+            }
+            EventKind::PlanRevised { .. } | EventKind::PlanRevisionRejected { .. } => {
+                counts.revision_rulings += 1;
+            }
+            EventKind::MilestoneUnblocked {
+                reason,
+                block_context,
+                ..
+            } if !is_engine_lift(reason, block_context.as_ref()) => {
+                counts.operator_unblocks += 1;
+            }
+            _ => {}
+        }
+    }
+    counts
+}
+
+/// Render an [`InterventionCounts`] as the one human-readable summary shared
+/// by the mission report and the CLI (`escalation-metrics` / `outcomes`).
+pub fn format_intervention_classes(counts: &InterventionCounts) -> String {
+    fn plural(n: u64, noun: &str) -> String {
+        if n == 1 {
+            format!("{n} {noun}")
+        } else {
+            format!("{n} {noun}s")
+        }
+    }
+    format!(
+        "{}, {}, {}, {}",
+        plural(counts.steers, "steer"),
+        plural(counts.grant_decisions, "grant decision"),
+        plural(counts.revision_rulings, "revision ruling"),
+        plural(counts.operator_unblocks, "operator unblock"),
+    )
+}
+
 /// Pair each `grant.requested` (in seq order) with the `grant.approved` /
 /// `grant.denied` that answered it, returning `(request_index,
 /// Option<decision_index>)` pairs indexing `mission_events`: the earliest
@@ -283,46 +369,31 @@ pub fn mission_escalation(mission_id: &str, events: &[Event]) -> MissionEscalati
         .find(|e| matches!(e.kind, EventKind::PlanApproved { .. }))
         .map(|e| e.seq);
 
-    let mut interventions: u64 = 0;
+    let counts = mission_interventions(mission_id, events);
+    let interventions = counts.total();
     let mut ledger = Vec::new();
 
-    // Steers and decision interventions (the autonomy numerator set).
+    // Steer ledger rows (the classification itself lives in
+    // [`mission_interventions`]; this just needs the matching text/ts).
     for e in &mission_events {
-        match &e.kind {
-            EventKind::UserMessage { text, .. } => {
-                // Classify by SEQUENCE, not wall clock (5th-pass review):
-                // the event log's seq is the order of truth — timestamps
-                // can tie or move backward across a clock step, and either
-                // would silently misclassify a steer as drafting.
-                if let Some(approved_seq) = plan_approved_seq {
-                    if e.seq >= approved_seq {
-                        interventions += 1;
-                        ledger.push(LedgerRow {
-                            ts: e.ts,
-                            mission_id: mission_id.to_string(),
-                            kind: LedgerKind::Steer,
-                            milestone_id: None,
-                            ask: text.clone(),
-                            decision: "steered".to_string(),
-                            latency_ms: None,
-                        });
-                    }
+        if let EventKind::UserMessage { text, .. } = &e.kind {
+            // Classify by SEQUENCE, not wall clock (5th-pass review):
+            // the event log's seq is the order of truth — timestamps
+            // can tie or move backward across a clock step, and either
+            // would silently misclassify a steer as drafting.
+            if let Some(approved_seq) = plan_approved_seq {
+                if e.seq >= approved_seq {
+                    ledger.push(LedgerRow {
+                        ts: e.ts,
+                        mission_id: mission_id.to_string(),
+                        kind: LedgerKind::Steer,
+                        milestone_id: None,
+                        ask: text.clone(),
+                        decision: "steered".to_string(),
+                        latency_ms: None,
+                    });
                 }
             }
-            EventKind::GrantApproved { .. }
-            | EventKind::GrantDenied { .. }
-            | EventKind::PlanRevised { .. }
-            | EventKind::PlanRevisionRejected { .. } => {
-                interventions += 1;
-            }
-            EventKind::MilestoneUnblocked {
-                reason,
-                block_context,
-                ..
-            } if !is_engine_lift(reason, block_context.as_ref()) => {
-                interventions += 1;
-            }
-            _ => {}
         }
     }
 
@@ -1111,5 +1182,230 @@ mod tests {
         assert_eq!(metrics.rubber_stamp.under_ten_seconds, 1);
         assert_eq!(metrics.ledger.len(), 1);
         assert_eq!(metrics.ledger[0].decision, "approved");
+    }
+
+    #[test]
+    fn intervention_classes_counts_each_class_separately() {
+        let events = vec![
+            ev(1, "m-1", 0, created()),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::PlanApproved {
+                    plan: sample_plan(),
+                    base_sha: None,
+                },
+            ),
+            ev(
+                3,
+                "m-1",
+                2_000,
+                EventKind::UserMessage {
+                    text: "steer one".into(),
+                    interrupt: false,
+                },
+            ),
+            ev(
+                4,
+                "m-1",
+                3_000,
+                EventKind::UserMessage {
+                    text: "steer two".into(),
+                    interrupt: false,
+                },
+            ),
+            ev(
+                5,
+                "m-1",
+                4_000,
+                EventKind::GrantApproved {
+                    kind: GrantKind::Command,
+                    command: "cargo test".into(),
+                },
+            ),
+            ev(
+                6,
+                "m-1",
+                5_000,
+                EventKind::GrantDenied {
+                    kind: GrantKind::Command,
+                    command: "cargo build".into(),
+                    reason: "not needed".into(),
+                },
+            ),
+            ev(
+                7,
+                "m-1",
+                6_000,
+                EventKind::PlanRevised {
+                    revision: 1,
+                    plan: sample_plan(),
+                },
+            ),
+            ev(
+                8,
+                "m-1",
+                7_000,
+                EventKind::PlanRevisionRejected {
+                    revision: 2,
+                    reason: "too risky".into(),
+                },
+            ),
+            ev(
+                9,
+                "m-1",
+                8_000,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "user skipped findings".into(),
+                    validator_guidance: None,
+                },
+            ),
+        ];
+        let counts = mission_interventions("m-1", &events);
+        assert_eq!(counts.steers, 2);
+        assert_eq!(counts.grant_decisions, 2);
+        assert_eq!(counts.revision_rulings, 2);
+        assert_eq!(counts.operator_unblocks, 1);
+        assert_eq!(counts.total(), 7);
+    }
+
+    #[test]
+    fn intervention_classes_exclude_engine_lift_and_drafting() {
+        let events = vec![
+            ev(
+                1,
+                "m-1",
+                0,
+                EventKind::UserMessage {
+                    text: "pre-approval drafting".into(),
+                    interrupt: false,
+                },
+            ),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: crate::workspace_gate::GATE_LIFT_REASON.to_string(),
+                    validator_guidance: None,
+                },
+            ),
+        ];
+        let counts = mission_interventions("m-1", &events);
+        assert_eq!(counts, InterventionCounts::default());
+        assert_eq!(counts.total(), 0);
+    }
+
+    #[test]
+    fn intervention_classes_total_matches_mission_escalation() {
+        for (mission_id, events) in anti_vacuity_missions() {
+            let fold = mission_escalation(&mission_id, &events);
+            let counts = mission_interventions(&mission_id, &events);
+            assert_eq!(counts.total(), fold.interventions, "mission {mission_id}");
+        }
+
+        let revision_events = vec![
+            ev(
+                1,
+                "m-1",
+                0,
+                EventKind::PlanRevised {
+                    revision: 1,
+                    plan: sample_plan(),
+                },
+            ),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::PlanRevisionRejected {
+                    revision: 2,
+                    reason: "too risky".into(),
+                },
+            ),
+            ev(3, "m-1", 2_000, EventKind::MissionCompleted {}),
+        ];
+        let fold = mission_escalation("m-1", &revision_events);
+        let counts = mission_interventions("m-1", &revision_events);
+        assert_eq!(counts.total(), fold.interventions);
+
+        let unblock_events = vec![
+            ev(
+                1,
+                "m-1",
+                0,
+                EventKind::MilestoneBlocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "workspace gate: bootstrap failed".into(),
+                },
+            ),
+            ev(
+                2,
+                "m-1",
+                1_000,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: crate::workspace_gate::GATE_LIFT_REASON.to_string(),
+                    validator_guidance: None,
+                },
+            ),
+            ev(
+                3,
+                "m-1",
+                2_000,
+                EventKind::MilestoneBlocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "fix-cycle cap".into(),
+                },
+            ),
+            ev(
+                4,
+                "m-1",
+                3_000,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "user skipped findings".into(),
+                    validator_guidance: None,
+                },
+            ),
+        ];
+        let fold = mission_escalation("m-1", &unblock_events);
+        let counts = mission_interventions("m-1", &unblock_events);
+        assert_eq!(counts.total(), fold.interventions);
+    }
+
+    #[test]
+    fn intervention_classes_format_pluralises() {
+        assert_eq!(
+            format_intervention_classes(&InterventionCounts {
+                steers: 2,
+                grant_decisions: 1,
+                revision_rulings: 0,
+                operator_unblocks: 0,
+            }),
+            "2 steers, 1 grant decision, 0 revision rulings, 0 operator unblocks"
+        );
+        assert_eq!(
+            format_intervention_classes(&InterventionCounts::default()),
+            "0 steers, 0 grant decisions, 0 revision rulings, 0 operator unblocks"
+        );
+        assert_eq!(
+            format_intervention_classes(&InterventionCounts {
+                steers: 1,
+                grant_decisions: 0,
+                revision_rulings: 0,
+                operator_unblocks: 1,
+            }),
+            "1 steer, 0 grant decisions, 0 revision rulings, 1 operator unblock"
+        );
     }
 }
