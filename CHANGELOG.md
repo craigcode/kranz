@@ -5,6 +5,13 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: `kranz lessons list [--json] [--needs-check]`, a read-only listing
+  of captured lessons with whether a deterministic check could catch the
+  same mistake. The classification lives in a companion record,
+  `.kranz/lessons/<mission-id>.check`: the orchestrator proposes a value at
+  lesson capture, an operator can set their own by hand, and the operator's
+  value wins. `--needs-check` shows checkable lessons with no linked check.
+  Lesson files and the lessons index are unchanged.
 - Added: a mission report now carries an `Interventions:` line counting
   operator interventions by class (grant decisions, steers, revision
   rulings, operator unblocks). `kranz escalation-metrics` and

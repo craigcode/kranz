@@ -123,7 +123,7 @@ absorb it. Per the [scoping decision](../scoping/repo-knowledge-store.md)
 Each captured lesson may have a companion record,
 `.kranz/lessons/<mission-id>.check`, that says whether a deterministic check
 (an approval-lint rule, a preflight rule, or a gate) could catch the same
-mistake. It is a plain `key: value` text file — deliberately **not**
+mistake. It is a plain `key: value` text file, deliberately **not**
 `.md`, so it can never be mistaken for a lesson body and the renderer that
 injects lessons into planning never reads it:
 
@@ -139,7 +139,7 @@ comment. `orchestrator` and `operator` take one of `checkable`,
 `not-checkable`, or `unclassified`. The **operator's value wins** over the
 orchestrator's when both are set; if neither is set, or the file doesn't
 exist, the lesson reads as `unclassified`. Every lesson captured before this
-record existed therefore reads as `unclassified` — there is no backfill.
+record existed therefore reads as `unclassified`. There is no backfill.
 
 The record is a separate file, not a field inside the lesson or the index,
 so that writing or editing it can never change a lesson's bytes or its
@@ -152,8 +152,8 @@ The orchestrator *proposes* a value at lesson capture: it ends its lesson
 reply with a trailing `CHECK: checkable` or `CHECK: not-checkable` line,
 which the engine strips out of the saved lesson body and instead records as
 the initial `orchestrator:` value of the `.check` file. Operators classify or
-link a check by hand — editing the `.check` file directly and committing it,
-the same as any other repo file — setting `operator:` and/or `link:` (a path
+link a check by hand. They edit the `.check` file directly and commit it,
+the same as any other repo file, setting `operator:` and/or `link:` (a path
 or ticket/rule reference, e.g. a line in `AGENTS.md` or the invariants note,
 or a ticket under `.kranz/tickets/`). This is decision **D-X**: both sides
 may classify a lesson, and when they disagree the operator's answer wins.
@@ -162,14 +162,14 @@ may classify a lesson, and when they disagree the operator's answer wins.
 effective classification, oldest first, exactly as they appear in
 `index.md`. It is read-only and takes no engine lock. `--json` emits the
 listing as JSON; `--needs-check` narrows it to lessons classified
-`checkable` with no `link:` set — the ones still waiting for someone to
+`checkable` with no `link:` set: the ones still waiting for someone to
 write the check and link it here.
 
 Lesson checks stay a plain ticket/rule link rather than reusing
 `review_memory.rs`'s replay-suite-and-promotion route. That route promotes
-*rule text fed to a reviewer model* — prompt-shaping, which sits on the
+*rule text fed to a reviewer model*. That is prompt-shaping, which sits on the
 frozen side of the
-[positioning note](decisions/positioning-governance-evidence-layer.md) — and
+[positioning note](decisions/positioning-governance-evidence-layer.md). It also
 gates promotion on passing a replay suite of required/prohibited findings,
 which fits a model-judged rule, not a deterministic code check. A lesson
 check, by contrast, is ordinary Rust (or other deterministic) code that ships
