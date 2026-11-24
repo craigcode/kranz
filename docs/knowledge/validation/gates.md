@@ -2,7 +2,7 @@
 title: Mission gates and deterministic safety nets
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-23
+last_verified: 2026-11-24
 verified_against:
   - crates/engine/src/contract_timeout.rs
   - crates/engine/src/contract_lint.rs
@@ -66,6 +66,8 @@ verified_against:
   - docs/tickets.md
   - crates/engine/src/git_ops.rs
 ---
+
+Rechecked 2026-11-24 (UTC) against a test-only change in `contract_lint.rs`: the lint timeout summary test gives its second run its own scratch directory, so the copied Windows sleep fixture is not overwritten while still open. No gate behaviour changed.
 
 Rechecked 2026-11-23 (UTC) against the fix-id change: `findings.rs` picks a fix feature's id cycle as the next free one on the milestone (`next_fix_cycle`), so a repair or a tier escalation no longer reuses an id; `orchestrator.rs` gained comments and tests only. No gate changed.
 
