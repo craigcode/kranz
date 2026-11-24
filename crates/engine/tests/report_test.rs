@@ -635,3 +635,107 @@ fn flight_rules_provenance_pre_flight_rules_report_is_unchanged() {
     );
     assert!(!report.contains("not-evaluated"), "{report}");
 }
+
+// ---------------------------------------------------------------------------
+// f-1-2: the Interventions line
+// ---------------------------------------------------------------------------
+
+#[test]
+fn report_interventions_line_two_steers_one_grant_shows_three() {
+    let state = completed_state();
+    let events = vec![
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::UserMessage {
+                text: "steer one".into(),
+                interrupt: false,
+            },
+        ),
+        ev(
+            4,
+            EventKind::UserMessage {
+                text: "steer two".into(),
+                interrupt: false,
+            },
+        ),
+        ev(
+            5,
+            EventKind::GrantRequested {
+                milestone_id: "ms-1".into(),
+                kind: kranz_engine::types::GrantKind::Command,
+                command: "cargo test".into(),
+            },
+        ),
+        ev(
+            6,
+            EventKind::GrantApproved {
+                kind: kranz_engine::types::GrantKind::Command,
+                command: "cargo test".into(),
+            },
+        ),
+    ];
+    let report = render_mission_report(
+        &state,
+        &events,
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        None,
+    );
+    assert!(
+        report.contains(
+            "**Interventions:** 3 (2 steers, 1 grant decision, 0 revision rulings, 0 operator unblocks)"
+        ),
+        "{report}"
+    );
+}
+
+#[test]
+fn report_interventions_line_zero_renders_zero() {
+    let state = completed_state();
+    let report = render_mission_report(
+        &state,
+        &[],
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        None,
+    );
+    assert!(
+        report.contains(
+            "**Interventions:** 0 (0 steers, 0 grant decisions, 0 revision rulings, 0 operator unblocks)"
+        ),
+        "{report}"
+    );
+}
+
+#[test]
+fn report_interventions_line_follows_cost() {
+    let state = completed_state();
+    let report = render_mission_report(
+        &state,
+        &[],
+        &plan(),
+        &estimate(),
+        std::path::Path::new("/tmp"),
+        None,
+    );
+    let cost_at = report.find("**Cost:**").expect("cost line present");
+    let interventions_at = report
+        .find("**Interventions:**")
+        .expect("interventions line present");
+    let workspace_at = report
+        .find("## Workspace")
+        .expect("workspace section present");
+    assert!(
+        cost_at < interventions_at && interventions_at < workspace_at,
+        "{report}"
+    );
+}
