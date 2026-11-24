@@ -363,6 +363,13 @@ pub fn render_outcomes(outcomes: &Outcomes) -> String {
     }
 
     out.push_str(&render_abandoned_section(&outcomes.abandoned));
+    if outcomes.abandoned.missions > 0 {
+        out.push_str(
+            "  note: the autonomy ratio above still counts abandoned missions as closed; \
+             the published ratio (kranz escalation-metrics) excludes them. See \
+             .kranz/tickets/outcomes-autonomy-ratio-divergence.md\n",
+        );
+    }
 
     let has_history = ratio.closed_missions > 0
         || !outcomes.escalations.is_empty()
@@ -1777,6 +1784,51 @@ mod tests {
         }
 
         #[test]
+        fn abandoned_missions_cli_outcomes_notes_ratio_divergence() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-abandoned",
+                vec![
+                    created("goal"),
+                    EventKind::PlanApproved {
+                        plan: sample_plan(),
+                        base_sha: None,
+                    },
+                    EventKind::UserMessage {
+                        text: "steer it".into(),
+                        interrupt: false,
+                    },
+                    EventKind::FeatureCompleted {
+                        feature_id: "f-1".into(),
+                        commits: vec!["abc123".into()],
+                    },
+                    EventKind::MilestoneUnblocked {
+                        milestone_id: "ms-1".into(),
+                        reason: "user skipped findings".into(),
+                        block_context: None,
+                        validator_guidance: None,
+                    },
+                    EventKind::MissionAbandoned {
+                        reason: "operator retired it".into(),
+                    },
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let text = render_outcomes(&outcomes);
+            assert!(
+                text.contains(
+                    "  note: the autonomy ratio above still counts abandoned missions as \
+                     closed; the published ratio (kranz escalation-metrics) excludes them. \
+                     See .kranz/tickets/outcomes-autonomy-ratio-divergence.md\n"
+                ),
+                "{text}"
+            );
+        }
+
+        #[test]
         fn outcomes_report_cli_text_renders_class_reuse_and_stamp_sections() {
             let tmp = TempDir::new().unwrap();
             let root = tmp.path();
@@ -2218,6 +2270,60 @@ mod tests {
                     "  m-abandoned: 2 interventions (1 steer, 0 grant decisions, 0 revision \
                      rulings, 1 operator unblock); features completed before abandon: 1\n"
                 ),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn abandoned_missions_cli_escalation_has_no_divergence_note() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            seed_mission(
+                root,
+                "m-abandoned",
+                vec![
+                    created(),
+                    EventKind::PlanApproved {
+                        plan: kranz_engine::types::Plan {
+                            goal: "ship it".into(),
+                            validation_contract: vec![],
+                            considered_alternatives: None,
+                            milestones: vec![],
+                            command_grants: vec![],
+                            touch_set: vec![],
+                            standards_manifest: None,
+                            reviewer_independence: None,
+                        },
+                        base_sha: None,
+                    },
+                    EventKind::UserMessage {
+                        text: "steer it".into(),
+                        interrupt: false,
+                    },
+                    EventKind::FeatureCompleted {
+                        feature_id: "f-1".into(),
+                        commits: vec!["abc123".into()],
+                    },
+                    EventKind::MilestoneUnblocked {
+                        milestone_id: "ms-1".into(),
+                        reason: "user skipped findings".into(),
+                        block_context: None,
+                        validator_guidance: None,
+                    },
+                    EventKind::MissionAbandoned {
+                        reason: "operator retired it".into(),
+                    },
+                ],
+            );
+
+            let metrics = compute_escalation_metrics(root).unwrap();
+            let text = render_escalation_metrics(&metrics);
+            assert!(
+                text.contains("Abandoned (outside the autonomy ratio)\n"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("still counts abandoned missions as closed"),
                 "{text}"
             );
         }
