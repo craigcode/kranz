@@ -930,6 +930,21 @@ pub enum EventKind {
         milestone_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tag: Option<String>,
+        /// Full sha the tag names after this completion. Set only when `tag` is set.
+        #[serde(rename = "tagCommit", default, skip_serializing_if = "Option::is_none")]
+        tag_commit: Option<String>,
+        /// The commit the same tag named before it was moved at this completion.
+        /// Set only when the milestone was completed again at a new commit.
+        #[serde(
+            rename = "retaggedFrom",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        retagged_from: Option<String>,
+        /// Set when this completion is untagged but a ref with the milestone's
+        /// tag name may still exist and names an EARLIER completion.
+        #[serde(rename = "staleTag", default, skip_serializing_if = "Option::is_none")]
+        stale_tag: Option<String>,
     },
 
     /// Final contract gate started (plan §4.5).

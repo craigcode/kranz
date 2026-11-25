@@ -882,6 +882,9 @@ fn export_traces_is_regenerable_and_filters_to_validated_passes() {
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".to_string(),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
         ],
     );
@@ -986,6 +989,9 @@ fn export_traces_all_aggregates_and_skips_unreadable_missions() {
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".to_string(),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
         ],
     );
@@ -1116,6 +1122,9 @@ fn write_corpus_mission(repo: &Path, mission_id: &str) {
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".to_string(),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
         ],
     );

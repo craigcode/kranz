@@ -263,6 +263,9 @@ mod tests {
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".to_string(),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
         );
         poll_mission(tmp.path(), "m-01", false, &exporter, &mut cursors)
@@ -330,6 +333,9 @@ mod tests {
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".to_string(),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
         );
 

@@ -1994,6 +1994,209 @@ async fn multi_milestone_worktree_mode_preserves_a1_a6_a7() {
 }
 
 // -----------------------------------------------------------------------
+// f-3-1: worktree-mode re-completion (reopen + retag) proving the same
+// tag-move guarantee `mission_test.rs`'s `milestone_retag_*` tests exercise
+// in CHECKOUT mode also holds when tagging happens via the mission
+// integration worktree, with the primary checkout left byte-untouched.
+// -----------------------------------------------------------------------
+
+/// A one-milestone, one-feature plan carrying the given validation contract
+/// (mirrors `mission_test.rs`'s `simple_plan`, which integration test files
+/// cannot share).
+fn one_feature_plan_with(contract: Vec<Assertion>) -> Plan {
+    Plan {
+        validation_contract: contract,
+        ..one_feature_plan()
+    }
+}
+
+/// The orchestrator streaming script, generalized over an arbitrary reply
+/// sequence (mirrors `mission_test.rs`'s `orch_script`, which integration
+/// test files cannot share).
+fn orch_script(replies: Vec<String>) -> MockScript {
+    MockScript::streaming(vec![mock_init("orch-session"), mock_result_text("ready")]).responding(
+        replies
+            .iter()
+            .map(|reply| vec![mock_text(reply), mock_result_text(reply)])
+            .collect(),
+    )
+}
+
+/// Conversion-turn reply that waives the one finding instead of fixing it
+/// (mirrors `mission_test.rs`'s `waive_reply`).
+fn waive_reply(subject: &str, reason: &str) -> String {
+    json!({
+        "fixFeatures": [],
+        "waived": [{ "subject": subject, "reason": reason }],
+        "summary": "not worth a fix round"
+    })
+    .to_string()
+}
+
+/// Worker script like [`worker_pass`], but writes a chosen file with chosen
+/// content instead of an arbitrary throwaway one, so a fix worker can make a
+/// real contract command assertion start passing (mirrors `mission_test.rs`'s
+/// `worker_pass_writing`).
+fn worker_pass_writing(path: &str, content: &str) -> MockScript {
+    MockScript::single_shot_json(&json!({
+        "result": "pass",
+        "summary": "implemented and tested",
+        "filesTouched": [path],
+        "testsAdded": [],
+        "testEvidence": "all green",
+        "commits": []
+    }))
+    .writes_file(path, content)
+}
+
+/// Same shape as `mission_test.rs`'s
+/// `milestone_retag_after_final_gate_fix_names_fixed_commit`, run in
+/// WORKTREE mode: a final-gate command assertion
+/// (`file_exists_contract("fixed.txt")`) fails, the orchestrator's waive is
+/// refused and a fix feature is synthesized, the fix worker writes
+/// `fixed.txt`, the milestone completes again, the final gate passes, and
+/// the mission completes. Because tagging happens through the mission
+/// integration worktree in this mode, this additionally proves the primary
+/// checkout's branch/HEAD/tracked-tree state are unchanged by the retag.
+#[tokio::test(flavor = "multi_thread")]
+async fn milestone_retag_in_worktree_mode_leaves_primary_untouched() {
+    let Some((_dir, root)) = mission_init_repo() else {
+        return;
+    };
+    let repo = GitRepo::open(&root).expect("open repo");
+    let branch_before = repo.current_branch().unwrap();
+    let head_before = repo.head_sha().unwrap();
+    let status_before = raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]);
+
+    let contract = vec![Assertion {
+        id: "a-1".to_string(),
+        statement: "the build succeeds".to_string(),
+        check: AssertionCheck::Command,
+        command: Some(file_exists_contract("fixed.txt")),
+        milestone: None,
+        negative_control: None,
+        timeout_secs: None,
+        pty_script: None,
+    }];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement_complete(),
+            waive_reply("a-1", "not worth a fix cycle"),
+            dirty_tree_commit_as_is(),
+            judgement_complete(),
+            "Always add a regression test alongside the fix it covers.".to_string(),
+        ]),
+        worker_pass_writing("fixed.txt", "fixed\n"),
+    ]));
+    let backend_dyn: Arc<dyn AgentBackend> = Arc::clone(&backend) as Arc<dyn AgentBackend>;
+
+    let cfg = MissionConfig {
+        max_fix_cycles_per_milestone: 1,
+        ..worktree_cfg()
+    };
+    let mut engine = MissionEngine::create(backend_dyn, &root, GOAL, cfg).expect("create engine");
+    engine.seed_worker_auth_verdict_for_test(AuthVerdict::Inconclusive);
+    engine
+        .approve_plan(one_feature_plan_with(contract))
+        .unwrap();
+
+    let status = timeout(TokioDuration::from_secs(60), engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = EventLog::read_events(&paths.events_file()).expect("read events.jsonl");
+    let completions: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::MilestoneCompleted {
+                milestone_id,
+                tag,
+                tag_commit,
+                retagged_from,
+                stale_tag,
+            } if milestone_id == "ms-1" => Some((
+                tag.clone(),
+                tag_commit.clone(),
+                retagged_from.clone(),
+                stale_tag.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        completions.len(),
+        2,
+        "exactly two milestone.completed events for ms-1: {completions:?}"
+    );
+
+    let tag_name = format!("kranz/{mission_id}/ms-1");
+    let (first_tag, first_commit, first_retagged, _first_stale) = &completions[0];
+    assert_eq!(first_tag.as_deref(), Some(tag_name.as_str()));
+    let first_commit = first_commit
+        .clone()
+        .expect("first completion has a tag_commit");
+    assert_eq!(first_retagged, &None);
+
+    let (second_tag, second_commit, second_retagged, second_stale) = &completions[1];
+    assert_eq!(second_tag.as_deref(), Some(tag_name.as_str()));
+    let second_commit = second_commit
+        .clone()
+        .expect("second completion has a tag_commit");
+    assert_ne!(second_commit, first_commit);
+    assert_eq!(
+        second_retagged.as_deref(),
+        Some(first_commit.as_str()),
+        "retagged_from must equal the first completion's tag_commit"
+    );
+    assert_eq!(second_stale, &None);
+
+    // Exactly one ref under this mission's tag namespace, moved to the
+    // second completion's tag_commit.
+    let refs = raw_git(
+        &root,
+        &["for-each-ref", &format!("refs/tags/kranz/{mission_id}")],
+    );
+    assert_eq!(
+        refs.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "exactly one kranz/<id>/* tag: {refs}"
+    );
+    let peeled = raw_git(
+        &root,
+        &["rev-parse", &format!("refs/tags/{tag_name}^{{commit}}")],
+    );
+    assert_eq!(peeled.trim(), second_commit);
+
+    // The PRIMARY checkout was never touched: same branch, same HEAD, and a
+    // byte-identical tracked-tree status before vs. after the whole run
+    // (tagging happened through the mission integration worktree).
+    assert_eq!(
+        repo.current_branch().unwrap(),
+        branch_before,
+        "primary checkout must never change branches across the whole mission"
+    );
+    assert_eq!(
+        repo.head_sha().unwrap(),
+        head_before,
+        "primary HEAD sha must be unchanged across the whole mission"
+    );
+    assert_eq!(
+        raw_git(&root, &["status", "--porcelain", "--untracked-files=no"]),
+        status_before,
+        "primary tracked-tree status must be byte-identical across the whole mission"
+    );
+}
+
+// -----------------------------------------------------------------------
 // f-2-1: wiring the real auth preflight into both spawn paths, cached once
 // per mission.
 // -----------------------------------------------------------------------

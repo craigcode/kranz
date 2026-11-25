@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Mission m-e7b464. A milestone completed again now moves its tag to the commit that passed. `milestone.completed` records the new commit, the commit the tag left, and a stale tag name when a real git failure leaves the completion untagged. Nothing in the engine reads the tag to pick a commit."
 title: A milestone's tag stays on its first completion after the milestone is completed again
 priority: 3
 schedule: once

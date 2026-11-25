@@ -856,6 +856,9 @@ fn golden_happy_path() {
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".into(),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
         ),
     )
@@ -904,6 +907,9 @@ fn golden_happy_path() {
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-2".into(),
                 tag: Some("v1".into()),
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
         ),
     )
@@ -1273,6 +1279,9 @@ fn unblock_guidance_folds_replaces_and_clears_on_completion() {
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".into(),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
         ),
     )
@@ -1333,6 +1342,9 @@ fn every_status_value_is_reachable() {
         EventKind::MilestoneCompleted {
             milestone_id: "ms-1".into(),
             tag: None,
+            tag_commit: None,
+            retagged_from: None,
+            stale_tag: None,
         }, // ms Complete
         EventKind::MissionPaused {}, // Paused
         EventKind::MissionResumed {},
@@ -1538,6 +1550,9 @@ fn approved_status_full_lifecycle_still_folds_to_complete() {
         EventKind::MilestoneCompleted {
             milestone_id: "ms-1".into(),
             tag: None,
+            tag_commit: None,
+            retagged_from: None,
+            stale_tag: None,
         },
         EventKind::MilestoneStarted {
             milestone_id: "ms-2".into(),
@@ -1553,6 +1568,9 @@ fn approved_status_full_lifecycle_still_folds_to_complete() {
         EventKind::MilestoneCompleted {
             milestone_id: "ms-2".into(),
             tag: None,
+            tag_commit: None,
+            retagged_from: None,
+            stale_tag: None,
         },
         EventKind::MissionCompleted {},
     ]);
@@ -1668,6 +1686,9 @@ fn plan_revision_cannot_change_completed_milestones() {
         EventKind::MilestoneCompleted {
             milestone_id: "ms-1".into(),
             tag: None,
+            tag_commit: None,
+            retagged_from: None,
+            stale_tag: None,
         },
         EventKind::PlanRevisionProposed {
             revision: 1,
@@ -1715,6 +1736,9 @@ fn plan_revision_tolerates_completed_milestone_whitespace() {
         EventKind::MilestoneCompleted {
             milestone_id: "ms-1".into(),
             tag: None,
+            tag_commit: None,
+            retagged_from: None,
+            stale_tag: None,
         },
         EventKind::PlanRevisionProposed {
             revision: 1,
@@ -1867,6 +1891,9 @@ fn dry_run_revised_plan_refuses_completed_milestone_rewrite() {
         EventKind::MilestoneCompleted {
             milestone_id: "ms-1".into(),
             tag: None,
+            tag_commit: None,
+            retagged_from: None,
+            stale_tag: None,
         },
         EventKind::PlanRevisionProposed {
             revision: 1,
@@ -2409,6 +2436,9 @@ fn interpret(actions: &[Action]) -> Vec<Event> {
             Action::MilestoneCompleted(m) => EventKind::MilestoneCompleted {
                 milestone_id: ms(*m),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
             Action::Pause => EventKind::MissionPaused {},
             Action::Resume => EventKind::MissionResumed {},
@@ -4959,4 +4989,104 @@ fn plan_approved_from_planning_still_applies() {
     let state = state_at_active_milestone();
     assert_eq!(state.mission.goal, "build the thing, planned");
     assert_eq!(state.mission.milestones.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// milestone.completed additive fields: tagCommit / retaggedFrom / staleTag
+// ---------------------------------------------------------------------------
+
+/// A pre-field `milestone.completed` log line (only `milestoneId` and `tag`,
+/// predating this feature) still deserializes, defaulting the three new
+/// fields to `None`, and still folds the milestone to `Complete`.
+#[test]
+fn milestone_tag_fields_pre_field_event_defaults_to_none_and_folds_complete() {
+    let old_shape = json!({
+        "seq": 4,
+        "ts": base_ts() + chrono::Duration::seconds(4),
+        "missionId": MISSION,
+        "type": "milestone.completed",
+        "payload": {
+            "milestoneId": "ms-1",
+            "tag": "kranz/m-1/ms-1"
+        }
+    });
+    let event: Event = serde_json::from_value(old_shape).unwrap();
+    match &event.kind {
+        EventKind::MilestoneCompleted {
+            milestone_id,
+            tag,
+            tag_commit,
+            retagged_from,
+            stale_tag,
+        } => {
+            assert_eq!(milestone_id, "ms-1");
+            assert_eq!(tag, &Some("kranz/m-1/ms-1".to_string()));
+            assert_eq!(tag_commit, &None);
+            assert_eq!(retagged_from, &None);
+            assert_eq!(stale_tag, &None);
+        }
+        other => panic!("expected milestone.completed, got {other:?}"),
+    }
+
+    let state = fold(&[
+        ev(1, created()),
+        ev(
+            2,
+            EventKind::PlanApproved {
+                plan: plan(),
+                base_sha: None,
+            },
+        ),
+        ev(
+            3,
+            EventKind::MilestoneStarted {
+                milestone_id: "ms-1".into(),
+                start_sha: "s0".into(),
+            },
+        ),
+        event,
+    ])
+    .unwrap();
+    assert_eq!(milestone(&state, "ms-1").status, MilestoneStatus::Complete);
+}
+
+/// All three fields set serializes with the documented camelCase keys and
+/// round-trips equal; with all three `None` those keys are absent entirely.
+#[test]
+fn milestone_tag_fields_serde_round_trip_and_omission_when_none() {
+    let with_fields = EventKind::MilestoneCompleted {
+        milestone_id: "ms-1".to_string(),
+        tag: Some("kranz/m-1/ms-1".to_string()),
+        tag_commit: Some("deadbeef".to_string()),
+        retagged_from: Some("c0ffee".to_string()),
+        stale_tag: Some("kranz/m-1/ms-1".to_string()),
+    };
+    let json = serde_json::to_value(&with_fields).unwrap();
+    assert_eq!(json["payload"]["tagCommit"], "deadbeef");
+    assert_eq!(json["payload"]["retaggedFrom"], "c0ffee");
+    assert_eq!(json["payload"]["staleTag"], "kranz/m-1/ms-1");
+    let back: EventKind = serde_json::from_value(json).unwrap();
+    match &back {
+        EventKind::MilestoneCompleted { .. } => {
+            assert_eq!(
+                serde_json::to_value(&back).unwrap(),
+                serde_json::to_value(&with_fields).unwrap()
+            );
+        }
+        other => panic!("expected milestone.completed, got {other:?}"),
+    }
+
+    let without_fields = EventKind::MilestoneCompleted {
+        milestone_id: "ms-1".to_string(),
+        tag: None,
+        tag_commit: None,
+        retagged_from: None,
+        stale_tag: None,
+    };
+    let json = serde_json::to_value(&without_fields).unwrap();
+    let payload = json["payload"].as_object().unwrap();
+    assert!(!payload.contains_key("tag"));
+    assert!(!payload.contains_key("tagCommit"));
+    assert!(!payload.contains_key("retaggedFrom"));
+    assert!(!payload.contains_key("staleTag"));
 }

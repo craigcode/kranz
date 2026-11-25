@@ -5254,6 +5254,226 @@ async fn command_assertion_at_final_gate_is_non_waivable() {
 }
 
 // ---------------------------------------------------------------------------
+// 3d-1b. Re-completed milestones move their tag (mission m-dd7d22, f-2-1)
+// ---------------------------------------------------------------------------
+
+/// Same shape as `command_assertion_at_final_gate_is_non_waivable`, except the
+/// fix worker actually makes the command assertion pass: the milestone
+/// completes once, is reopened by the non-waivable finding, then completes
+/// again after the fix lands. The tag must end up naming the commit from the
+/// SECOND completion, with the first completion's commit recorded as
+/// `retaggedFrom` — never left pointing at the stale, since-reopened commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn milestone_retag_after_final_gate_fix_names_fixed_commit() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let contract = vec![assertion(
+        "a-1",
+        "the build succeeds",
+        Some(&file_exists_contract("fixed.txt")),
+    )];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "not worth a fix cycle"),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            "Always add a regression test alongside the fix it covers.".to_string(),
+        ]),
+        worker_pass_writing("fixed.txt", "fixed\n"),
+    ]));
+
+    let cfg = MissionConfig {
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let mission_id = engine.mission_id().to_string();
+    let paths = engine.paths().clone();
+    drop(engine);
+
+    let events = read_log(&paths);
+    let completions: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::MilestoneCompleted {
+                milestone_id,
+                tag,
+                tag_commit,
+                retagged_from,
+                stale_tag,
+            } if milestone_id == "ms-1" => Some((
+                tag.clone(),
+                tag_commit.clone(),
+                retagged_from.clone(),
+                stale_tag.clone(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        completions.len(),
+        2,
+        "exactly two milestone.completed events for ms-1: {completions:?}"
+    );
+
+    let tag_name = format!("kranz/{mission_id}/ms-1");
+    let (first_tag, first_commit, first_retagged, _first_stale) = &completions[0];
+    assert_eq!(first_tag.as_deref(), Some(tag_name.as_str()));
+    let first_commit = first_commit
+        .clone()
+        .expect("first completion has a tag_commit");
+    assert_eq!(first_retagged, &None);
+
+    let (second_tag, second_commit, second_retagged, second_stale) = &completions[1];
+    assert_eq!(second_tag.as_deref(), Some(tag_name.as_str()));
+    let second_commit = second_commit
+        .clone()
+        .expect("second completion has a tag_commit");
+    assert_ne!(second_commit, first_commit);
+    assert_eq!(second_retagged.as_deref(), Some(first_commit.as_str()));
+    assert_eq!(second_stale, &None);
+
+    // Exactly one ref under this mission's tag namespace.
+    let refs = raw_git(
+        &root,
+        &["for-each-ref", &format!("refs/tags/kranz/{mission_id}")],
+    );
+    assert_eq!(
+        refs.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "exactly one tag ref: {refs}"
+    );
+
+    // The ref's peeled commit matches the second completion's tag_commit.
+    let peeled = raw_git(
+        &root,
+        &["rev-parse", &format!("refs/tags/{tag_name}^{{commit}}")],
+    );
+    assert_eq!(peeled.trim(), second_commit);
+
+    // The fix feature's commit is reachable from the tag target, but not
+    // from the first (stale) tag_commit.
+    let fix_commit = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::FeatureCompleted {
+                feature_id,
+                commits,
+            } if feature_id.contains("fix") && !commits.is_empty() => {
+                commits[0].split_whitespace().next().map(str::to_string)
+            }
+            _ => None,
+        })
+        .expect("fix feature completed with a commit");
+    let is_ancestor = |descendant_tip: &str, candidate: &str| -> bool {
+        Command::new("git")
+            .args(["merge-base", "--is-ancestor", candidate, descendant_tip])
+            .current_dir(&root)
+            .status()
+            .expect("spawn git merge-base")
+            .success()
+    };
+    assert!(
+        is_ancestor(&second_commit, &fix_commit),
+        "fix commit {fix_commit} must be an ancestor of (or equal to) the tag target {second_commit}"
+    );
+    assert!(
+        !is_ancestor(&first_commit, &fix_commit),
+        "fix commit {fix_commit} must NOT be reachable from the first (stale) tag_commit {first_commit}"
+    );
+
+    // The tag is a real annotated tag whose message records the re-completion.
+    let obj_type = raw_git(&root, &["cat-file", "-t", &format!("refs/tags/{tag_name}")]);
+    assert_eq!(obj_type.trim(), "tag");
+    let tag_body = raw_git(&root, &["cat-file", "-p", &format!("refs/tags/{tag_name}")]);
+    assert!(
+        tag_body.contains("completed again"),
+        "tag message records the re-completion: {tag_body}"
+    );
+}
+
+/// A conflicting ref (`<tag>/blocker`) pre-exists so git cannot create the
+/// milestone's tag at all — a genuine git failure. The mission must still
+/// complete, untagged, with `tag`/`tag_commit`/`stale_tag` all `None` and no
+/// ref created at that name.
+#[tokio::test(flavor = "multi_thread")]
+async fn milestone_retag_real_tag_failure_completes_untagged() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+
+    let mission_id = engine.mission_id().to_string();
+    let tag_name = format!("kranz/{mission_id}/ms-1");
+    raw_git(&root, &["tag", &format!("{tag_name}/blocker")]);
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::MilestoneCompleted {
+                milestone_id,
+                tag: None,
+                tag_commit: None,
+                stale_tag: None,
+                ..
+            } if milestone_id == "ms-1"
+        )),
+        "milestone.completed must be untagged with no stale_tag: {:?}",
+        event_types(&events)
+    );
+
+    let refs = raw_git(
+        &root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/tags/{tag_name}"),
+        ],
+    );
+    assert!(
+        refs.lines()
+            .all(|l| l.trim() != format!("refs/tags/{tag_name}")),
+        "the real tag name must not exist: {refs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 3d-2. Author-broken command assertions escalate to the operator (f-1-1)
 // ---------------------------------------------------------------------------
 

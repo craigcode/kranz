@@ -675,6 +675,9 @@ mod tests {
             EventKind::MilestoneCompleted {
                 milestone_id: milestone_id.to_string(),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
         )
     }

@@ -735,6 +735,75 @@ fn tag_creates_annotated_tag() {
 }
 
 #[test]
+fn milestone_tag_ref_commit_is_none_for_missing_tag() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, _) = seeded_repo();
+    assert_eq!(repo.tag_commit("kranz/does-not-exist").unwrap(), None);
+}
+
+#[test]
+fn milestone_tag_ref_commit_returns_peeled_head_sha_after_tag() {
+    if !setup() {
+        return;
+    }
+    let (_dir, repo, head) = seeded_repo();
+    repo.tag("kranz/m1", "milestone 1 complete").unwrap();
+
+    assert_eq!(repo.tag_commit("kranz/m1").unwrap(), Some(head));
+}
+
+#[test]
+fn milestone_tag_ref_retag_moves_tag_to_new_head_and_updates_message() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, first_head) = seeded_repo();
+    repo.tag("kranz/m1", "milestone 1 complete").unwrap();
+    assert_eq!(repo.tag_commit("kranz/m1").unwrap(), Some(first_head));
+
+    write(&dir, "README.md", "hello\nsecond commit\n");
+    let second_head = repo.add_all_and_commit("second commit").unwrap();
+
+    repo.retag("kranz/m1", "milestone 1 complete again")
+        .unwrap();
+
+    assert_eq!(repo.tag_commit("kranz/m1").unwrap(), Some(second_head));
+
+    let objtype = raw_git(dir.path(), &["cat-file", "-t", "refs/tags/kranz/m1"]);
+    assert_eq!(objtype.trim(), "tag");
+
+    let message = raw_git(
+        dir.path(),
+        &["for-each-ref", "refs/tags/kranz/m1", "--format=%(contents)"],
+    );
+    assert!(
+        message.contains("milestone 1 complete again"),
+        "message: {message}"
+    );
+}
+
+#[test]
+fn milestone_tag_ref_rejects_flag_shaped_name_without_creating_tag() {
+    if !setup() {
+        return;
+    }
+    let (dir, repo, _) = seeded_repo();
+
+    repo.tag_commit("-d")
+        .expect_err("tag_commit must reject flag-shaped name");
+    repo.retag("-d", "msg")
+        .expect_err("retag must reject flag-shaped name");
+
+    let tags = raw_git(dir.path(), &["tag", "--list"]);
+    assert!(
+        tags.trim().is_empty(),
+        "no tag should have been created: {tags}"
+    );
+}
+
+#[test]
 fn ensure_identity_sets_local_identity_when_missing() {
     if !setup() {
         return;
