@@ -5,17 +5,17 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
-- Changed: `kranz outcomes`'s autonomy ratio now follows the definition
-  published in docs/metrics.md and already used by
-  `kranz escalation-metrics` (`.autonomy`): abandoned missions no longer
-  count as closed missions, operator unblocks now count as interventions
-  (the engine's own workspace-gate lift still does not), and steers are
-  classified by event order (seq) instead of timestamp. The two commands
-  now report the same autonomy ratio for the same repo, where they could
-  previously differ. The same intervention rule also feeds the
-  `Interventions:` figure in a mission's evidence bundle, and the
-  intervention count behind the per-repo autonomy share in
-  `kranz outcomes --all` and `GET /api/cost-per-merged-change`
+- Changed: by operator decision, `kranz outcomes`'s autonomy ratio now
+  follows the definition published in docs/metrics.md and already used
+  by `kranz escalation-metrics` (`.autonomy`): abandoned missions no
+  longer count as closed missions, operator unblocks now count as
+  interventions (the engine's own workspace-gate lift still does not),
+  and steers are classified by event order (seq) instead of timestamp.
+  The two commands now report the same autonomy ratio for the same
+  repo, where they could previously differ. The same intervention rule
+  also feeds the `Interventions:` figure in a mission's evidence
+  bundle, and the intervention count behind the per-repo autonomy
+  share in `kranz outcomes --all` and `GET /api/cost-per-merged-change`
   (`zeroInterventionShare`); that share's denominator still counts
   abandoned missions, as before. The `.abandoned` section itself is
   unchanged. Reported numbers change only for repos with abandoned
