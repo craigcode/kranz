@@ -1,0 +1,311 @@
+# Mission plan — m-e7b464
+
+**Goal:** When a milestone is completed again after a reopen, the engine moves the local tag `kranz/<mission>/<milestone>` to the newly validated commit and records it additively on `milestone.completed` (`tagCommit`, `retaggedFrom`). A real git failure still completes the milestone untagged, and the event says plainly whether a stale tag of that name remains (`staleTag`).
+
+Branch `kranz/mission-m-e7b464` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Authority granted on approval
+
+Approving this plan grants the following to the mission's sessions with no further prompt.
+
+**Commands** (12; each is a prefix, so `x` also allows `x <anything>`):
+- `git diff $KRANZ_BASE_SHA -- crates/engine/src/events.rs`
+- `git diff $KRANZ_BASE_SHA.. -- crates/engine/src/events.rs`
+- `git diff $KRANZ_BASE_SHA -- crates/engine/src/types.rs`
+- `git diff $KRANZ_BASE_SHA.. -- crates/engine/src/orchestrator.rs`
+- `git diff $KRANZ_BASE_SHA.. -- crates/engine/src/milestone_tag.rs`
+- `git diff $KRANZ_BASE_SHA.. -- CHANGELOG.md`
+- `git diff $KRANZ_BASE_SHA.. --stat`
+- `git grep`
+- `git tag --list`
+- `git for-each-ref refs/tags/kranz`
+- `git cat-file -t`
+- `git rev-parse`
+
+**Write paths** (18; glob patterns the mission may change):
+- `crates/engine/src/git_ops.rs`
+- `crates/engine/src/events.rs`
+- `crates/engine/src/orchestrator.rs`
+- `crates/engine/src/milestone_tag.rs`
+- `crates/engine/src/lib.rs`
+- `crates/engine/src/corpus_export.rs`
+- `crates/engine/src/trace_export.rs`
+- `crates/engine/src/reviewer_independence_tests.rs`
+- `crates/engine/tests/git_ops_test.rs`
+- `crates/engine/tests/mission_test.rs`
+- `crates/engine/tests/reducer_test.rs`
+- `crates/engine/tests/report_test.rs`
+- `crates/engine/tests/config_cost_prompts_test.rs`
+- `crates/engine/tests/worktree_isolation.rs`
+- `crates/cli/src/tail.rs`
+- `crates/cli/src/otel/**`
+- `crates/cli/tests/cli_test.rs`
+- `CHANGELOG.md`
+
+## Cost estimate
+
+Estimated **$9.68 – $48.40** (expected ~$22.19). Rough estimate — live usage is authoritative; based on 55 completed mission(s).
+
+Context-fit check (corpus p90 over 66 plan(s): 4778 chars / 25 files):
+- **f-2-1** (Milestone tag outcome module, orchestrator wiring and mission tests) — spec is 7207 chars (corpus p90: 4778)
+
+## Considered alternatives
+
+**Chosen approach:** Move the canonical tag with `git tag -f -a` to the commit that last passed, and record the previous target additively on the event (`retaggedFrom`). The tag name then always checks out the validated tree, and the log keeps the history. The old commit stays reachable from the mission branch because fixes land on top of it. The plan has three milestones so that the event-field sweep (which touches orchestrator.rs) lands before the orchestrator behaviour change, and so that features in the same milestone touch disjoint files.
+
+Rejected shapes:
+- **Keep the first tag and add a numbered ref such as `kranz/<m>/<ms>-2` for each re-completion** — The canonical name keeps checking out the rejected pre-fix tree, which is the exact complaint, and readers would need to know to look for suffixes.
+- **Delete the old tag and create a new one** — Same end state as a force-move, but it takes two steps, so a failure in between leaves no tag at all.
+- **Also archive the superseded target under `kranz/<m>/<ms>-superseded-<n>`** — Adds ref clutter for no gain: the old commit is still reachable from the mission branch and `retaggedFrom` records it. `kranz/<m>/<ms>/...` is impossible because a ref name cannot also be a directory.
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** The git layer can read the commit an annotated tag names (or report that the tag is absent) and can move an existing annotated tag to HEAD while keeping it annotated. Both refuse flag-shaped names without running git.
+  `cargo test -p kranz-engine --test git_ops_test milestone_tag_ref_`
+- **[a2]** A pre-field `milestone.completed` event, with only `milestoneId` and optionally `tag`, still deserializes and folds. The new `tagCommit`, `retaggedFrom` and `staleTag` fields round-trip under those camelCase keys and are omitted from the JSON when unset.
+  `cargo test -p kranz-engine --test reducer_test milestone_tag_fields_`
+- **[a3]** Milestone tag outcome classification against real temporary git repos. A first completion creates the tag. A re-completion at a new HEAD moves the tag and reports the previous commit. A re-completion at the already-tagged commit leaves the tag alone. A ref conflict fails with no stale tag. A failed move leaves the old tag and reports it as stale. Only the failure outcome is classified as a warning.
+  `cargo test -p kranz-engine --lib milestone_tag::`
+- **[a4]** End-to-end (checkout mode): a mission whose milestone completes, is reopened by a final-gate finding, gets a fix commit and completes again ends Complete. Exactly one `kranz/<id>/ms-1` tag exists. It names the commit recorded as `tagCommit` on the second `milestone.completed`, and the fix commit is reachable from it. The second event records `retaggedFrom` equal to the first event's `tagCommit`. A real tag failure (a ref conflict) completes the milestone and the mission untagged, with no `kranz/<id>/ms-1` ref.
+  `cargo test -p kranz-engine --test mission_test milestone_retag_`
+- **[a5]** End-to-end (worktree mode): the same reopen-and-complete-again scenario moves the tag to the fixed commit. The primary checkout's branch, HEAD and tracked tree are unchanged.
+  `cargo test -p kranz-engine --test worktree_isolation milestone_retag_`
+- **[a6]** `kranz tail` renders the three new states of a `milestone.completed` event: tagged, tag moved from an earlier commit, and untagged with a stale tag.
+  `cargo test -p kranz milestone_tag_display_`
+- **[a7]** Anti-vacuity for milestone 1: the new git_ops and event-field filters each match real tests (at least 3 and at least 2), and no test with those name prefixes existed at the base commit.
+  `n1=$(cargo test -p kranz-engine --test git_ops_test milestone_tag_ref_ -- --list 2>/dev/null | grep -c ': test$') && test "$n1" -ge 3 && n2=$(cargo test -p kranz-engine --test reducer_test milestone_tag_fields_ -- --list 2>/dev/null | grep -c ': test$') && test "$n2" -ge 2 && ! git grep -q -E 'fn (milestone_tag_ref_|milestone_tag_fields_)' $KRANZ_BASE_SHA -- crates`
+- **[a8]** Anti-vacuity for milestone 2: the mission-test filter matches at least 2 tests and the lib filter at least 5. The `milestone_tag` module and the `milestone_retag_` tests did not exist at the base commit.
+  `n1=$(cargo test -p kranz-engine --test mission_test milestone_retag_ -- --list 2>/dev/null | grep -c ': test$') && test "$n1" -ge 2 && n2=$(cargo test -p kranz-engine --lib milestone_tag:: -- --list 2>/dev/null | grep -c ': test$') && test "$n2" -ge 5 && ! git cat-file -e $KRANZ_BASE_SHA:crates/engine/src/milestone_tag.rs && ! git grep -q -E 'fn milestone_retag_' $KRANZ_BASE_SHA -- crates`
+- **[a9]** Anti-vacuity for milestone 3: the worktree filter matches at least 1 test and the tail display filter at least 3. Neither existed at the base commit.
+  `n1=$(cargo test -p kranz-engine --test worktree_isolation milestone_retag_ -- --list 2>/dev/null | grep -c ': test$') && test "$n1" -ge 1 && n2=$(cargo test -p kranz milestone_tag_display_ -- --list 2>/dev/null | grep -c ': test$') && test "$n2" -ge 3 && ! git grep -q -E 'fn (milestone_retag_|milestone_tag_display_)' $KRANZ_BASE_SHA -- crates/engine/tests/worktree_isolation.rs crates/cli`
+- **[a10]** The existing tag, final-gate and worktree behaviour still holds: the happy-path tag test, the final-gate non-waivable fix test, the multi-milestone worktree tag test and the primary-untouched worktree test all pass.
+  `cargo test -p kranz-engine --test mission_test -- happy_path_completes_mission_with_tag_and_contract_gate command_assertion_at_final_gate_is_non_waivable && cargo test -p kranz-engine --test worktree_isolation -- multi_milestone_worktree_mode_preserves_a1_a6_a7 primary_checkout_untouched_in_worktree_mode`
+- **[a11]** The full reducer integration suite still passes with the new event fields.
+  `cargo test -p kranz-engine --test reducer_test`
+- **[a12]** Event and type shapes change only additively: `types.rs` is byte-identical to the base, and the `events.rs` diff removes no lines.
+  `git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/types.rs && ! git diff $KRANZ_BASE_SHA -- crates/engine/src/events.rs | grep -q -E '^-([^-]|$)'`
+- **[a13]** The workspace is formatted and every target, including all test files that construct `milestone.completed`, compiles clippy-clean.
+  `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
+- **[a14]** Logging: the expected re-completion paths (tag moved, or tag already on HEAD) log at info level with wording that says the milestone was completed again. Only real git failures log at warn. Tag failures never fail or block the mission. Every `milestone.completed` emitted on a normal completion path accurately describes the ref: `tag` and `tagCommit` are set only when the ref names HEAD at completion, `retaggedFrom` only when the tag was moved, and `staleTag` whenever the milestone completed untagged and a ref of that name may still exist. The skip-milestone path is unchanged apart from carrying the new fields as None. *(agent judgement)*
+- **[a15]** CHANGELOG.md's Unreleased section has an entry describing the new tag behaviour and the three new event fields. It also states that no engine, CLI, server or dashboard code resolves the milestone tag to pick a commit: merge detection uses branch tips, and resume and the report ignore the field, so only humans checking out the tag see the difference. `tag_milestone`'s doc comment no longer claims a pre-existing tag downgrades to None. *(agent judgement)*
+## Contract lint
+
+Each `check: command` assertion above was run once against the untouched base tree at approval time. Suspects are assertions that already pass (or could not reach a verdict) before this plan's work lands — a possible polarity/vacuity bug in the assertion itself. This never blocks approval.
+
+author-bug suspects (already pass / no verdict on the untouched base): [a1] cargo test -p kranz-engine --test git_ops_test milestone_tag_ref_; [a2] cargo test -p kranz-engine --test reducer_test milestone_tag_fields_; [a3] cargo test -p kranz-engine --lib milestone_tag::; [a4] cargo test -p kranz-engine --test mission_test milestone_retag_; [a5] cargo test -p kranz-engine --test worktree_isolation milestone_retag_; [a6] cargo test -p kranz milestone_tag_display_; [a10] cargo test -p kranz-engine --test mission_test -- happy_path_completes_mission_with_tag_and_contract_gate command_assertion_at_final_gate_is_non_waivable && cargo test -p kranz-engine --test worktree_isolation -- multi_milestone_worktree_mode_preserves_a1_a6_a7 primary_checkout_untouched_in_worktree_mode
+base-expected-to-fail (benign): [a7] n1=$(cargo test -p kranz-engine --test git_ops_test milestone_tag_ref_ -- --list 2>/dev/null | grep -c ': test$') && test "$n1" -ge 3 && n2=$(cargo test -p kranz-engine --test reducer_test milestone_tag_fields_ -- --list 2>/dev/null | grep -c ': test$') && test "$n2" -ge 2 && ! git grep -q -E 'fn (milestone_tag_ref_|milestone_tag_fields_)' $KRANZ_BASE_SHA -- crates; [a8] n1=$(cargo test -p kranz-engine --test mission_test milestone_retag_ -- --list 2>/dev/null | grep -c ': test$') && test "$n1" -ge 2 && n2=$(cargo test -p kranz-engine --lib milestone_tag:: -- --list 2>/dev/null | grep -c ': test$') && test "$n2" -ge 5 && ! git cat-file -e $KRANZ_BASE_SHA:crates/engine/src/milestone_tag.rs && ! git grep -q -E 'fn milestone_retag_' $KRANZ_BASE_SHA -- crates; [a9] n1=$(cargo test -p kranz-engine --test worktree_isolation milestone_retag_ -- --list 2>/dev/null | grep -c ': test$') && test "$n1" -ge 1 && n2=$(cargo test -p kranz milestone_tag_display_ -- --list 2>/dev/null | grep -c ': test$') && test "$n2" -ge 3 && ! git grep -q -E 'fn (milestone_retag_|milestone_tag_display_)' $KRANZ_BASE_SHA -- crates/engine/tests/worktree_isolation.rs crates/cli
+not linted (never run on the base): [a11] cargo test -p kranz-engine --test reducer_test; [a12] git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/types.rs && ! git diff $KRANZ_BASE_SHA -- crates/engine/src/events.rs | grep -q -E '^-([^-]|$)'; [a13] cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
+
+Lint commands ran under shell: sh
+
+named contract gates (defect classes):
+- vacuous-filter: FAIL
+  [a10] cargo test filter `happy_path_completes_mission_with_tag_and_contract_gate` collides with an existing test at crates/engine/tests/mission_test.rs:1348 (`fn happy_path_completes_mission_with_tag_and_contract_gate`) — the gate can pass on pre-existing tests with zero implementation; the filter must match ONLY the not-yet-written tests: `cargo test -p kranz-engine --test mission_test -- happy_path_completes_mission_with_tag_and_contract_gate command_assertion_at_final_gate_is_non_waivable && cargo test -p kranz-engine --test worktree_isolation -- multi_milestone_worktree_mode_preserves_a1_a6_a7 primary_checkout_untouched_in_worktree_mode`
+  [a10] cargo test filter `multi_milestone_worktree_mode_preserves_a1_a6_a7` collides with an existing test at crates/engine/tests/worktree_isolation.rs:1882 (`fn multi_milestone_worktree_mode_preserves_a1_a6_a7`) — the gate can pass on pre-existing tests with zero implementation; the filter must match ONLY the not-yet-written tests: `cargo test -p kranz-engine --test mission_test -- happy_path_completes_mission_with_tag_and_contract_gate command_assertion_at_final_gate_is_non_waivable && cargo test -p kranz-engine --test worktree_isolation -- multi_milestone_worktree_mode_preserves_a1_a6_a7 primary_checkout_untouched_in_worktree_mode`
+- wrong-polarity: PASS
+- host-shell-syntax: PASS
+- passes-on-base: FAIL
+  [a1] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo test -p kranz-engine --test git_ops_test milestone_tag_ref_`
+  [a2] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo test -p kranz-engine --test reducer_test milestone_tag_fields_`
+  [a3] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo test -p kranz-engine --lib milestone_tag::`
+  [a4] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo test -p kranz-engine --test mission_test milestone_retag_`
+  [a5] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo test -p kranz-engine --test worktree_isolation milestone_retag_`
+  [a6] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo test -p kranz milestone_tag_display_`
+  [a10] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo test -p kranz-engine --test mission_test -- happy_path_completes_mission_with_tag_and_contract_gate command_assertion_at_final_gate_is_non_waivable && cargo test -p kranz-engine --test worktree_isolation -- multi_milestone_worktree_mode_preserves_a1_a6_a7 primary_checkout_untouched_in_worktree_mode`
+- env-sensitive: PASS
+
+
+## Milestone 1 — Tag primitives and additive event fields
+
+### 1.1 git_ops: read a tag's commit and move an annotated tag
+
+Repository: Rust workspace, engine crate `kranz-engine` at crates/engine. Goal of the wider mission: when a milestone is completed a second time, the engine will move the local annotated tag `kranz/<mission>/<milestone>` to the newly validated commit. This feature adds ONLY the two git primitives the orchestrator will use. Do not touch orchestrator.rs or events.rs.
+
+Context: `GitRepo` in crates/engine/src/git_ops.rs already has `pub fn tag(&self, name, message)` (around line 1887). It refuses a flag-shaped name (leading '-') with `EngineError::Git` before running git, then runs `self.run(&["tag", "--no-sign", "-a", name, "-m", message])`. Git invocations go through the hardened `self.run` / `self.probe` helpers. `self.probe` returns the raw process output with its exit status; see `path_changed_since` around line 1876 for an example. Keep using these helpers so the existing git-config protections (gpg signing disabled, etc.; see crates/engine/src/git_config_protection_tests.rs) apply to the new calls too. `rev_parse` around line 986 shows the flag-guard style.
+
+Add to `impl GitRepo`, next to `tag`, with doc comments in the surrounding style:
+1. `pub fn tag_commit(&self, name: &str) -> Result<Option<String>>`: the full commit sha the tag `refs/tags/<name>` points at, peeled through an annotated tag object (use `rev-parse --verify --quiet refs/tags/<name>^{commit}` via `probe`). Return Ok(None) when the tag does not exist (exit 1 with empty stdout). Return Err(EngineError::Git) on any other failure. Always resolve through the full `refs/tags/` path, never a short name, so a same-named branch cannot stand in. Refuse an empty or flag-shaped name with EngineError::Git before running git.
+2. `pub fn retag(&self, name: &str, message: &str) -> Result<()>`: force-move an annotated tag to HEAD (`tag --no-sign -a -f <name> -m <message>`), creating it if absent. Use the same flag-name guard as `tag`.
+
+Tests go in crates/engine/tests/git_ops_test.rs. Copy the existing `tag_creates_annotated_tag` test around line 712 and its repo-setup helpers. Every new test function name MUST start with `milestone_tag_ref_`, and you need at least 3 such tests. Write the tests first.
+
+Commands: run ONLY `cargo test -p kranz-engine --test git_ops_test milestone_tag_ref_`, plus `cargo fmt --all` and `cargo clippy -p kranz-engine --all-targets -- -D warnings`. Do NOT run unfiltered `cargo test -p kranz-engine` or `--workspace`: the suite outruns the command limit. Add no dependencies.
+
+Done when:
+- milestone_tag_ref_ test: tag_commit returns Ok(None) for a tag that does not exist
+- milestone_tag_ref_ test: after repo.tag(name, msg), tag_commit returns the HEAD commit sha (the peeled commit, not the tag object sha)
+- milestone_tag_ref_ test: after a new commit, retag(name, msg2) makes tag_commit return the new HEAD; `git cat-file -t refs/tags/<name>` is still `tag`; the tag message is msg2
+- milestone_tag_ref_ test: tag_commit and retag both return Err for a flag-shaped name such as `-d`, and no tag is created
+- `cargo test -p kranz-engine --test git_ops_test milestone_tag_ref_` passes and clippy is clean
+
+### 1.2 Additive milestone.completed fields and struct-literal sweep
+
+Repository: Rust workspace. The engine crate `kranz-engine` is at crates/engine, the CLI crate (package `kranz`) at crates/cli. Goal of the wider mission: `milestone.completed` will record exactly which commit the milestone tag names, whether the tag was moved from an earlier completion, and whether a stale tag remains when tagging failed. This feature adds ONLY the event fields and updates every place that constructs or exhaustively matches the variant. Do not change tagging behaviour.
+
+In crates/engine/src/events.rs (around line 928), the variant is currently:
+```
+#[serde(rename = "milestone.completed")]
+MilestoneCompleted {
+    #[serde(rename = "milestoneId")]
+    milestone_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tag: Option<String>,
+},
+```
+Add three fields after `tag`, each with a doc comment:
+- `tag_commit: Option<String>`: full sha the tag names after this completion. Set only when `tag` is set.
+- `retagged_from: Option<String>`: the commit the same tag named before it was moved at this completion. Set only when the milestone was completed again at a new commit.
+- `stale_tag: Option<String>`: set when this completion is untagged but a ref with the milestone's tag name may still exist and names an EARLIER completion.
+Each field must be `#[serde(rename = "tagCommit" | "retaggedFrom" | "staleTag", default, skip_serializing_if = "Option::is_none")]`. Change NOTHING else in events.rs. The diff must only add lines: a contract check fails if any line is removed. crates/engine/src/types.rs must not change at all.
+
+Sweep: every struct-literal construction `EventKind::MilestoneCompleted { milestone_id, tag }` must add `tag_commit: None, retagged_from: None, stale_tag: None`. Every exhaustive pattern without `..` must gain `..`. Known sites (verify with grep for `MilestoneCompleted`):
+- crates/engine/src/orchestrator.rs: about lines 3503, 6801, 6844, 9472. At 6801/6844 just add the None fields; a later feature changes them.
+- crates/engine/src/corpus_export.rs, trace_export.rs, reviewer_independence_tests.rs
+- crates/cli/src/tail.rs:634: the pattern `{ milestone_id, tag }` needs `..`. Do not change its output yet.
+- crates/cli/src/otel/map.rs, crates/cli/src/otel/run.rs
+- crates/cli/tests/cli_test.rs
+- crates/engine/tests/: reducer_test.rs, report_test.rs, config_cost_prompts_test.rs
+All other uses already use `..` and need no change. The reducer (crates/engine/src/reducer.rs:758) uses `..` and needs no change.
+
+Tests in crates/engine/tests/reducer_test.rs, following its existing event-construction and fold patterns. Every new test function name MUST start with `milestone_tag_fields_`, and you need at least 2. Write the tests first:
+(a) a pre-field JSON event for `milestone.completed`, with milestoneId and tag but none of the new keys, in the same serialized Event shape the log uses (see how reducer_test or EventLog reads events), deserializes with all three new fields None and folds the milestone to Complete;
+(b) an event with all three set serializes with keys `tagCommit`, `retaggedFrom`, `staleTag` and round-trips; one with them None serializes without those keys.
+
+Commands: `cargo test -p kranz-engine --test reducer_test milestone_tag_fields_`, `cargo fmt --all`, and `cargo clippy --workspace --all-targets -- -D warnings`. Clippy is how you confirm the sweep compiles every crate's tests; it can take a long while. Do NOT run unfiltered `cargo test -p kranz-engine` or `cargo test --workspace`. Add no dependencies.
+
+Done when:
+- milestone_tag_fields_ test: pre-field milestone.completed JSON deserializes with tag_commit, retagged_from and stale_tag all None and folds the milestone to Complete
+- milestone_tag_fields_ test: an event with all three fields set serializes using camelCase keys tagCommit, retaggedFrom and staleTag and round-trips equal; with all None those keys are absent
+- `git diff` of crates/engine/src/events.rs against the base shows only added lines; crates/engine/src/types.rs is unchanged
+- `cargo clippy --workspace --all-targets -- -D warnings` passes, proving every construction site was swept
+
+
+## Milestone 2 — Re-completed milestones move their tag
+
+### 2.1 Milestone tag outcome module, orchestrator wiring and mission tests
+
+Repository: Rust workspace, engine crate `kranz-engine` at crates/engine.
+
+Problem being fixed (mission m-dd7d22): a milestone completed and the engine tagged HEAD as `kranz/<mission>/<milestone>`. A final-gate finding then reopened that milestone, a fix commit landed, and the milestone completed again. The second tag attempt failed with "tag already exists" and was logged as a warning, so the tag still pointed at the rejected pre-fix commit and the passing commit had no tag. Required behaviour: after a mission finishes, the tag names the commit at which the milestone LAST passed validation, or the event record says plainly that it does not. A tag failure must never fail or block the mission.
+
+Already available from earlier features:
+- `GitRepo::tag(name, msg)` creates an annotated tag at HEAD.
+- `GitRepo::tag_commit(name) -> Result<Option<String>>` returns the peeled commit, or None when the tag is absent.
+- `GitRepo::retag(name, msg)` force-moves an annotated tag to HEAD.
+- `GitRepo::head_sha()`.
+- `EventKind::MilestoneCompleted { milestone_id, tag, tag_commit, retagged_from, stale_tag }`, where the last three are Option<String> (see crates/engine/src/events.rs).
+
+1. Create crates/engine/src/milestone_tag.rs and register it in crates/engine/src/lib.rs as `pub mod milestone_tag;` (or pub(crate), following neighbours). It should contain:
+- `pub enum MilestoneTagOutcome` with variants:
+  - `Created { tag, commit }`
+  - `Moved { tag, commit, previous }`
+  - `AlreadyCurrent { tag, commit }`
+  - `Failed { error: String, stale_tag: Option<String> }`
+- A method returning the four event values (tag, tag_commit, retagged_from, stale_tag).
+- `fn is_failure(&self) -> bool`.
+- `pub fn tag_milestone(repo: &GitRepo, name: &str) -> MilestoneTagOutcome`, which does:
+  - head = repo.head_sha(); existing = repo.tag_commit(name).
+  - Absent: repo.tag(name, "kranz milestone complete"), giving Created.
+  - existing == head: leave the tag, giving AlreadyCurrent. This covers resume-after-crash and a reopen with no new commit.
+  - Otherwise: repo.retag(name, &format!("kranz milestone complete (completed again; previously {existing})")), giving Moved { previous: existing }.
+  - Any git error gives Failed. For stale_tag, re-probe tag_commit(name) after the failure: Ok(None) means stale_tag None; Ok(Some(c)) with c != head means Some(name); a probe error means Some(name), to be conservative.
+  - Logging inside this function:
+    - Created: no log, or debug.
+    - Moved: `tracing::info!` with tag, from and to fields and a message containing "milestone completed again", e.g. "milestone completed again; moved tag to the newly validated commit".
+    - AlreadyCurrent: `tracing::info!` with "milestone completed again; tag already names this commit".
+    - Failed: keep `tracing::warn!(tag, error, "milestone tag failed; completing untagged")`.
+  - Never panic.
+- Lib unit tests in a `#[cfg(test)] mod tests` inside this module, using real temp git repos. Check how other lib tests build a GitRepo in a tempdir, e.g. git_config_protection_tests.rs. Write at least 5 tests:
+  - Created on a fresh repo.
+  - AlreadyCurrent when called twice at the same HEAD.
+  - Moved after a new commit: previous is the old commit and the ref now names the new HEAD.
+  - Failed with stale_tag None on a ref directory/file conflict: pre-create tag `<name>/blocker`, so `<name>` cannot be created.
+  - Failed with stale_tag Some(name) when the move fails while the old tag exists: create the tag, commit, then create the lock file `<git-dir>/refs/tags/<name>.lock` so `git tag -f` fails.
+  - is_failure is true only for Failed.
+
+2. Orchestrator: in crates/engine/src/orchestrator.rs, `fn tag_milestone(&self, milestone_id)` (around line 7386) currently returns Option<String> and warns on any error. Make it return MilestoneTagOutcome by calling `milestone_tag::tag_milestone(self.active_repo(), &name)`, with the name still `kranz/{mission_id}/{milestone_id}`. Always use `active_repo()` so worktree-mode missions tag via the integration worktree and never touch the primary checkout. Replace its doc comment, which currently says a pre-existing tag downgrades to None, with the new behaviour. At the two completion sites (around lines 6793-6801 and 6838-6844, `let tag = self.tag_milestone(&milestone_id); ... self.emit(EventKind::MilestoneCompleted { .. })`), fill all four fields from the outcome. Keep the tag call at exactly its current position, after completion review and external checks. Leave the skip-milestone path (around line 3503: tag None, other fields None) unchanged.
+
+3. Mission tests in crates/engine/tests/mission_test.rs. Every new test name MUST start with `milestone_retag_`, and you need at least 2. Use the helpers in that file: setup, init_repo, make_engine, test_cfg (checkout mode), simple_plan, assertion, orch_script, judgement, dirty_tree_commit_as_is, waive_reply, worker_pass, worker_pass_writing, file_exists_contract, read_log, raw_git, seq_of. Model the reopen flow on `command_assertion_at_final_gate_is_non_waivable` (around line 5178): a contract command assertion `file_exists_contract("fixed.txt")` fails at the final gate, the orchestrator's waive is refused and a fix feature is synthesized, then a fix worker `worker_pass_writing("fixed.txt", ...)` lands the fix and the milestone completes again. This time the final gate passes and the mission completes; end the orchestrator script with a lesson reply, as the happy-path test at ~1348 does. Adjust script order to whatever the engine actually consumes.
+
+(a) `milestone_retag_after_final_gate_fix_names_fixed_commit` asserts:
+- status is Complete;
+- there are exactly two milestone.completed events for ms-1;
+- the first has tag Some(kranz/<id>/ms-1) and a tag_commit, and retagged_from None;
+- the second has the same tag, a tag_commit different from the first, retagged_from == the first's tag_commit, and stale_tag None;
+- `git for-each-ref refs/tags/kranz/<id>` lists exactly one ref;
+- `git rev-parse refs/tags/kranz/<id>/ms-1^{commit}` == the second tag_commit;
+- the fix feature's commit (from its feature.completed `commits`) is an ancestor-or-equal of the tag target and not of the first tag_commit (`git merge-base --is-ancestor`);
+- `git cat-file -t` is `tag`, and the tag message contains "completed again".
+
+(b) `milestone_retag_real_tag_failure_completes_untagged`: before engine.run(), create a conflicting tag `kranz/<id>/ms-1/blocker` in the repo (mission id from engine.mission_id()). Assert status is Complete, milestone.completed has tag, tag_commit and stale_tag all None, and no ref `refs/tags/kranz/<id>/ms-1` exists.
+
+Commands: run ONLY filtered tests: `cargo test -p kranz-engine --lib milestone_tag::`, `cargo test -p kranz-engine --test mission_test milestone_retag_`, and `cargo test -p kranz-engine --test mission_test -- happy_path_completes_mission_with_tag_and_contract_gate command_assertion_at_final_gate_is_non_waivable`. Then run `cargo fmt --all` and `cargo clippy -p kranz-engine --all-targets -- -D warnings`. Never run unfiltered `cargo test -p kranz-engine --lib` or `--workspace`: they outrun the command limit. Do not modify events.rs or types.rs. Add no dependencies.
+
+Done when:
+- lib tests under milestone_tag:: (at least 5) cover Created, AlreadyCurrent, Moved (previous = old commit, ref now at new HEAD), Failed with stale_tag None on a ref conflict, Failed with stale_tag Some on a blocked move, and is_failure only for Failed
+- milestone_retag_after_final_gate_fix_names_fixed_commit: mission Complete; the second milestone.completed has retagged_from == the first tag_commit and tag_commit == the tag's peeled commit; exactly one kranz/<id>/* tag; the fix commit is reachable from the tag and not from the first target; the tag is annotated and its message contains 'completed again'
+- milestone_retag_real_tag_failure_completes_untagged: with a conflicting kranz/<id>/ms-1/blocker tag the mission still completes, milestone.completed has tag, tag_commit and stale_tag all None, and refs/tags/kranz/<id>/ms-1 does not exist
+- the existing happy-path tag test and the final-gate non-waivable test still pass
+- re-completion logs at info with 'milestone completed again'; only real failures warn
+
+
+## Milestone 3 — Worktree coverage and operator surfaces
+
+### 3.1 Worktree-mode re-completion test
+
+Repository: Rust workspace, engine crate `kranz-engine` at crates/engine.
+
+Already implemented: when a milestone is completed a second time (for example after a final-gate finding reopens it and a fix lands), the engine moves the annotated tag `kranz/<mission>/<milestone>` to the newly validated HEAD of the active repo. The tag message says "completed again; previously <sha>". The second `milestone.completed` event records `tag_commit` (the new commit) and `retagged_from` (the old commit). See crates/engine/src/milestone_tag.rs and the `milestone_retag_` tests in crates/engine/tests/mission_test.rs, which exercise this in CHECKOUT mode.
+
+This feature adds ONE test in crates/engine/tests/worktree_isolation.rs proving the same in WORKTREE mode, where tagging happens via the integration worktree and the primary checkout stays untouched. Name it `milestone_retag_in_worktree_mode_leaves_primary_untouched`; the name MUST start with `milestone_retag_`.
+
+Use that file's helpers: mission_init_repo, worktree_cfg, raw_git, worker_pass, dirty_tree_commit_as_is, judgement_complete, file_exists_contract, and patterns from `primary_checkout_untouched_in_worktree_mode` (around line 1224) and `multi_milestone_worktree_mode_preserves_a1_a6_a7` (around line 1882, which checks tags). For the reopen flow, mirror `milestone_retag_after_final_gate_fix_names_fixed_commit` in mission_test.rs:
+- a command contract assertion `file_exists_contract("fixed.txt")` fails at the final gate;
+- the orchestrator's waive is refused and a fix feature is synthesized;
+- the fix worker writes fixed.txt;
+- the milestone completes again;
+- the final gate passes and the mission completes.
+Copy any helper you need, such as waive_reply or a worker that writes a given file, as a local fn: integration test files cannot share helpers.
+
+Assert:
+- the mission is Complete;
+- the second milestone.completed has retagged_from == the first's tag_commit;
+- `refs/tags/kranz/<id>/ms-1^{commit}` equals the second tag_commit;
+- exactly one kranz/<id>/* tag exists;
+- in the PRIMARY root, the current branch and HEAD sha equal their values before the run, and `git status --porcelain --untracked-files=no` is empty.
+
+Commands: run ONLY `cargo test -p kranz-engine --test worktree_isolation milestone_retag_` and `cargo test -p kranz-engine --test worktree_isolation -- multi_milestone_worktree_mode_preserves_a1_a6_a7 primary_checkout_untouched_in_worktree_mode`, plus `cargo fmt --all` and `cargo clippy -p kranz-engine --all-targets -- -D warnings`. Never run unfiltered engine tests. Change no non-test source; if the test reveals a real engine bug, report it in knownGaps with evidence rather than patching around it.
+
+Done when:
+- milestone_retag_in_worktree_mode_leaves_primary_untouched passes: mission Complete, tag moved to the second tag_commit, retagged_from equals the first tag_commit, exactly one kranz/<id>/* tag
+- the primary checkout's branch and HEAD are unchanged and there are no tracked modifications after the run
+- the existing worktree tag and primary-untouched tests still pass
+
+### 3.2 tail display of retag and stale tag, CHANGELOG entry
+
+Repository: Rust workspace. The CLI package is `kranz` at crates/cli; the engine is at crates/engine.
+
+Already implemented: `EventKind::MilestoneCompleted` (crates/engine/src/events.rs) now has `milestone_id`, `tag: Option<String>`, `tag_commit: Option<String>` (sha the tag names after this completion), `retagged_from: Option<String>` (commit the tag named before it was moved because the milestone completed again), and `stale_tag: Option<String>` (completion is untagged but a tag of that name may still name an earlier completion). The engine now moves the milestone tag on re-completion instead of failing with "already exists"; see crates/engine/src/milestone_tag.rs.
+
+1. crates/cli/src/tail.rs, around line 634: the MilestoneCompleted arm currently prints `complete (tag X)` or `complete`. Extend it:
+- tag set, retagged_from None: `complete (tag X)`, as now.
+- tag set, retagged_from set: `complete again (tag X moved from <first 8 chars of retagged_from>)`.
+- tag None, stale_tag Some(S): `complete (untagged; tag S still names an earlier completion)`.
+- Otherwise: `complete`.
+Prefer extracting the note into a small pure fn so it can be unit-tested. Add unit tests whose names MUST start with `milestone_tag_display_`, at least 3 (moved, stale, plain tagged). Put them wherever tail.rs's existing tests live, or in a `#[cfg(test)]` module in tail.rs. They must run under `cargo test -p kranz milestone_tag_display_`.
+
+2. CHANGELOG.md, top `## Unreleased` section: add one `- Fixed:` bullet in the file's existing prose style. It should cover:
+- a milestone completed again after a reopen (for example a final-gate fix) now moves its `kranz/<mission>/<milestone>` tag to the commit that passed, instead of leaving it on the rejected commit;
+- `milestone.completed` gains optional `tagCommit`, `retaggedFrom` and `staleTag`;
+- a real tag failure still completes the milestone untagged, and says so;
+- the expected re-completion is logged at info, not warn;
+- nothing in Kranz resolves the milestone tag to pick a commit: merge detection uses branch tips, and resume and the mission report ignore the tag field, so only someone checking out the tag by hand saw the stale commit.
+
+Commands: `cargo test -p kranz milestone_tag_display_`, `cargo fmt --all`, `cargo clippy -p kranz --all-targets -- -D warnings`. Do not run `cargo test --workspace`. Do not modify engine source, events.rs or types.rs.
+
+Done when:
+- at least 3 milestone_tag_display_ tests pass, covering moved-tag, stale-tag and plain tagged renderings
+- CHANGELOG.md Unreleased has a Fixed entry describing tag moves on re-completion, the three new optional fields, untagged-on-failure honesty, and that no code reads the tag to pick a commit
+- clippy is clean for the kranz package
