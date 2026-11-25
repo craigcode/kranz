@@ -72,6 +72,17 @@ otherwise unchanged.
 
 Rechecked 2026-11-17 (UTC) against the foreground command limit in `runner.rs` and `types.rs`: worker and validator session specs now carry `BASH_DEFAULT_TIMEOUT_MS` and `BASH_MAX_TIMEOUT_MS`, set from config `agentCommandTimeoutSecs` (absent means 1800 seconds, `0` sets neither), so the Claude CLI keeps a long command in the foreground instead of moving it to the background after two minutes. Pipeline stages, their order and the event schema are unchanged.
 
+Rechecked 2026-11-25 (UTC) against the validator grant-parking rule:
+`RunOutcome` (`runner.rs`) now records `tool_calls_after_last_denial`,
+`stopping_denied_command` and `last_tool_call`, and `maybe_park_for_grant`
+(`orchestrator.rs`) offers a validator a grant only for the denial that
+stopped its session; otherwise it records an `orchestrator.decision`
+naming how the session ended, falls back to the existing single validator
+retry, and blocks the milestone with cause `untrusted-validator` and the
+same ending-state reason if the retry is still untrusted
+(`docs/scoping/validator-park-only-when-denial-stopped-it.md`). Pipeline
+stages, their order and the event schema are unchanged.
+
 Rechecked 2026-11-17 (UTC) against the grant wait and stall record: the wait before a parked grant request is denied by default comes from config `grantRequestTimeoutSecs` (absent keeps one hour; `kranz exec` substitutes 300 seconds unless `--grant-wait` or the config key says otherwise), the engine prints one stderr line per request naming the wait and the answering command, and the denial reason states the wait. A worker run that ends without passing after the agent CLI moved one of its commands to the background is recorded as an `orchestrator.decision`, and the first such run per feature is not counted against `maxRespawns` (`docs/scoping/worker-long-command-stall.md`). Pipeline stages, their order and the event schema are unchanged.
 
 Rechecked 2026-11-17 (UTC) against the temp-directory cleanup: on Unix `runner::run_session_to` owns the session's scratch home through `session_scratch::SessionScratch` and removes it after the hook records are folded, on every return path, and the worker spec builder owns it from before it is seeded, so a worker refused before its session starts leaves none; the decompose planner, the read-back reviewer, `ask` and the worker-auth preflight do the same, and the preflight probe now runs in a directory inside its own home, whose name ends in a UUID. The removal runs on the runtime's blocking pool. Nothing is removed on Windows. The `kranz` binary releases its empty git config directory after the runtime is dropped (`main.rs`, `git_ops::release_empty_global_config`). Abandon, `kranz clean` and the server's delete route remove a mission's worktrees that hold only committed files; see "Resumability" below. `EventLog::replaced_an_existing_lock` reports whether an acquire took an existing lock file over. Pipeline stages, event kinds and their order are unchanged. The long-lived orchestrator session's scratch home is still not removed.
