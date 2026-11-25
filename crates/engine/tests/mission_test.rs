@@ -5316,9 +5316,12 @@ async fn milestone_retag_after_final_gate_fix_names_fixed_commit() {
                 tag_commit,
                 retagged_from,
                 stale_tag,
-            } if milestone_id == "ms-1" => {
-                Some((tag.clone(), tag_commit.clone(), retagged_from.clone(), stale_tag.clone()))
-            }
+            } if milestone_id == "ms-1" => Some((
+                tag.clone(),
+                tag_commit.clone(),
+                retagged_from.clone(),
+                stale_tag.clone(),
+            )),
             _ => None,
         })
         .collect();
@@ -5331,7 +5334,9 @@ async fn milestone_retag_after_final_gate_fix_names_fixed_commit() {
     let tag_name = format!("kranz/{mission_id}/ms-1");
     let (first_tag, first_commit, first_retagged, _first_stale) = &completions[0];
     assert_eq!(first_tag.as_deref(), Some(tag_name.as_str()));
-    let first_commit = first_commit.clone().expect("first completion has a tag_commit");
+    let first_commit = first_commit
+        .clone()
+        .expect("first completion has a tag_commit");
     assert_eq!(first_retagged, &None);
 
     let (second_tag, second_commit, second_retagged, second_stale) = &completions[1];
@@ -5366,10 +5371,11 @@ async fn milestone_retag_after_final_gate_fix_names_fixed_commit() {
     let fix_commit = events
         .iter()
         .find_map(|e| match &e.kind {
-            EventKind::FeatureCompleted { feature_id, commits }
-                if feature_id.contains("fix") && !commits.is_empty() =>
-            {
-                Some(commits[0].clone())
+            EventKind::FeatureCompleted {
+                feature_id,
+                commits,
+            } if feature_id.contains("fix") && !commits.is_empty() => {
+                commits[0].split_whitespace().next().map(str::to_string)
             }
             _ => None,
         })
@@ -5452,9 +5458,17 @@ async fn milestone_retag_real_tag_failure_completes_untagged() {
         event_types(&events)
     );
 
-    let refs = raw_git(&root, &["for-each-ref", &format!("refs/tags/{tag_name}")]);
+    let refs = raw_git(
+        &root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/tags/{tag_name}"),
+        ],
+    );
     assert!(
-        refs.trim().is_empty(),
+        refs.lines()
+            .all(|l| l.trim() != format!("refs/tags/{tag_name}")),
         "the real tag name must not exist: {refs}"
     );
 }

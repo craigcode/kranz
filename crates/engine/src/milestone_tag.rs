@@ -297,9 +297,7 @@ mod tests {
 
         // Lock the tag ref so `git tag -f` fails while the old tag still
         // exists.
-        let lock = dir
-            .path()
-            .join(".git/refs/tags/kranz/m-1/ms-1.lock");
+        let lock = dir.path().join(".git/refs/tags/kranz/m-1/ms-1.lock");
         std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         std::fs::write(&lock, "").unwrap();
 
