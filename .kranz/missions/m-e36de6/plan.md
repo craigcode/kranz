@@ -1,0 +1,208 @@
+# Mission plan — m-e36de6
+
+**Goal:** Offer a validator a command grant only when a denial is what stopped its session; when an earlier denial did not stop an untrusted validator, retry within the existing budget or block with a reason that says how the session actually ended.
+
+Branch `kranz/mission-m-e36de6` (from `main`). Approved plan of record; the machine-readable twin is [plan.json](plan.json). Live status: `kranz status` or the dashboard.
+
+## Authority granted on approval
+
+Approving this plan grants the following to the mission's sessions with no further prompt.
+
+**Write paths** (7; glob patterns the mission may change):
+- `crates/engine/src/runner.rs`
+- `crates/engine/src/orchestrator.rs`
+- `crates/engine/tests/runner_test.rs`
+- `crates/engine/tests/mission_test.rs`
+- `docs/scoping/validator-park-only-when-denial-stopped-it.md`
+- `CHANGELOG.md`
+- `docs/knowledge/architecture/mission-pipeline.md`
+
+## Cost estimate
+
+Estimated **$5.40 – $29.31** (expected ~$13.43). Rough estimate — live usage is authoritative; based on 57 completed mission(s).
+
+Context-fit check (corpus p90 over 68 plan(s): 4812 chars / 25 files):
+- **f-1-1** (Runner records whether the last denial stopped the session) — spec is 6278 chars (corpus p90: 4812)
+- **f-1-2** (Orchestrator offers a validator grant only for the stopping denial and names how the session ended) — spec is 5511 chars (corpus p90: 4812)
+- **f-1-3** (Mission tests: no grant for a denial the validator carried on past; stopping denial still parks) — spec is 5519 chars (corpus p90: 4812)
+
+## Considered alternatives
+
+**Chosen approach:** Record where the last denial sits in the session (tool calls after it, stopping command, last tool call) in the runner, gate the existing validator grant park on that evidence, and reuse the existing single retry and untrusted-validator block with a richer reason; one milestone with runner, orchestrator, mission-test and docs features so each worker session stays small.
+
+Rejected shapes:
+- **Treat a denial as stopping only when it is the last tool result of the session** — A parallel tool batch returns results for calls issued before the denial was seen, so a real stopping denial would be missed.
+- **Treat a denial as stopping when the session ends within N events of it** — Event granularity differs by backend (Claude vs Codex text and other events), so any N is arbitrary and backend-dependent.
+- **Add a new event or a new BlockCause to record why the validator session ended** — Touches contract files for information an orchestrator.decision and the existing block reason already carry.
+- **Also apply the rule to the worker deny-grant and egress grant paths** — Outside the ticket's validator scope, and egress denials have no stream position; recorded as open instead.
+
+## Validation contract
+
+Defined before any feature; gates mission completion.
+
+- **[a1]** The runner records, per session, whether its last denied tool result was followed by any further tool call (count), the shell command of a denial that stopped the session, and the session's last tool call; an early denial followed by tool calls records no stopping command, and a denial with no tool call after it records that command.
+  `out=$(cargo test -p kranz-engine --test runner_test session_end_denial 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a2]** The validator session-end description names how the session ended (no report / error result / aborted / failed), its last tool call, and how many tool calls ran after the last denied tool result.
+  `out=$(cargo test -p kranz-engine --lib validator_session_end_summary 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a3]** A validator session with an early denied command, further successful tool calls and a partial end raises no grant request; the validator is retried and, on a clean retry, the mission completes.
+  `out=$(cargo test -p kranz-engine --test mission_test validator_denial_not_stopping_retry 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a4]** When both the primary and the retry validator sessions continue past an early denial and end without a report, no grant request is raised and the milestone blocks with a reason naming how the session ended (no report, its last tool call, and the tool calls after the denial).
+  `out=$(cargo test -p kranz-engine --test mission_test validator_denial_not_stopping_blocks 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a5]** A validator session whose denied command is followed by no further tool call before a partial (non-error) end still parks a grant request naming exactly that command.
+  `out=$(cargo test -p kranz-engine --test mission_test validator_stopping_denial_parks 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a6]** The existing grant-flow mission tests (validator, worker-deny, egress, touch-path, cap, retry and superseded-request grants) still pass.
+  `out=$(cargo test -p kranz-engine --test mission_test grant 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a7]** An incidental denial on a validator that still produces a trusted pass does not park for a grant.
+  `out=$(cargo test -p kranz-engine --test mission_test incidental_denial_on_a_passing_validator_does_not_park 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a8]** Contract files change additively only: no line of events.rs, types.rs, backend.rs or error.rs is removed or modified against the mission base.
+  `! (git diff -U0 $KRANZ_BASE_SHA -- crates/engine/src/events.rs crates/engine/src/types.rs crates/engine/src/backend.rs crates/engine/src/error.rs | grep -E '^-' | grep -qvE '^--- ')`
+- **[a9]** The frozen prompt module is unchanged.
+  `git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/prompts.rs`
+- **[a10]** The grant request wait is unchanged: the one-hour default constant is intact and the grantRequestTimeoutSecs config field is untouched.
+  `grep -q 'pub const DEFAULT_GRANT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);' crates/engine/src/orchestrator.rs && ! (git diff -U0 $KRANZ_BASE_SHA -- crates/engine/src/types.rs | grep -E '^[-+]' | grep -vE '^(---|\+\+\+) ' | grep -q 'grant_request_timeout')`
+- **[a11]** The workspace is formatted.
+  `cargo fmt --all --check`
+- **[a12]** The workspace builds and lints clean with warnings denied, including all test targets.
+  `cargo clippy --workspace --all-targets -- -D warnings`
+- **[a13]** The engine library test suite passes.
+  `out=$(cargo test -p kranz-engine --lib 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+- **[a14]** docs/scoping/validator-park-only-when-denial-stopped-it.md records the stopping rule and the offered-command rule as flagged D-X operator decisions with their rejected alternatives, and records as open and not acted on: the one-hour grant wait question, the operator's one-command-per-call / no-background-agent validator guidance (prompt change deferred under the positioning freeze), the worker deny-grant path's same first-denial shape, and egress grants (no stream position); the CHANGELOG has an Unreleased entry describing the change in user-visible terms. *(agent judgement)*
+## Contract lint
+
+Each `check: command` assertion above was run once against the untouched base tree at approval time. Suspects are assertions that already pass (or could not reach a verdict) before this plan's work lands — a possible polarity/vacuity bug in the assertion itself. This never blocks approval.
+
+author-bug suspects (already pass / no verdict on the untouched base): [a6] out=$(cargo test -p kranz-engine --test mission_test grant 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; [a7] out=$(cargo test -p kranz-engine --test mission_test incidental_denial_on_a_passing_validator_does_not_park 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; [a8] ! (git diff -U0 $KRANZ_BASE_SHA -- crates/engine/src/events.rs crates/engine/src/types.rs crates/engine/src/backend.rs crates/engine/src/error.rs | grep -E '^-' | grep -qvE '^--- '); [a9] git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/prompts.rs; [a10] grep -q 'pub const DEFAULT_GRANT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);' crates/engine/src/orchestrator.rs && ! (git diff -U0 $KRANZ_BASE_SHA -- crates/engine/src/types.rs | grep -E '^[-+]' | grep -vE '^(---|\+\+\+) ' | grep -q 'grant_request_timeout'); [a11] cargo fmt --all --check; [a12] cargo clippy --workspace --all-targets -- -D warnings
+base-expected-to-fail (benign): [a1] out=$(cargo test -p kranz-engine --test runner_test session_end_denial 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; [a2] out=$(cargo test -p kranz-engine --lib validator_session_end_summary 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; [a3] out=$(cargo test -p kranz-engine --test mission_test validator_denial_not_stopping_retry 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; [a4] out=$(cargo test -p kranz-engine --test mission_test validator_denial_not_stopping_blocks 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; [a5] out=$(cargo test -p kranz-engine --test mission_test validator_stopping_denial_parks 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'; [a13] out=$(cargo test -p kranz-engine --lib 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'
+
+Lint commands ran under shell: sh
+
+named contract gates (defect classes):
+- vacuous-filter: PASS
+- wrong-polarity: PASS
+- host-shell-syntax: PASS
+- passes-on-base: FAIL
+  [a6] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `out=$(cargo test -p kranz-engine --test mission_test grant 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+  [a7] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `out=$(cargo test -p kranz-engine --test mission_test incidental_denial_on_a_passing_validator_does_not_park 2>&1) && printf '%s\n' "$out" | grep -qE 'test result: ok\. [1-9][0-9]* passed'`
+  [a8] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `! (git diff -U0 $KRANZ_BASE_SHA -- crates/engine/src/events.rs crates/engine/src/types.rs crates/engine/src/backend.rs crates/engine/src/error.rs | grep -E '^-' | grep -qvE '^--- ')`
+  [a9] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `git diff --quiet $KRANZ_BASE_SHA -- crates/engine/src/prompts.rs`
+  [a10] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `grep -q 'pub const DEFAULT_GRANT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);' crates/engine/src/orchestrator.rs && ! (git diff -U0 $KRANZ_BASE_SHA -- crates/engine/src/types.rs | grep -E '^[-+]' | grep -vE '^(---|\+\+\+) ' | grep -q 'grant_request_timeout')`
+  [a11] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo fmt --all --check`
+  [a12] already exits zero on the untouched base tree — a correctly-scoped "the work landed" assertion must FAIL before the work lands: `cargo clippy --workspace --all-targets -- -D warnings`
+- env-sensitive: PASS
+
+
+## Milestone 1 — A validator is offered a command grant only for the denial that stopped it
+
+### 1.1 Runner records whether the last denial stopped the session
+
+Repo: kranz (Rust workspace). Crate: crates/engine. Read AGENTS.md first (rules on fmt, additive contract files, matching surrounding code).
+
+PROBLEM: `run_session` in crates/engine/src/runner.rs (event loop around lines 513-657) collects every denied shell command of a session into `RunOutcome.denied_commands` (scrubbed, de-duplicated, capped at 16), with no record of WHERE in the session the denial happened. The orchestrator then offers a grant for the first one even when the session carried on for dozens of tool calls after the denial and ended for an unrelated reason. This feature adds the evidence the orchestrator needs; a later feature changes the orchestrator. Do NOT change orchestrator behaviour here.
+
+OPERATOR DECISION D-A (the rule to implement): a denial stopped a session when the session made NO further tool call (no `AgentEvent::ToolUse`) after its LAST denied tool result. Text, Other, Permission* and the terminal Result events after it do not count. ToolResults after the denial do not count either (a parallel tool batch issues all its ToolUse events before any result, so results of calls issued before the denial was seen must not count against it).
+
+ADD three pub fields to `pub struct RunOutcome` in runner.rs (after `backgrounded_commands`), each with a doc comment in the file's style:
+1. `pub tool_calls_after_last_denial: Option<u32>` — None when the session had no denied tool result; otherwise the number of ToolUse events after the last denied ToolResult (Some(0) = the denial stopped the session). Counts ANY denied tool result (whatever `sink.handle` returns true for), not only shell ones.
+2. `pub stopping_denied_command: Option<String>` — Some only when `tool_calls_after_last_denial == Some(0)` AND the last denied result was attributed to a grantable shell tool command (same attribution as `denied_commands`: the command from the immediately preceding ToolUse, `is_grantable_shell_tool`, `scrub::scrub_and_truncate(&summary, MESSAGE_CONTENT_MAX)`, non-blank after trim). It must NOT depend on the 16-entry cap or de-duplication of `denied_commands` (a repeated or 17th denial is still recorded here). If the last denial was a non-shell tool or had no attributable command, this is None even if earlier shell commands were denied.
+3. `pub last_tool_call: Option<String>` — the session's last ToolUse rendered as `<tool>: <summary>`, passed through `scrub::scrub_and_truncate(.., 200)`; None when the session made no tool call.
+
+IMPLEMENTATION HINTS: in the loop, the existing `if let AgentEvent::ToolUse { tool, summary, .. } = &event` block is where to bump the counter (`if let Some(n) = calls_after.as_mut() { *n += 1 }`) and update the last tool call. In the existing denial block (`if sink.handle(..)? { denied_count += 1; if let Some((tool, summary)) = last_tool_use.take() { .. } }`) set the counter to Some(0) and set a `last_denial_command: Option<String>` to the attributed command or None (compute it inside the same `take()` branch; when `take()` yields None, set it to None). At the end compute `stopping_denied_command = if calls_after == Some(0) { last_denial_command } else { None }`. Populate the three fields in the `Ok(RunOutcome { .. })` literal near line 793. Do not change `denied_commands`, `denied_count` or `result` semantics.
+
+SWEEP: there are three other `runner::RunOutcome { .. }` struct literals, all in the test module of crates/engine/src/orchestrator.rs (near lines 13241, 13428, 13460; grep `RunOutcome {`). Add the new fields there with neutral values (None). Do not change anything else in orchestrator.rs.
+
+TESTS (crates/engine/tests/runner_test.rs; follow `denied_commands_captured_from_codex_command_execution` near line 677, which uses MockBackend::with_scripts, MockScript { events, ..Default::default() }, mock_init, mock_tool_use, mock_denied, mock_result_text, run_session, worker_meta; `mock_tool_result(tool, summary)` exists in crates/engine/src/backend_mock.rs). Every new test name MUST start with `session_end_denial_` (contract filter). Write at least:
+- session_end_denial_followed_by_tool_calls_records_no_stopping_command: Bash `grep -n foo src/lib.rs; echo exit` ToolUse, mock_denied, then mock_tool_use(Read)+mock_tool_result, mock_tool_use(Bash, `grep -n foo src/lib.rs`)+mock_tool_result, mock_tool_use("Agent", "check the dashboard")+mock_tool_result("Agent","Async agent launched successfully."), mock_result_text("waiting for the background agent"). Assert tool_calls_after_last_denial == Some(3), stopping_denied_command == None, last_tool_call == Some("Agent: check the dashboard"), denied_commands still contains the grep line.
+- session_end_denial_last_tool_event_records_stopping_command: a successful Read call, then Bash `gc audit --deep` ToolUse, mock_denied, mock_text, mock_result_text. Assert Some(0) and stopping_denied_command == Some("gc audit --deep").
+- session_end_denial_parallel_batch_counts_as_stopping: ToolUse A (Bash `gc lint`), ToolUse B (Read), denied result, successful result, result text. Assert Some(0) and a stopping command is Some (attribution within a batch picks the last ToolUse; assert only `is_some()` plus `tool_calls_after_last_denial == Some(0)` if B is non-shell — note: with B = Read, take() yields Read which is not a shell tool, so stopping_denied_command is None; therefore make B the Bash call and A the Read call, and assert stopping_denied_command == Some("gc lint")).
+- session_end_denial_none_when_nothing_denied: no denial → tool_calls_after_last_denial None, stopping None, last_tool_call Some.
+- session_end_denial_non_shell_last_denial_offers_nothing: earlier Bash denial followed by a tool call, then a Write ToolUse denied as the last tool event → Some(0) but stopping_denied_command None.
+
+RUN ONLY FILTERED TESTS: `cargo test -p kranz-engine --test runner_test session_end_denial` and `cargo test -p kranz-engine --test runner_test denied_commands`. Do NOT run the unfiltered `cargo test -p kranz-engine --lib` (it can exceed your command time limit). Run `cargo build -p kranz-engine --all-targets` to prove the orchestrator test literals compile, then `cargo fmt --all` and `cargo clippy -p kranz-engine --all-targets -- -D warnings` before finishing. Never pipe gate commands into tail/head. Commit your work.
+
+Done when:
+- An early denied Bash command followed by three successful tool calls and a partial end yields tool_calls_after_last_denial == Some(3) and stopping_denied_command == None
+- A denied Bash command with no later tool call yields tool_calls_after_last_denial == Some(0) and stopping_denied_command naming exactly that command
+- In a parallel batch (two ToolUse events, then a denied result, then a successful result) the denial counts as stopping
+- A session with no denial yields tool_calls_after_last_denial == None and stopping_denied_command == None
+- A last denial on a non-shell tool yields stopping_denied_command == None even when an earlier shell command was denied
+- last_tool_call renders the last ToolUse as `<tool>: <summary>`
+- denied_commands and denied_count behaviour is unchanged (existing denied_commands runner tests pass)
+- All tests are named with the prefix session_end_denial_ and pass under `cargo test -p kranz-engine --test runner_test session_end_denial`
+
+### 1.2 Orchestrator offers a validator grant only for the stopping denial and names how the session ended
+
+Repo: kranz (Rust workspace). Crate: crates/engine. Read AGENTS.md first. File: crates/engine/src/orchestrator.rs (very large; read only the regions named here).
+
+CONTEXT: `runner::RunOutcome` (crates/engine/src/runner.rs) now carries three fields added by an earlier feature: `tool_calls_after_last_denial: Option<u32>` (None = no denial in the session; Some(0) = no tool call after the last denied tool result, i.e. the denial stopped the session), `stopping_denied_command: Option<String>` (the shell command of the denial that stopped the session, else None) and `last_tool_call: Option<String>` (`<tool>: <summary>` of the last tool call, scrubbed and bounded). It also still has `denied_commands: Vec<String>` (every denied shell command in the session).
+
+CURRENT BEHAVIOUR (the bug): `fn maybe_park_for_grant` (around line 2381) takes `outcome.denied_commands.first()` and parks the milestone for an operator command grant whenever a validator outcome is untrusted. It is called before the single validator retry (around line 6528) and after it (around line 6635). In mission m-7886d9 a scrutiny validator's compound command was denied, the validator made 33 more tool calls, launched a background `Agent` and ended its turn with no report; the engine parked on the denied command, the grant timed out after an hour and the mission blocked, although the grant was not what the validator needed.
+
+CHANGE 1 — `maybe_park_for_grant`: offer `outcome.stopping_denied_command` instead of `denied_commands.first()` (operator decision D-B: the offered command is the one whose denial stopped the session). When `stopping_denied_command` is None but `denied_commands` is non-empty, do NOT park: emit one decision via `self.emit_decision(&msg, None)?` whose text starts `not offering a grant for `<first denied command>`: ` (render the command with `crate::presentation::visible(..)`), followed by `the denial did not stop the <role label> session; ` and then `validator_session_end_summary(outcome)`; return Ok(false). When both are empty, return Ok(false) silently as today. Update the function's doc comment to describe the stopping rule. Leave the call sites' control flow as is: a non-parking primary falls through to the egress check and the existing single retry; the post-retry call applies the same rule to the retry outcome. Do NOT change `maybe_park_for_worker_deny_grant`, `maybe_park_for_egress_grant`, `park_for_grant`, the grant cap, or the grant wait (`DEFAULT_GRANT_REQUEST_TIMEOUT` must stay `Duration::from_secs(3600)`).
+
+CHANGE 2 — new private fn `validator_session_end_summary(outcome: &runner::RunOutcome) -> String`, placed next to `run_outcome_summary` (around line 8288). Do NOT modify `run_outcome_summary` (judgement.rs also uses it). The text is built from parts joined with `; `:
+(a) how it ended: `SessionExit::Aborted` → `the session was aborted by the engine`; `SessionExit::Failed(msg)` → `the session failed: <tail_chars(msg, 240)>`; result `RunResult::Fail` with exit Completed → `the session ended with an error result`; no `validator_report` otherwise → `the session ended its turn without a report`; a report present → `the session produced a report`.
+(b) `last tool call: `<visible(last_tool_call)>`` when Some, else `it made no tool calls`.
+(c) from tool_calls_after_last_denial: Some(n) with n > 0 → `<n> tool call(s) ran after the last denied tool result`; Some(0) → `the last denied tool result was its final tool event`; None → omitted.
+These exact phrases are relied on by mission tests: `ended its turn without a report`, `last tool call: `, `tool call(s) ran after the last denied tool result`.
+
+CHANGE 3 — wording at the retry and block sites in the validator round (around lines 6545-6556 and 6647-6659): append `; ` + `validator_session_end_summary(&outcome)` to the retry decision text (after the `run_outcome_summary` part) and to the `MilestoneBlocked` reason `"{} validation did not produce a trusted report after retry: {}"` (so the reason names how the retry session ended). Keep `BlockCause::UntrustedValidator`. Do not change the frontier-confirmation block near line 7018. No event, type or schema changes: events.rs, types.rs, backend.rs and error.rs must not change. Do not touch crates/engine/src/prompts.rs.
+
+UNIT TESTS in the orchestrator.rs test module (there is a helper returning `runner::RunOutcome` near line 13427 you can reuse or mirror with struct-update syntax). Every new test name MUST start with `validator_session_end_summary_` (contract filter). Cover: partial/no-report with 33 calls after the denial and last call `Agent: check` → contains `ended its turn without a report`, `last tool call: `Agent: check``, `33 tool call(s) ran after the last denied tool result`; Some(0) → `the last denied tool result was its final tool event`; Aborted → `was aborted`; Failed(msg) → `failed: ` and the message tail; no tool calls → `it made no tool calls`; no denial → no `denied tool result` phrase.
+
+RUN ONLY FILTERED TESTS: `cargo test -p kranz-engine --lib validator_session_end_summary`, and the existing grant mission tests `cargo test -p kranz-engine --test mission_test validator_denial` and `cargo test -p kranz-engine --test mission_test grant_` (their scripted validators end right after the denial, so they must still park). Do NOT run the unfiltered `cargo test -p kranz-engine --lib`. Run `cargo fmt --all` and `cargo clippy -p kranz-engine --all-targets -- -D warnings` before finishing; never pipe gate commands. Commit your work.
+
+Done when:
+- maybe_park_for_grant parks on stopping_denied_command and never on an earlier denied command that did not stop the session
+- When the session had denied commands but none stopped it, an orchestrator.decision starting `not offering a grant for` is emitted and no grant.requested event is raised
+- validator_session_end_summary produces `the session ended its turn without a report`, `last tool call: `<tool>: <summary>``, and `<n> tool call(s) ran after the last denied tool result` for a partial session that continued past a denial
+- validator_session_end_summary describes aborted, failed and error-result endings and the no-tool-call case
+- The untrusted-validator MilestoneBlocked reason and the retry decision include the session-end summary; run_outcome_summary is unchanged
+- Existing validator grant mission tests (validator_denial_*, grant_*) still pass
+- Unit tests are named with the prefix validator_session_end_summary_ and pass under `cargo test -p kranz-engine --lib validator_session_end_summary`
+
+### 1.3 Mission tests: no grant for a denial the validator carried on past; stopping denial still parks
+
+Repo: kranz (Rust workspace). Read AGENTS.md first. File to change: crates/engine/tests/mission_test.rs ONLY (do not change engine source; if a test fails because engine behaviour is wrong, report it in knownGaps rather than editing src).
+
+CONTEXT (already implemented in src): the runner records per validator session whether a denial stopped it (no tool call after the last denied tool result). `maybe_park_for_grant` in crates/engine/src/orchestrator.rs now offers a grant only for the denial that stopped the session; when a session had denials but carried on, it emits an orchestrator.decision starting `not offering a grant for` and falls through to the single validator retry. An untrusted retry blocks the milestone (`milestone.blocked`, cause UntrustedValidator) with a reason that contains the session-end summary, which uses the phrases `the session ended its turn without a report`, `last tool call: `<tool>: <summary>`` and `<n> tool call(s) ran after the last denied tool result`.
+
+READ FIRST (only these regions): mission_test.rs lines ~340-460 (helpers `validator_denied`, `validator_denied_but_passing`, `validator_untrusted_no_denial`, `wait_for_pending_grant`) and the grant tests ~6452-6890 (`validator_denial_grant_approved_extends_grants_and_completes`, `validator_denial_grant_denied_blocks_the_milestone`, `unanswered_grant_request_times_out_to_denied`, `grant_offered_from_the_claude_retry_when_primary_had_no_command`). Mock event helpers live in crates/engine/src/backend_mock.rs: `mock_init`, `mock_text`, `mock_tool_use(tool, summary)`, `mock_tool_result(tool, summary)`, `mock_denied(tool, summary)`, `mock_result_text(text)`, `mock_result_error`; import any not yet imported. MockBackend serves scripts strictly FIFO by session start, and the validator retry consumes the NEXT validator script.
+
+ADD HELPER `validator_denied_then_continued(command: &str) -> MockScript` next to `validator_denied`, with doc comment citing m-7886d9: events = [mock_init("mock-session"), mock_tool_use("Bash", command), mock_denied("Bash", "This Bash command contains multiple operations. The following part requires approval: echo exit"), mock_tool_use("Read", "src/lib.rs"), mock_tool_result("Read", "fn main() {}"), mock_tool_use("Bash", "grep -n main src/lib.rs"), mock_tool_result("Bash", "1:fn main() {}"), mock_tool_use("Agent", "check the dashboard"), mock_tool_result("Agent", "Async agent launched successfully."), mock_result_text("waiting for the background agent to finish")]. The final text is not JSON, so the validator outcome is Partial with no report. Use command = `grep -n main src/lib.rs; echo exit`.
+
+ADD HELPER `validator_stopped_by_denial(command: &str) -> MockScript`: [mock_init, mock_tool_use("Read","src/lib.rs"), mock_tool_result("Read","fn main() {}"), mock_tool_use("Bash", command), mock_denied("Bash", "Permission denied"), mock_text("cannot run the check without that command"), mock_result_text("stopped without a report")] — a partial, NON-error end where the denial is the last tool event.
+
+TEST 1 `validator_denial_not_stopping_retry_completes_without_grant` (#[tokio::test], `if !setup() { return; }`, `let (_dir, root) = init_repo();`). Scripts in this exact order: worker_pass(), orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", ""), no_lesson()]), validator_denied_then_continued(cmd), validator_with(json!([])). cfg = MissionConfig { skip_functional: false, ..test_cfg() }; make_engine; approve_plan(simple_plan(1, vec![])); run with timeout(TEST_TIMEOUT, engine.run()). Assert status Complete; event types do NOT contain "grant.requested"; contain "milestone.completed"; and some orchestrator.decision event's text contains "not offering a grant for" (find the OrchestratorDecision variant's field names in crates/engine/src/events.rs).
+
+TEST 2 `validator_denial_not_stopping_blocks_naming_session_end`. Scripts: worker_pass(), orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]), validator_denied_then_continued(cmd), validator_denied_then_continued(cmd). Same cfg. Assert status Blocked; no "grant.requested"; a `EventKind::MilestoneBlocked { reason, .. }` whose reason contains "ended its turn without a report", "last tool call: `Agent: check the dashboard`" and "3 tool call(s) ran after the last denied tool result"; reducer::fold(&events) gives empty command_grants and no pending_grant_request.
+
+TEST 3 `validator_stopping_denial_parks_for_that_command`. Scripts: worker_pass(), orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]), validator_stopped_by_denial("gc audit --deep"). Same cfg; after approve_plan call `engine.set_grant_request_timeout(Duration::from_millis(0));` (mirrors `unanswered_grant_request_times_out_to_denied`) and run. Assert status Blocked; an `EventKind::GrantRequested { command, milestone_id, .. }` with command == "gc audit --deep" and milestone_id == "ms-1"; "grant.denied" present.
+
+If a test hangs, the script order is wrong: count sessions (worker, orchestrator turns are inside one orch_script, then validator sessions). RUN ONLY FILTERED TESTS: `cargo test -p kranz-engine --test mission_test validator_denial_not_stopping`, `cargo test -p kranz-engine --test mission_test validator_stopping_denial_parks`, and the regression `cargo test -p kranz-engine --test mission_test grant`. Do NOT run unfiltered test suites. Run `cargo fmt --all` and `cargo clippy -p kranz-engine --all-targets -- -D warnings` before finishing; never pipe gate commands. Commit your work.
+
+Done when:
+- validator_denial_not_stopping_retry_completes_without_grant: an early denied command followed by successful tool calls and a partial end raises no grant.request, a `not offering a grant for` decision is recorded, and the mission completes after a clean retry
+- validator_denial_not_stopping_blocks_naming_session_end: with both sessions continuing past the denial, the mission blocks with no grant request and the milestone.blocked reason names that the session ended its turn without a report, its last tool call, and the tool calls after the denial
+- validator_stopping_denial_parks_for_that_command: a denial followed by no tool call and a partial non-error end raises grant.requested naming exactly `gc audit --deep` on ms-1
+- Existing grant mission tests still pass under `cargo test -p kranz-engine --test mission_test grant`
+
+### 1.4 Record the D-X decisions, open questions and changelog entry
+
+Repo: kranz. Read AGENTS.md (Public documentation boundary section) first. Documentation only; do not change any source file.
+
+CONTEXT: this mission changed when a validator is parked for a command grant. Before: `maybe_park_for_grant` (crates/engine/src/orchestrator.rs) offered the first denied shell command of the session whenever the validator outcome was untrusted. Found 2026-11-14 in missions m-373b57 and m-7886d9: in m-7886d9 the scrutiny validator's `grep ...; echo "exit:$?"` had its `echo` part refused, the validator made about 33 more tool calls (about a hundred events), launched a background `Agent` sub-agent and ended its turn with no report; the engine parked on the grep line, the grant timed out after an hour and the mission blocked. Operator guidance (one command per call, no background agents) made the same validation pass with no grant. After: the runner records `tool_calls_after_last_denial`, `stopping_denied_command` and `last_tool_call` on `RunOutcome` (crates/engine/src/runner.rs); the orchestrator offers a grant only for the stopping denial; otherwise it records an orchestrator.decision `not offering a grant for ...` naming how the session ended, uses the existing single validator retry, and if the retry is still untrusted blocks the milestone (cause untrusted-validator) with a reason naming how the session ended (no report / error / aborted / failed, last tool call, tool calls after the last denial). No event or schema changed.
+
+1. CREATE docs/scoping/validator-park-only-when-denial-stopped-it.md, modelled on docs/scoping/worker-long-command-stall.md (read it for tone and structure: plain sentences, short sections). Sections: the cause as read from the m-7886d9 event log (run 266c60e5: denials at seq 470 and 507, 33 tool calls after the last one, last call `Agent` at seq 572, `worker.completed` partial at 574, `grant.requested` at 575); `D-A: when a denial stopped the session (operator decision)` — the rule: no tool call after the last denied tool result; results of calls already issued and text/result events do not count; rejected: `the denial is the last tool result` (misfires on a parallel tool batch) and `the session ends within N events` (event counts differ by backend, so N is arbitrary); `D-B: which command is offered (operator decision)` — the stopping denial's command, not the first denied command; a last denial with no shell command offers nothing; `What was built`; `Not changed here` — (i) the one-hour grant wait before deny-default (`grantRequestTimeoutSecs`), whether it should be shorter or notify is a separate question; (ii) validator prompt guidance (one command per call, no background agents) is deferred because prompts.rs is frozen under docs/knowledge/decisions/positioning-governance-evidence-layer.md; (iii) the worker deny-grant path (`maybe_park_for_worker_deny_grant`) still offers the first denied command and has the same shape; (iv) egress grants are unchanged because proxy denials have no position in the event stream; (v) attribution inside a parallel tool batch can still name the wrong command of the batch (pre-existing, operator-confirmed).
+
+2. CHANGELOG.md: add one `- Fixed:` bullet at the top of the `## Unreleased` list, in the existing style (plain, user-visible): a validator that was denied a command but carried on and later stopped for another reason is no longer parked for a grant on that command; the engine retries it and, if it still has no report, blocks the milestone with a reason saying how the session ended; a denial that was the validator's last tool call still raises a grant request.
+
+3. docs/knowledge/architecture/mission-pipeline.md: add one `Rechecked 2026-11-25 (UTC) against ...` paragraph directly above the existing `Rechecked 2026-11-17 (UTC) against the grant wait and stall record` paragraph (around line 75), in the same style, summarising the new grant rule and stating that pipeline stages, their order and the event schema are unchanged. Do not edit the frontmatter.
+
+Verify with `git diff --stat` that only these three files changed. Commit your work.
+
+Done when:
+- docs/scoping/validator-park-only-when-denial-stopped-it.md exists and flags D-A (stopping rule) and D-B (offered command) as operator decisions with their rejected alternatives
+- The scoping doc lists as not changed: the grant wait, the deferred prompt guidance, the worker deny-grant path, egress grants and parallel-batch attribution
+- CHANGELOG.md Unreleased gains one Fixed entry describing the change in user-visible terms
+- mission-pipeline.md gains one dated recheck paragraph and no other change
+- No source file changed in this feature
