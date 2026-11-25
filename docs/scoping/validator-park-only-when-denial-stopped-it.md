@@ -16,14 +16,16 @@ at seq 572. `worker.completed` recorded a partial result at seq 574, and
 `grant.requested` followed at seq 575.
 
 `maybe_park_for_grant` (`crates/engine/src/orchestrator.rs`) offered the
-first denied shell command of the session whenever the validator outcome
-was untrusted — in this run, the `grep` line from seq 470, not the `echo`
-line that actually ended the session. The engine parked on that grant, the
-grant request timed out after an hour, and the mission blocked. Operator
-guidance to the validator (one command per call, no background agents) made
-the same validation pass with no grant at all, which confirms the denial
-itself was not what sank the run — the 33 calls and the sub-agent after it
-were.
+first denied command of the session whenever the validator outcome was
+untrusted — in this run, the whole `grep ...; echo "exit:$?"` compound
+command from seq 470, even though the session had carried on for about 33
+more tool calls after the seq 507 denial and ended for an unrelated reason:
+it launched a background `Agent` sub-agent and ended its turn without a
+report. The engine parked on that grant, the grant request timed out after
+an hour, and the mission blocked. Operator guidance to the validator (one
+command per call, no background agents) made the same validation pass with
+no grant at all, which confirms the denial itself was not what sank the
+run — the 33 calls and the sub-agent after it were.
 
 ## D-A: when a denial stopped the session (operator decision)
 
@@ -34,12 +36,13 @@ it.
 
 Rejected alternatives:
 
-- **The denial is the last tool result.** This misfires on a parallel tool
-  batch: a batch can return a denied result alongside other results in the
-  same turn, with no further calls in that turn, even though the session
-  goes on to make more calls afterward in a later turn. Counting results
-  instead of calls-after would also wrongly call a denial "stopping" when
-  only its sibling results, not a later call, happened to land after it.
+- **The denial is the last tool result.** In a parallel tool batch the
+  agent issues all of its tool calls before any result comes back, so the
+  results of calls issued alongside a denied one can arrive after the
+  denied result even though those calls were made no later than it. A
+  denial that truly stopped the session can then fail to be the last tool
+  result, and this rule would miss it. This is why D-A counts tool calls
+  made after the denial, and ignores the order of results.
 - **The session ends within N events of the denial.** Event counts between
   a denial and the end of a session differ by backend and by how chatty a
   given validator run is, so any N would be arbitrary. The m-7886d9 run
@@ -50,8 +53,13 @@ Rejected alternatives:
 
 The grant offers the stopping denial's command — the one whose denied tool
 result was the session's last tool call — not the first denied command of
-the session. In m-7886d9 that means the grant, if any were due, would be
-about `echo "exit:$?"`, not `grep ...`.
+the session, and the offered command is the whole command of that stopping
+tool call as recorded, not a fragment of it. In m-7886d9, under D-A no
+denial stopped the session: the last tool call was the background `Agent`
+call at seq 572, not either denial. So no grant is offered; the engine
+records a `not offering a grant for ...` decision, uses the single
+validator retry, and if the retry is still untrusted it blocks the
+milestone with a reason naming how the session ended.
 
 If the last denial carried no shell command (for example, a non-Bash tool
 denial), the grant offers nothing: there is no command whose grant would
@@ -61,10 +69,13 @@ have let the session continue past that point.
 
 - `RunOutcome` (`crates/engine/src/runner.rs`) gains three fields:
   `tool_calls_after_last_denial` (count of tool calls made after the
-  session's last denied tool result), `stopping_denied_command` (the shell
-  command of that last denial, when the denial stopped the session and the
-  denial had one), and `last_tool_call` (the name of the session's final
-  tool call, for use in a block reason when no grant is offered).
+  session's last denied tool result; any tool's denial counts, not only a
+  shell one; `None` when the session had no denied tool result),
+  `stopping_denied_command` (the shell command of that last denial, when
+  the denial stopped the session and the denial had one), and
+  `last_tool_call` (the session's last tool call rendered as
+  `<tool>: <summary>`, scrubbed and bounded to 200 characters, for use in a
+  block reason when no grant is offered).
 - `maybe_park_for_grant` (`crates/engine/src/orchestrator.rs`) offers a
   grant only when `tool_calls_after_last_denial` is zero and
   `stopping_denied_command` is present. Otherwise it records an
