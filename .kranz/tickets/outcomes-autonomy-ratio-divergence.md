@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Mission m-87118c. `kranz outcomes` now computes its autonomy ratio by the published definition, and a test folds one log through both `outcomes.rs` and `escalation_metrics.rs`. The per-repo share in `kranz outcomes --all` still counts abandoned missions in its denominator."
 title: kranz outcomes autonomy ratio diverges from the published definition
 priority: 3
 schedule: once

@@ -10,6 +10,22 @@ Notable user-visible changes are documented here. This project follows
   command; the engine retries it and, if it still has no report, blocks
   the milestone with a reason saying how the session ended. A denial that
   was the validator's last tool call still raises a grant request.
+- Changed: by operator decision, `kranz outcomes`'s autonomy ratio now
+  follows the definition published in docs/metrics.md and already used
+  by `kranz escalation-metrics` (`.autonomy`): abandoned missions no
+  longer count as closed missions, operator unblocks now count as
+  interventions (the engine's own workspace-gate lift still does not),
+  and steers are classified by event order (seq) instead of timestamp.
+  The two commands now report the same autonomy ratio for the same
+  repo, where they could previously differ. The same intervention rule
+  also feeds the `Interventions:` figure in a mission's evidence
+  bundle, and the intervention count behind the per-repo autonomy
+  share in `kranz outcomes --all` and `GET /api/cost-per-merged-change`
+  (`zeroInterventionShare`); that share's denominator still counts
+  abandoned missions, as before. The `.abandoned` section itself is
+  unchanged. Reported numbers change only for repos with abandoned
+  missions, operator unblocks, or steers recorded with out-of-order
+  timestamps.
 - Changed: validators can no longer pass git options that write a file or
   run a program. `git diff`, `git log` and `git show` were allowed by prefix,
   which also admitted `--output`, `--ext-diff`, `--textconv` and

@@ -66,4 +66,5 @@ Approved plans, newest last.
 - 2026-11-24 · [m-6112e3](m-6112e3/plan.md) — Record, for each captured lesson, whether a deterministic check could catch the same mistake (orchestrator classifies at… [truncated] · [report](m-6112e3/report.md)
 - 2026-11-24 · [m-fbbac4](m-fbbac4/plan.md) — Validators of both roles can read the mission's own diff with the sanctioned form `git diff $KRANZ_BASE_SHA..HEAD [-- <p… [truncated] · [report](m-fbbac4/report.md)
 - 2026-11-25 · [m-e7b464](m-e7b464/plan.md) — When a milestone is completed again after a reopen, the engine moves the local tag `kranz/<mission>/<milestone>` to the … [truncated] · [report](m-e7b464/report.md)
+- 2026-11-25 · [m-87118c](m-87118c/plan.md) — Make `kranz outcomes`' AutonomyRatio follow the published definition in docs/metrics.md, the one escalation_metrics.rs i… [truncated] · [report](m-87118c/report.md)
 - 2026-11-25 · [m-e36de6](m-e36de6/plan.md) — Offer a validator a command grant only when a denial is what stopped its session; when an earlier denial did not stop an… [truncated] · [report](m-e36de6/report.md)
