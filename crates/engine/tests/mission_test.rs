@@ -22,8 +22,8 @@ use kranz_engine::auth_verify::AuthVerdict;
 use kranz_engine::backend::{AgentBackend, PromptMode};
 use kranz_engine::backend_claude::parse_stream_line;
 use kranz_engine::backend_mock::{
-    mock_init, mock_result_error, mock_result_json, mock_result_text, mock_text, mock_tool_result,
-    mock_tool_use, MockBackend, MockScript,
+    mock_denied, mock_init, mock_result_error, mock_result_json, mock_result_text, mock_text,
+    mock_tool_result, mock_tool_use, MockBackend, MockScript,
 };
 use kranz_engine::control;
 use kranz_engine::cost;
@@ -404,6 +404,53 @@ fn validator_denied_but_passing(command: &str) -> MockScript {
     events.push(mock_result_json(&report));
     MockScript {
         events,
+        ..Default::default()
+    }
+}
+
+/// Validator script DENIED a command early but that keeps running afterward
+/// (further tool calls succeed) and ends in a Partial outcome with no
+/// parseable report (the final text is not JSON) — the denial is NOT what
+/// stopped the session (m-7886d9). `maybe_park_for_grant` must not offer a
+/// grant for `command`; it emits a `not offering a grant for` decision naming
+/// how the session actually ended and falls through to the single validator
+/// retry.
+fn validator_denied_then_continued(command: &str) -> MockScript {
+    MockScript {
+        events: vec![
+            mock_init("mock-session"),
+            mock_tool_use("Bash", command),
+            mock_denied(
+                "Bash",
+                "This Bash command contains multiple operations. The following part requires approval: echo exit",
+            ),
+            mock_tool_use("Read", "src/lib.rs"),
+            mock_tool_result("Read", "fn main() {}"),
+            mock_tool_use("Bash", "grep -n main src/lib.rs"),
+            mock_tool_result("Bash", "1:fn main() {}"),
+            mock_tool_use("Agent", "check the dashboard"),
+            mock_tool_result("Agent", "Async agent launched successfully."),
+            mock_result_text("waiting for the background agent to finish"),
+        ],
+        ..Default::default()
+    }
+}
+
+/// Validator script DENIED a command that IS the last tool event in the
+/// session (no tool call after the denial) — the denial is what stopped it
+/// (m-7886d9). Ends Partial, non-error, with no report, so
+/// `maybe_park_for_grant` must offer a grant for `command`.
+fn validator_stopped_by_denial(command: &str) -> MockScript {
+    MockScript {
+        events: vec![
+            mock_init("mock-session"),
+            mock_tool_use("Read", "src/lib.rs"),
+            mock_tool_result("Read", "fn main() {}"),
+            mock_tool_use("Bash", command),
+            mock_denied("Bash", "Permission denied"),
+            mock_text("cannot run the check without that command"),
+            mock_result_text("stopped without a report"),
+        ],
         ..Default::default()
     }
 }
@@ -6886,6 +6933,162 @@ async fn grant_offered_from_the_claude_retry_when_primary_had_no_command() {
         .mission
         .command_grants
         .contains(&denied_cmd.to_string()));
+}
+
+/// An early denied command that the validator session continued past (further
+/// tool calls succeeded) must NOT park for a grant: `maybe_park_for_grant`
+/// gates on the denial that STOPPED the session (D-B), not merely one that
+/// occurred. The session ends Partial with no report, so the single validator
+/// retry runs within the existing budget, and a clean retry completes the
+/// mission with no grant ever requested (m-7886d9).
+#[tokio::test]
+async fn validator_denial_not_stopping_retry_completes_without_grant() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let cmd = "grep -n main src/lib.rs; echo exit";
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+        validator_denied_then_continued(cmd),
+        validator_with(json!([])),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        !types.contains(&"grant.requested"),
+        "a denial the session continued past must never park for a grant: {types:?}"
+    );
+    assert!(types.contains(&"milestone.completed"));
+    assert!(events.iter().any(|e| matches!(&e.kind,
+        EventKind::OrchestratorDecision { summary, .. }
+            if summary.contains("not offering a grant for"))));
+}
+
+/// When BOTH validator sessions (primary and the single Claude retry) carry
+/// denials they continued past, no grant is ever offered, and the milestone
+/// blocks with a reason naming how the session actually ended: it ended its
+/// turn without a report, its last tool call, and how many tool calls ran
+/// after the last denied tool result (m-7886d9).
+#[tokio::test]
+async fn validator_denial_not_stopping_blocks_naming_session_end() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let cmd = "grep -n main src/lib.rs; echo exit";
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
+        validator_denied_then_continued(cmd),
+        validator_denied_then_continued(cmd),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    drop(engine);
+
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(!types.contains(&"grant.requested"), "{types:?}");
+    let blocked = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::MilestoneBlocked { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("milestone.blocked event");
+    assert!(
+        blocked.contains("ended its turn without a report"),
+        "{blocked}"
+    );
+    assert!(
+        blocked.contains("last tool call: `Agent: check the dashboard`"),
+        "{blocked}"
+    );
+    assert!(
+        blocked.contains("3 tool call(s) ran after the last denied tool result"),
+        "{blocked}"
+    );
+    let state = reducer::fold(&events).unwrap();
+    assert!(state.mission.command_grants.is_empty());
+    assert!(state.pending_grant_request.is_none());
+}
+
+/// A denial that IS the last tool event in the validator session (the session
+/// stopped on it, D-B) must still park for a grant naming exactly that
+/// command — the behaviour the earlier two tests prove does NOT happen for a
+/// denial the session continued past (m-7886d9).
+#[tokio::test]
+async fn validator_stopping_denial_parks_for_that_command() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+    let denied_cmd = "gc audit --deep";
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![dirty_tree_commit_as_is(), judgement("complete", "")]),
+        validator_stopped_by_denial(denied_cmd),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    engine.set_grant_request_timeout(Duration::from_millis(0));
+    let paths = engine.paths().clone();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+    drop(engine);
+
+    let events = read_log(&paths);
+    assert!(event_types(&events).contains(&"grant.requested"));
+    assert!(event_types(&events).contains(&"grant.denied"));
+    assert!(events.iter().any(|e| matches!(&e.kind,
+        EventKind::GrantRequested { command, milestone_id, .. }
+            if command == denied_cmd && milestone_id == "ms-1")));
 }
 
 /// A worker write outside the touch_set parks a TOUCH-PATH grant naming the
