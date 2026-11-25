@@ -320,6 +320,25 @@ pub struct RunOutcome {
     /// records only that it left the foreground (ticket
     /// `worker-long-command-stall`).
     pub backgrounded_commands: Vec<String>,
+    /// Number of `ToolUse` events observed after the session's LAST denied
+    /// tool result (D-A): `Some(0)` means the denial was the last tool
+    /// event — nothing ran afterward to decide whether the session recovered.
+    /// `None` when the session had no denied tool result at all. Counts any
+    /// denied tool result `sink.handle` flagged, not only shell ones.
+    pub tool_calls_after_last_denial: Option<u32>,
+    /// The command a grant could unblock, but ONLY when the last denial also
+    /// stopped the session (`tool_calls_after_last_denial == Some(0)`) and
+    /// that denial attributes to a grantable shell tool call. `None` when a
+    /// later tool call followed the denial, or the stopping denial was a
+    /// non-shell tool — the orchestrator must not offer a grant for a
+    /// denial the session already moved past. Unlike `denied_commands`, not
+    /// bounded or de-duplicated: this names exactly one command.
+    pub stopping_denied_command: Option<String>,
+    /// The session's last `ToolUse`, rendered `<tool>: <summary>` and
+    /// scrubbed; `None` when the session made no tool call. Lets a denial
+    /// report say how the session actually ended when the denial did not
+    /// stop it.
+    pub last_tool_call: Option<String>,
 }
 
 /// Longest refusal category kept in the event log. Categories are short
@@ -519,6 +538,13 @@ async fn run_session_body(
     // Positional ToolUse↔ToolResult correlation for grant-request: remember
     // the last tool call so a denied result can name the command it blocked.
     let mut last_tool_use: Option<(String, String)> = None;
+    // Survives the `take()` below: the session's last tool call regardless
+    // of whether a later denial consumed `last_tool_use` for attribution.
+    let mut last_any_tool_use: Option<(String, String)> = None;
+    // D-A (session-end-denial): ToolUse count since the last denial, and
+    // what that denial would grant if it turns out to be the stopping one.
+    let mut tool_calls_after_last_denial: Option<u32> = None;
+    let mut last_denial_command: Option<String> = None;
     let mut denied_commands: Vec<String> = Vec::new();
     const DENIED_COMMANDS_CAP: usize = 16;
     let mut backgrounded_commands: Vec<String> = Vec::new();
@@ -587,6 +613,10 @@ async fn run_session_body(
                     }
                     if let AgentEvent::ToolUse { tool, summary, .. } = &event {
                         last_tool_use = Some((tool.clone(), summary.clone()));
+                        last_any_tool_use = Some((tool.clone(), summary.clone()));
+                        if let Some(n) = tool_calls_after_last_denial.as_mut() {
+                            *n += 1;
+                        }
                     }
                     // Same positional correlation as a denial below: the
                     // notice names no command, the preceding call does.
@@ -620,13 +650,18 @@ async fn run_session_body(
                         // prefix, never a fabricated denial. Trim-guard matches the
                         // reducer's non-empty check so a whitespace-only capture
                         // can't be emitted and then rejected on fold.)
+                        tool_calls_after_last_denial = Some(0);
+                        last_denial_command = None;
                         if let Some((tool, summary)) = last_tool_use.take() {
-                            if is_grantable_shell_tool(&tool)
-                                && denied_commands.len() < DENIED_COMMANDS_CAP
-                            {
+                            if is_grantable_shell_tool(&tool) {
                                 let cmd = scrub::scrub_and_truncate(&summary, MESSAGE_CONTENT_MAX);
-                                if !cmd.trim().is_empty() && !denied_commands.contains(&cmd) {
-                                    denied_commands.push(cmd);
+                                if !cmd.trim().is_empty() {
+                                    last_denial_command = Some(cmd.clone());
+                                    if denied_commands.len() < DENIED_COMMANDS_CAP
+                                        && !denied_commands.contains(&cmd)
+                                    {
+                                        denied_commands.push(cmd);
+                                    }
                                 }
                             }
                         }
@@ -790,6 +825,14 @@ async fn run_session_body(
         report: report.clone(),
     })?;
 
+    let stopping_denied_command = if tool_calls_after_last_denial == Some(0) {
+        last_denial_command
+    } else {
+        None
+    };
+    let last_tool_call = last_any_tool_use
+        .map(|(tool, summary)| scrub::scrub_and_truncate(&format!("{tool}: {summary}"), 200));
+
     Ok(RunOutcome {
         run_id: run_meta.run_id,
         session_id,
@@ -804,6 +847,9 @@ async fn run_session_body(
         denied_commands,
         denied_egress,
         backgrounded_commands,
+        tool_calls_after_last_denial,
+        stopping_denied_command,
+        last_tool_call,
     })
 }
 

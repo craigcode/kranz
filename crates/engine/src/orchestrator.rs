@@ -13264,6 +13264,9 @@ pub(crate) mod tests {
             denied_commands: vec![],
             denied_egress: vec![],
             backgrounded_commands: vec![],
+            tool_calls_after_last_denial: None,
+            stopping_denied_command: None,
+            last_tool_call: None,
         };
 
         let validators_before = (
@@ -13451,6 +13454,9 @@ pub(crate) mod tests {
             denied_commands: vec![],
             denied_egress: vec![],
             backgrounded_commands: vec![],
+            tool_calls_after_last_denial: None,
+            stopping_denied_command: None,
+            last_tool_call: None,
         }
     }
 
@@ -13471,6 +13477,9 @@ pub(crate) mod tests {
             denied_commands: vec![],
             denied_egress: vec![],
             backgrounded_commands: vec![],
+            tool_calls_after_last_denial: None,
+            stopping_denied_command: None,
+            last_tool_call: None,
         }
     }
 
