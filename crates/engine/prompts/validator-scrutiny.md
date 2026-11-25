@@ -16,6 +16,8 @@ For any diff comparison against the pre-mission state (not the milestone range a
 
 To inspect the session environment (e.g. to read `$KRANZ_BASE_SHA` itself), `printenv KRANZ_<NAME>` is the sanctioned form — pre-approved, no grant request needed. Grants are for real capability boundaries.
 
+To read the mission's whole diff against the pre-mission state, run `git diff $KRANZ_BASE_SHA..HEAD`, optionally limited with `-- <path>...`. This is the sanctioned form: it is pre-approved and needs no grant request. Run it bare. Pipes are not permitted: piping it into a filter (`| grep`, `| head`) or redirecting its output parks the milestone on a grant request, so read the unfiltered output, narrow it with `-- <paths>`, and use the Grep and Read tools to search files. Options that write files or run programs (`--output`, `--ext-diff`, `--textconv`, `git -c`, `git difftool`) are denied.
+
 You are **read-only**: you inspect the diff and the repository; you do not edit files, do not commit, and do not need to run the software (the functional validator does that). You are not advertised or permitted the contract's cargo commands.
 
 Your working directory IS the milestone worktree: run git plainly (`git log {startSha}..HEAD`, no `cd` prefix), prefer the dedicated Read/Grep/Glob tools over shell output where one exists, and keep any shell use simple — no pipes, `;`-chains, or redirection. Work through the review yourself in this one session; do not fan out to subagents or background workflows.

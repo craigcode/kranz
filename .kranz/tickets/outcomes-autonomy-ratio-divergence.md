@@ -8,10 +8,10 @@ schedule: once
 
 `crates/engine/src/outcomes.rs` computes an `AutonomyRatio` that disagrees,
 in three ways, with the definition `docs/metrics.md` publishes and that
-`crates/engine/src/escalation_metrics.rs` implements. This ticket records
-the divergence as an operator decision: whether to align `kranz outcomes`
-with the published definition. Aligning it would change its numbers, so it
-is not done as a drive-by fix.
+`crates/engine/src/escalation_metrics.rs` implements. The operator decided
+on 2026-11-24 to align `kranz outcomes` with the published definition. This
+changes the numbers `kranz outcomes` reports, so the change says so in the
+changelog.
 
 ## Context
 
@@ -26,7 +26,9 @@ is not done as a drive-by fix.
 Three independent divergences, same underlying metric, two different
 answers depending on which command you run.
 
-## D-X options
+## D-X options (DECIDED 2026-11-24: align)
+
+The operator chose the second option. The first is kept for the record.
 
 - Leave `kranz outcomes`'s `AutonomyRatio` as-is; treat it as a distinct,
   unpublished figure.
@@ -37,7 +39,17 @@ answers depending on which command you run.
 
 ## Acceptance hints
 
-- This ticket records the decision; it does not change either file's
-  behavior.
-- A follow-up feature, once the operator decides, would need a regression
-  test comparing the two folds over the same log.
+- `kranz outcomes` excludes abandoned missions from closed missions, counts
+  operator unblocks as interventions and classifies steers by seq. Prefer
+  calling the shared `mission_interventions` rule over a second copy of it.
+- A regression test folds one log through both `outcomes.rs` and
+  `escalation_metrics.rs` and asserts the two autonomy ratios agree. The log
+  includes an abandoned mission, an operator unblock and a steer whose
+  timestamp and seq order differ.
+- The existing test `abandoned_missions_fold_outcomes_ratio_unchanged` pins
+  the old behaviour (closed 2, share 0.5). Update it to the aligned numbers
+  and say so in the pull request.
+- The `.abandoned` section is unchanged.
+- The changelog entry states that `kranz outcomes` autonomy figures change
+  and why. `docs/metrics.md` needs no new definition.
+- Anti-vacuity: the test filter matches only the new test.

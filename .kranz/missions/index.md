@@ -64,3 +64,4 @@ Approved plans, newest last.
 - 2026-11-23 · [m-777557](m-777557/plan.md) — Make the limit on engine-run contract `command` assertions configurable: a per-assertion `timeoutSecs` in the plan wins … [truncated] · [report](m-777557/report.md)
 - 2026-11-24 · [m-dd7d22](m-dd7d22/plan.md) — Each mission report states how many times the operator intervened, split by class, and both `kranz escalation-metrics` a… [truncated] · [report](m-dd7d22/report.md)
 - 2026-11-24 · [m-6112e3](m-6112e3/plan.md) — Record, for each captured lesson, whether a deterministic check could catch the same mistake (orchestrator classifies at… [truncated] · [report](m-6112e3/report.md)
+- 2026-11-24 · [m-fbbac4](m-fbbac4/plan.md) — Validators of both roles can read the mission's own diff with the sanctioned form `git diff $KRANZ_BASE_SHA..HEAD [-- <p… [truncated] · [report](m-fbbac4/report.md)
