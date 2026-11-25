@@ -2,7 +2,7 @@
 title: Positioning — kranz is a governance and evidence layer
 owner: operator
 freshness: check-on-touch
-last_verified: 2026-11-24
+last_verified: 2026-11-25
 verified_against:
   - crates/acp/src/lib.rs
   - docs/scoping/shared-acp-client.md
@@ -14,6 +14,8 @@ verified_against:
   - crates/engine/src/trace_export.rs
   - crates/cli/src/ready.rs
 ---
+
+Rechecked 2026-11-25 (UTC) against `trace_export.rs`: its test fixtures gained the three new optional `milestone.completed` tag fields, set to none. Trace export behaviour is unchanged and no positioning boundary moved.
 
 Rechecked 2026-11-24 (UTC) against the lesson check record and listing
 (`crates/engine/src/lesson_checks.rs`, `kranz lessons list`): both are
