@@ -471,6 +471,9 @@ fn mission_a_events() -> Vec<EventKind> {
         EventKind::MilestoneCompleted {
             milestone_id: "ms-1".into(),
             tag: None,
+            tag_commit: None,
+            retagged_from: None,
+            stale_tag: None,
         },
         spawned("o-1", Role::Orchestrator, None, None),
         completed("o-1", Some(0.9), TokenUsage::default()),
@@ -508,6 +511,9 @@ fn mission_b_events() -> Vec<EventKind> {
         EventKind::MilestoneCompleted {
             milestone_id: "ms-1".into(),
             tag: None,
+            tag_commit: None,
+            retagged_from: None,
+            stale_tag: None,
         },
         spawned("o-1", Role::Orchestrator, None, None),
         completed("o-1", Some(0.5), TokenUsage::default()),
@@ -605,6 +611,9 @@ fn calibrate_clamps_zero_costs_to_floor() {
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".into(),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
             EventKind::MissionCompleted {},
         ],
@@ -644,6 +653,9 @@ fn completed_mission_with_worker_cost(id: &str, worker_cost: f64) -> Vec<EventKi
         EventKind::MilestoneCompleted {
             milestone_id: "ms-1".into(),
             tag: None,
+            tag_commit: None,
+            retagged_from: None,
+            stale_tag: None,
         },
         EventKind::MissionCompleted {},
     ]

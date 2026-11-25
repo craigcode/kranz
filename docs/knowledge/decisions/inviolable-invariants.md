@@ -2,7 +2,7 @@
 title: Inviolable invariants
 owner: agent
 freshness: check-on-touch
-last_verified: 2026-11-24
+last_verified: 2026-11-25
 verified_against:
   - crates/engine/src/contract_timeout.rs
   - crates/engine/src/contract_lint.rs
@@ -39,6 +39,8 @@ verified_against:
   - crates/engine/src/scrub.rs
   - crates/engine/src/types.rs
 ---
+
+Rechecked 2026-11-25 (UTC) against the milestone tag change (`milestone_tag.rs`, `git_ops.rs`, `orchestrator.rs`, `events.rs`): a milestone completed again after a reopen moves its local `kranz/<mission>/<milestone>` tag to the commit that passed, and `milestone.completed` gained optional `tagCommit`, `retaggedFrom` and `staleTag` fields. The event fields are additive with serde defaults, the engine still writes only local refs, and tagging still cannot fail a mission. No invariant moved.
 
 Rechecked 2026-11-24 (UTC) against a test-only change in `contract_lint.rs`: the lint timeout summary test gives its second run its own scratch directory, so the copied Windows sleep fixture is not overwritten while still open. No invariant changed.
 

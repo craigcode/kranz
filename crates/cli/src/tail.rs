@@ -631,17 +631,21 @@ impl EventRenderer {
                 ansi::YELLOW,
                 format!("unblocked: {reason}"),
             ),
-            EventKind::MilestoneCompleted { milestone_id, tag } => {
-                let tag_note = tag
-                    .as_deref()
-                    .map(|t| format!(" (tag {t})"))
-                    .unwrap_or_default();
-                (
-                    format!("milestone {milestone_id}"),
-                    ansi::YELLOW,
-                    format!("complete{tag_note}"),
-                )
-            }
+            EventKind::MilestoneCompleted {
+                milestone_id,
+                tag,
+                retagged_from,
+                stale_tag,
+                ..
+            } => (
+                format!("milestone {milestone_id}"),
+                ansi::YELLOW,
+                milestone_tag_display(
+                    tag.as_deref(),
+                    retagged_from.as_deref(),
+                    stale_tag.as_deref(),
+                ),
+            ),
             EventKind::MissionValidating {} => (
                 "mission".to_string(),
                 ansi::YELLOW,
@@ -833,6 +837,27 @@ fn result_label(result: RunResult) -> &'static str {
     }
 }
 
+/// Note appended to a `complete` tail line describing the milestone tag's
+/// fate: moved on re-completion, left untagged after a real git failure, or
+/// just set as usual.
+fn milestone_tag_display(
+    tag: Option<&str>,
+    retagged_from: Option<&str>,
+    stale_tag: Option<&str>,
+) -> String {
+    match (tag, retagged_from, stale_tag) {
+        (Some(t), Some(from), _) => {
+            let short = &from[..from.len().min(8)];
+            format!("complete again (tag {t} moved from {short})")
+        }
+        (Some(t), None, _) => format!("complete (tag {t})"),
+        (None, _, Some(stale)) => {
+            format!("complete (untagged; tag {stale} still names an earlier completion)")
+        }
+        (None, _, None) => "complete".to_string(),
+    }
+}
+
 /// Tail `events.jsonl` from `from_seq`, printing each new event as one line
 /// to stderr, until `stop` is set (a final catch-up read runs after that).
 ///
@@ -862,5 +887,39 @@ pub async fn tail_events(
             return;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod milestone_tag_display_tests {
+    use super::milestone_tag_display;
+
+    #[test]
+    fn milestone_tag_display_plain_tagged() {
+        assert_eq!(
+            milestone_tag_display(Some("kranz/m-1/ms-1"), None, None),
+            "complete (tag kranz/m-1/ms-1)"
+        );
+    }
+
+    #[test]
+    fn milestone_tag_display_moved() {
+        assert_eq!(
+            milestone_tag_display(Some("kranz/m-1/ms-1"), Some("deadbeefcafe1234"), None),
+            "complete again (tag kranz/m-1/ms-1 moved from deadbeef)"
+        );
+    }
+
+    #[test]
+    fn milestone_tag_display_stale() {
+        assert_eq!(
+            milestone_tag_display(None, None, Some("kranz/m-1/ms-1")),
+            "complete (untagged; tag kranz/m-1/ms-1 still names an earlier completion)"
+        );
+    }
+
+    #[test]
+    fn milestone_tag_display_plain_untagged() {
+        assert_eq!(milestone_tag_display(None, None, None), "complete");
     }
 }

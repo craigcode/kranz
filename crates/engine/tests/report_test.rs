@@ -126,6 +126,9 @@ fn completed_state() -> kranz_engine::types::MissionState {
             EventKind::MilestoneCompleted {
                 milestone_id: "ms-1".into(),
                 tag: None,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
             },
         ),
         ev(9, EventKind::MissionCompleted {}),

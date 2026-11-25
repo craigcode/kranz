@@ -69,6 +69,7 @@ pub mod mechanical_maintenance;
 pub mod merge;
 pub mod merged;
 pub mod migrate_state;
+pub mod milestone_tag;
 pub mod mission_catalog;
 pub mod outcomes;
 pub mod pack;
