@@ -1894,6 +1894,51 @@ impl GitRepo {
         Ok(())
     }
 
+    /// The commit sha that the tag `name` points at, peeled through an
+    /// annotated tag object (`git rev-parse --verify --quiet
+    /// refs/tags/<name>^{commit}`).
+    ///
+    /// Always resolves through the full `refs/tags/` path, never a short
+    /// name, so a same-named branch cannot stand in. Returns `Ok(None)` when
+    /// the tag does not exist. Rejects an empty or flag-shaped `name` with
+    /// [`EngineError::Git`] before invoking git, mirroring [`GitRepo::tag`].
+    pub fn tag_commit(&self, name: &str) -> Result<Option<String>> {
+        if name.is_empty() || name.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing tag_commit with flag-shaped name {name:?}"
+            )));
+        }
+        let refspec = format!("refs/tags/{name}^{{commit}}");
+        let out = self.probe(&["rev-parse", "--verify", "--quiet", &refspec])?;
+        if out.status.success() {
+            return Ok(Some(
+                String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            ));
+        }
+        if out.status.code() == Some(1) && String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+            return Ok(None);
+        }
+        Err(EngineError::Git(format!(
+            "tag_commit probe failed for {name:?}: {}",
+            failure_detail(&out)
+        )))
+    }
+
+    /// Force-move an annotated tag to `HEAD`, creating it if absent
+    /// (`git tag --no-sign -a -f <name> -m <message>`).
+    ///
+    /// Rejects a flag-shaped `name` with [`EngineError::Git`] before
+    /// invoking git, mirroring [`GitRepo::tag`].
+    pub fn retag(&self, name: &str, message: &str) -> Result<()> {
+        if name.starts_with('-') {
+            return Err(EngineError::Git(format!(
+                "refusing retag with flag-shaped name {name:?}"
+            )));
+        }
+        self.run(&["tag", "--no-sign", "-a", "-f", name, "-m", message])?;
+        Ok(())
+    }
+
     // -- worktrees (roadmap M3 parallel workers) ---------------------------
     //
     // Parallel-within-milestone execution runs each independent feature's
