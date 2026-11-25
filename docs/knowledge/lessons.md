@@ -2,7 +2,7 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-24
+last_verified: 2026-11-25
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
@@ -10,6 +10,8 @@ verified_against:
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-11-25 (UTC) against `.kranz/lessons/index.md`, which gained the m-fbbac4 lesson (pair a prefix `git` allow rule on a read-only role with deny rules for the options that write or run programs). The curated list is unchanged.
 
 Rechecked 2026-11-24 (UTC): lessons gained an optional companion check record
 (`.kranz/lessons/<mission-id>.check`) and a read-only `kranz lessons list
