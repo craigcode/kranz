@@ -152,6 +152,46 @@ const READ_ONLY_DENY: &[&str] = &[
     "Bash(git push*)",
 ];
 
+/// Validator-only deny rules closing the write/run options the broad
+/// `GIT_INSPECT` allows (`Bash(git diff*)`, `Bash(git log*)`,
+/// `Bash(git show*)`) already admit (ticket `validator-diff-inspection-grant`,
+/// m-dd7d22). Validators are prompt-injectable, so every rule below is judged
+/// by the worst command it matches:
+///
+/// - `--output`/`-o`, `--ext-diff` and `--textconv` write a file or run an
+///   arbitrary program named as the diff/textconv driver; git accepts
+///   unambiguous long-option abbreviations, so both the mid-pattern form
+///   (covering `--out=`, `--outp`, `--ext`, `--textc`, etc. anywhere in the
+///   command) and a prefix-only fallback (for CLI versions that only honour
+///   a trailing `*`) are listed for each of `diff`, `log`, `show`.
+/// - `git difftool` runs an arbitrary program via `-x <cmd>`, and the
+///   existing `Bash(git diff*)` allow also matches `git difftool`, so it
+///   needs its own deny.
+///
+/// `--no-ext-diff` and `--no-textconv` do NOT match these rules — the
+/// substring `--ext`/`--textc` needs two leading dashes — and stay usable.
+const VALIDATOR_GIT_DENY: &[&str] = &[
+    "Bash(git diff*--ou*)",
+    "Bash(git diff --ou*)",
+    "Bash(git diff*--ext*)",
+    "Bash(git diff --ext*)",
+    "Bash(git diff*--textc*)",
+    "Bash(git diff --textc*)",
+    "Bash(git log*--ou*)",
+    "Bash(git log --ou*)",
+    "Bash(git log*--ext*)",
+    "Bash(git log --ext*)",
+    "Bash(git log*--textc*)",
+    "Bash(git log --textc*)",
+    "Bash(git show*--ou*)",
+    "Bash(git show --ou*)",
+    "Bash(git show*--ext*)",
+    "Bash(git show --ext*)",
+    "Bash(git show*--textc*)",
+    "Bash(git show --textc*)",
+    "Bash(git difftool*)",
+];
+
 /// The CLI `--tools` restriction for read-only roles (design.md table).
 const INSPECT_TOOLS: &[&str] = &["Bash", "Read", "Glob", "Grep"];
 
@@ -258,6 +298,16 @@ pub fn for_role(
             // never `echo` (command substitution). The KRANZ_ prefix IS the
             // disclosure boundary: those vars are engine-injected.
             allowed.push("Bash(printenv KRANZ_*)".to_string());
+            // Sanctioned mission-diff read (ticket
+            // validator-diff-inspection-grant; m-dd7d22's
+            // `git diff <sha>..HEAD -- <files> | grep ... | head ...` was
+            // denied on the `grep`/`head` parts and parked as a grant
+            // request, blocking the milestone). `$KRANZ_BASE_SHA` is the
+            // engine-injected env var naming the base commit pinned at plan
+            // approval; this is the sanctioned way for a validator to read
+            // the mission diff. Pipes are deliberately NOT allowed here (no
+            // `grep`/`head` rules): the Grep/Read tools filter instead.
+            allowed.push("Bash(git diff $KRANZ_BASE_SHA..HEAD*)".to_string());
             // Scrutiny/mechanical split: only the functional validator runs
             // the contract/validator commands. Scrutiny inspects the range
             // read-only (Read/Grep/Glob + plain git) and is neither
@@ -289,11 +339,14 @@ pub fn for_role(
                 }
             }
             dedup_preserving_order(&mut allowed);
+            let mut deny = read_only_deny();
+            deny.extend(to_strings(VALIDATOR_GIT_DENY));
+            dedup_preserving_order(&mut deny);
             PermissionProfile {
                 permission_mode: Some("default".to_string()),
                 tools: Some(to_strings(INSPECT_TOOLS)),
                 allowed_tools: allowed,
-                disallowed_tools: read_only_deny(),
+                disallowed_tools: deny,
             }
         }
     }
@@ -453,6 +506,195 @@ fn dedup_preserving_order(items: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Glob match with only `*` as a wildcard (matching any sequence,
+    /// including none); everything else is literal. Standard two-pointer
+    /// wildcard-matching algorithm.
+    fn glob_match(glob: &str, text: &str) -> bool {
+        let g: Vec<char> = glob.chars().collect();
+        let t: Vec<char> = text.chars().collect();
+        let (mut gi, mut ti) = (0usize, 0usize);
+        let mut star_idx: Option<usize> = None;
+        let mut match_idx = 0usize;
+        while ti < t.len() {
+            if gi < g.len() && g[gi] == t[ti] {
+                gi += 1;
+                ti += 1;
+            } else if gi < g.len() && g[gi] == '*' {
+                star_idx = Some(gi);
+                match_idx = ti;
+                gi += 1;
+            } else if let Some(si) = star_idx {
+                gi = si + 1;
+                match_idx += 1;
+                ti = match_idx;
+            } else {
+                return false;
+            }
+        }
+        while gi < g.len() && g[gi] == '*' {
+            gi += 1;
+        }
+        gi == g.len()
+    }
+
+    /// Test-only matcher modeling (NOT implementing) the Claude CLI's
+    /// `Bash(<glob>)` rule semantics: `*` matches any sequence including
+    /// none, everything else is literal, matched against the WHOLE trimmed
+    /// segment. A bare `Bash` rule (no parens) matches every command.
+    fn rule_glob_matches(rule: &str, segment: &str) -> bool {
+        let segment = segment.trim();
+        if rule == "Bash" {
+            return true;
+        }
+        match rule.strip_prefix("Bash(").and_then(|r| r.strip_suffix(')')) {
+            Some(glob) => glob_match(glob, segment),
+            None => false,
+        }
+    }
+
+    /// Splits a compound command the same way the CLI does for matching
+    /// purposes: on `&&`, `||`, `;`, `|` and newlines.
+    fn split_segments(command: &str) -> Vec<&str> {
+        command
+            .split("&&")
+            .flat_map(|s| s.split("||"))
+            .flat_map(|s| s.split(';'))
+            .flat_map(|s| s.split('|'))
+            .flat_map(|s| s.split('\n'))
+            .collect()
+    }
+
+    /// Test-only model of the CLI's permission enforcement over a
+    /// [`PermissionProfile`]: every non-empty trimmed segment of `command`
+    /// must match some allow rule, and no segment (nor the whole command)
+    /// may match any deny rule — deny wins over allow. Fails closed on
+    /// `$(`, a backtick, `>` or `<` (command substitution / redirection),
+    /// since those change what actually runs in ways this simplified
+    /// matcher cannot model. This helper approximates, but is not, the real
+    /// CLI enforcement.
+    fn profile_allows(profile: &PermissionProfile, command: &str) -> bool {
+        if command.contains("$(")
+            || command.contains('`')
+            || command.contains('>')
+            || command.contains('<')
+        {
+            return false;
+        }
+        let trimmed_whole = command.trim();
+        if profile
+            .disallowed_tools
+            .iter()
+            .any(|rule| rule_glob_matches(rule, trimmed_whole))
+        {
+            return false;
+        }
+        let mut saw_segment = false;
+        for segment in split_segments(command) {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            saw_segment = true;
+            if profile
+                .disallowed_tools
+                .iter()
+                .any(|rule| rule_glob_matches(rule, segment))
+            {
+                return false;
+            }
+            if !profile
+                .allowed_tools
+                .iter()
+                .any(|rule| rule_glob_matches(rule, segment))
+            {
+                return false;
+            }
+        }
+        saw_segment
+    }
+
+    /// Ticket `validator-diff-inspection-grant` (m-dd7d22): validators may
+    /// read the mission diff via the one sanctioned form
+    /// `git diff $KRANZ_BASE_SHA..HEAD [-- <paths>]`, without a grant
+    /// request, while git options that write a file or run a program stay
+    /// denied. Does NOT assert other revision ranges (e.g. `git diff
+    /// HEAD~3..HEAD`) are denied: the pre-existing broad `Bash(git diff*)`
+    /// allow — which the validator prompts also rely on for
+    /// `{startSha}..HEAD` — still allows them, and this mission deliberately
+    /// leaves that alone.
+    #[test]
+    fn validator_mission_diff_reads_allow_base_sha_diff_only() {
+        let cfg = MissionConfig::default();
+        const SANCTIONED: &str = "Bash(git diff $KRANZ_BASE_SHA..HEAD*)";
+
+        for role in [Role::ValidatorScrutiny, Role::ValidatorFunctional] {
+            let profile = for_role(role, &cfg, &[], &[], &[]);
+
+            assert!(
+                profile.allowed_tools.iter().any(|r| r == SANCTIONED),
+                "{role:?} must allow {SANCTIONED}: {:?}",
+                profile.allowed_tools
+            );
+
+            for allowed_cmd in [
+                "git diff $KRANZ_BASE_SHA..HEAD",
+                "git diff $KRANZ_BASE_SHA..HEAD -- crates/engine/src/permissions.rs docs/design.md",
+                "git diff --no-ext-diff --no-textconv $KRANZ_BASE_SHA..HEAD",
+                "printenv KRANZ_BASE_SHA",
+            ] {
+                assert!(
+                    profile_allows(&profile, allowed_cmd),
+                    "{role:?} expected to allow `{allowed_cmd}`"
+                );
+            }
+
+            for denied_cmd in [
+                "git",
+                "git -c diff.external=/tmp/x diff $KRANZ_BASE_SHA..HEAD",
+                "git diff $KRANZ_BASE_SHA..HEAD --output=/tmp/x",
+                "git diff --output /tmp/x $KRANZ_BASE_SHA..HEAD",
+                "git diff --out=/tmp/x $KRANZ_BASE_SHA..HEAD",
+                "git diff --ext-diff $KRANZ_BASE_SHA..HEAD",
+                "git diff $KRANZ_BASE_SHA..HEAD --ext",
+                "git diff --textconv $KRANZ_BASE_SHA..HEAD",
+                "git diff --textc $KRANZ_BASE_SHA..HEAD",
+                "git log -p --ext-diff $KRANZ_BASE_SHA..HEAD",
+                "git log -p --output=/tmp/x",
+                "git show --textconv HEAD",
+                "git difftool -y -x sh $KRANZ_BASE_SHA..HEAD",
+                "GIT_EXTERNAL_DIFF=/tmp/x git diff $KRANZ_BASE_SHA..HEAD",
+                "git diff $KRANZ_BASE_SHA..HEAD -- a.rs | grep -nE x",
+                "git diff $KRANZ_BASE_SHA..HEAD | head -20",
+                "git diff $KRANZ_BASE_SHA..HEAD > /tmp/x",
+                "git diff $KRANZ_BASE_SHA..HEAD; touch /tmp/x",
+                "git commit -m x",
+                "git checkout main",
+            ] {
+                assert!(
+                    !profile_allows(&profile, denied_cmd),
+                    "{role:?} expected to deny `{denied_cmd}`"
+                );
+            }
+        }
+
+        // Orchestrator is unchanged: no new allow, deny set equals
+        // read_only_deny(), none of the new validator git deny rules.
+        let orchestrator = for_role(Role::Orchestrator, &cfg, &[], &[], &[]);
+        assert_eq!(orchestrator.disallowed_tools, read_only_deny());
+        assert!(!orchestrator.allowed_tools.iter().any(|r| r == SANCTIONED));
+        for rule in VALIDATOR_GIT_DENY {
+            assert!(!orchestrator.disallowed_tools.iter().any(|r| r == rule));
+        }
+
+        // Worker is unchanged: no-grant allow is exactly `["Bash"]`, and it
+        // carries none of the new validator git deny rules.
+        let worker = for_role(Role::Worker, &cfg, &[], &[], &[]);
+        assert_eq!(worker.allowed_tools, vec!["Bash".to_string()]);
+        for rule in VALIDATOR_GIT_DENY {
+            assert!(!worker.disallowed_tools.iter().any(|r| r == rule));
+        }
+    }
 
     /// Audit 2026-09-01 C1/H6: every role denies the authority material, and
     /// the deny survives the one operator lever that edits the deny list.
