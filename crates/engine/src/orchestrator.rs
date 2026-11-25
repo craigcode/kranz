@@ -3503,6 +3503,9 @@ impl MissionEngine {
                 self.emit(EventKind::MilestoneCompleted {
                     milestone_id,
                     tag: None,
+                    tag_commit: None,
+                    retagged_from: None,
+                    stale_tag: None,
                 })?;
                 Ok(None)
             }
@@ -6798,7 +6801,13 @@ impl MissionEngine {
             self.clear_open_questions("milestone completed", |q| {
                 q.milestone_id.as_deref() == Some(milestone_id.as_str())
             })?;
-            self.emit(EventKind::MilestoneCompleted { milestone_id, tag })?;
+            self.emit(EventKind::MilestoneCompleted {
+                milestone_id,
+                tag,
+                tag_commit: None,
+                retagged_from: None,
+                stale_tag: None,
+            })?;
             return Ok(());
         }
 
@@ -6841,7 +6850,13 @@ impl MissionEngine {
                 self.clear_open_questions("milestone completed", |q| {
                     q.milestone_id.as_deref() == Some(milestone_id.as_str())
                 })?;
-                self.emit(EventKind::MilestoneCompleted { milestone_id, tag })?;
+                self.emit(EventKind::MilestoneCompleted {
+                    milestone_id,
+                    tag,
+                    tag_commit: None,
+                    retagged_from: None,
+                    stale_tag: None,
+                })?;
             }
             FindingsConversion::Fix {
                 specs,
@@ -9472,6 +9487,9 @@ pub(crate) mod tests {
                 .emit(EventKind::MilestoneCompleted {
                     milestone_id: "ms-1".into(),
                     tag: None,
+                    tag_commit: None,
+                    retagged_from: None,
+                    stale_tag: None,
                 })
                 .unwrap();
             assert_eq!(

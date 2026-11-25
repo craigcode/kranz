@@ -631,7 +631,9 @@ impl EventRenderer {
                 ansi::YELLOW,
                 format!("unblocked: {reason}"),
             ),
-            EventKind::MilestoneCompleted { milestone_id, tag } => {
+            EventKind::MilestoneCompleted {
+                milestone_id, tag, ..
+            } => {
                 let tag_note = tag
                     .as_deref()
                     .map(|t| format!(" (tag {t})"))

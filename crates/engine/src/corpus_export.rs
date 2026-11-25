@@ -796,6 +796,9 @@ mod tests {
                 EventKind::MilestoneCompleted {
                     milestone_id: "ms-1".to_string(),
                     tag: None,
+                    tag_commit: None,
+                    retagged_from: None,
+                    stale_tag: None,
                 },
             ),
             ev(27, EventKind::MissionCompleted {}),

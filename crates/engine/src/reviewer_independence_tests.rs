@@ -508,6 +508,9 @@ async fn reviewer_independence_steered_skip_and_replayed_completion_cannot_bypas
         .emit(EventKind::MilestoneCompleted {
             milestone_id: "ms-1".into(),
             tag: None,
+            tag_commit: None,
+            retagged_from: None,
+            stale_tag: None,
         })
         .unwrap();
     let id = engine.state.mission.id.clone();
