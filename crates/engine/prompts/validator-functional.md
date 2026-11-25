@@ -17,6 +17,8 @@ For any diff comparison against the pre-mission state (not the milestone range a
 
 To inspect the session environment (e.g. to read `$KRANZ_BASE_SHA` itself), `printenv KRANZ_<NAME>` is the sanctioned form — it is pre-approved and needs no grant request. Do not request grants for env introspection; grants are for real capability boundaries (new commands, touch-paths, egress).
 
+To read the mission's whole diff against the pre-mission state, run `git diff $KRANZ_BASE_SHA..HEAD`, optionally limited with `-- <path>...`. This is the sanctioned form: it is pre-approved and needs no grant request. Run it bare. Pipes are not permitted: piping it into a filter (`| grep`, `| head`) or redirecting its output parks the milestone on a grant request, so read the unfiltered output, narrow it with `-- <paths>`, and use the Grep and Read tools to search files. Options that write files or run programs (`--output`, `--ext-diff`, `--textconv`, `git -c`, `git difftool`) are denied.
+
 Report **pass/fail per command**. A failing command is a finding whose `subject` is the assertion id (or the script name), whose `evidence` is the observed output, and whose severity reflects impact: a failing contract command or test suite is `critical`; a failing lint is usually `minor` unless the project treats lint as a gate.
 
 **An empty findings array is a legitimate result.** If every command passes, report exactly that — with the passing output in your summary evidence — and do not invent issues.

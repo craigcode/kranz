@@ -1,0 +1,3 @@
+When you add a trailing-`*` `Bash(git <sub>*)` allow rule to a read-only role in `permissions.rs`, check it against the worst suffix it adm…
+
+When you add a trailing-`*` `Bash(git <sub>*)` allow rule to a read-only role in `permissions.rs`, check it against the worst suffix it admits. Pair it with deny rules for that subcommand's file-writing and program-running options, at their shortest abbreviation git accepts (for example `--ou`, `--ext`, `--textc`). Then prove the boundary with the test-only `profile_allows` matcher, not by reading the rule. The CLI checks each piped or chained part separately and deny rules beat allow rules. So a prefix allow also admits sibling commands such as `git difftool -x <cmd>`, and options written after the range.

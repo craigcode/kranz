@@ -5,6 +5,15 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: validators can no longer pass git options that write a file or
+  run a program. `git diff`, `git log` and `git show` were allowed by prefix,
+  which also admitted `--output`, `--ext-diff`, `--textconv` and
+  `git difftool`. Validator-only deny rules now close those, including the
+  abbreviations git accepts. Worker and orchestrator rules are unchanged.
+- Added: `git diff $KRANZ_BASE_SHA..HEAD`, optionally limited to paths, is
+  the sanctioned way for a validator to read the mission diff, and both
+  validator prompts say so. Pipes stay denied: a validator that pipes the
+  diff into a filter still raises a grant request.
 - Fixed: a milestone completed again after a reopen (for example, a
   final-gate fix) now moves its `kranz/<mission>/<milestone>` tag to the
   commit that passed, instead of leaving it on the rejected commit from the

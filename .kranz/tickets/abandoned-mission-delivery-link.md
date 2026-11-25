@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Decided D-X1 on 2026-11-24: count only, which is what already ships. No link is recorded. Reopen with a scoping pass if the link is wanted later."
 title: Link an abandoned mission to the change that finished its work
 priority: 3
 schedule: once
@@ -19,7 +21,7 @@ each abandoned mission's interventions by class and whether a feature had
 completed before the abandon. That tells an operator *that* human effort
 was spent and salvaged, but not *where* the resulting change landed.
 
-## D-X options
+## D-X options (DECIDED 2026-11-24: D-X1)
 
 - **D-X1 — count only (shipped default).** Keep reporting the abandoned
   count and its per-mission detail with no link to the delivering change.
