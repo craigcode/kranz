@@ -6793,7 +6793,8 @@ impl MissionEngine {
             if !box_future(|| self.external_completion_checks(Some(mi))).await? {
                 return Ok(());
             }
-            let tag = self.tag_milestone(&milestone_id);
+            let (tag, tag_commit, retagged_from, stale_tag) =
+                self.tag_milestone(&milestone_id).event_fields();
             // Structured human questions (ticket
             // structured-human-question-events): asks scoped to this
             // milestone are moot once it completes — clear them out of the
@@ -6804,9 +6805,9 @@ impl MissionEngine {
             self.emit(EventKind::MilestoneCompleted {
                 milestone_id,
                 tag,
-                tag_commit: None,
-                retagged_from: None,
-                stale_tag: None,
+                tag_commit,
+                retagged_from,
+                stale_tag,
             })?;
             return Ok(());
         }
@@ -6844,7 +6845,8 @@ impl MissionEngine {
                 if !box_future(|| self.external_completion_checks(Some(mi))).await? {
                     return Ok(());
                 }
-                let tag = self.tag_milestone(&milestone_id);
+                let (tag, tag_commit, retagged_from, stale_tag) =
+                    self.tag_milestone(&milestone_id).event_fields();
                 // Structured human questions: same clear-on-complete as the
                 // findings-empty path above.
                 self.clear_open_questions("milestone completed", |q| {
@@ -6853,9 +6855,9 @@ impl MissionEngine {
                 self.emit(EventKind::MilestoneCompleted {
                     milestone_id,
                     tag,
-                    tag_commit: None,
-                    retagged_from: None,
-                    stale_tag: None,
+                    tag_commit,
+                    retagged_from,
+                    stale_tag,
                 })?;
             }
             FindingsConversion::Fix {
@@ -7395,18 +7397,13 @@ impl MissionEngine {
         Ok(findings)
     }
 
-    /// Annotated milestone tag; a pre-existing tag (milestone re-completed
-    /// after final-gate fixes) downgrades to `None` rather than failing the
-    /// mission.
-    fn tag_milestone(&self, milestone_id: &str) -> Option<String> {
+    /// Annotated milestone tag. A pre-existing tag (milestone re-completed
+    /// after final-gate fixes) is moved to the newly validated commit rather
+    /// than left pointing at the earlier, since-reopened completion. A real
+    /// git failure completes the milestone untagged.
+    fn tag_milestone(&self, milestone_id: &str) -> crate::milestone_tag::MilestoneTagOutcome {
         let name = format!("kranz/{}/{}", self.state.mission.id, milestone_id);
-        match self.active_repo().tag(&name, "kranz milestone complete") {
-            Ok(()) => Some(name),
-            Err(e) => {
-                tracing::warn!(tag = %name, error = %e, "milestone tag failed; completing untagged");
-                None
-            }
-        }
+        crate::milestone_tag::tag_milestone(self.active_repo(), &name)
     }
 
     // -----------------------------------------------------------------------
