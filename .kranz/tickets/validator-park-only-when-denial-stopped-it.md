@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Mission m-e36de6. A validator is offered a grant only for the denial that stopped its session, meaning no tool call followed the last denied tool result. Otherwise the engine retries once and blocks with a reason that says how the session ended. The worker grant path and egress grants are unchanged and recorded as open in the scoping note."
 title: Park a validator for a grant only when the denial stopped it
 priority: 2
 schedule: once

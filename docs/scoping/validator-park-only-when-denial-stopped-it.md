@@ -17,7 +17,7 @@ at seq 572. `worker.completed` recorded a partial result at seq 574, and
 
 `maybe_park_for_grant` (`crates/engine/src/orchestrator.rs`) offered the
 first denied command of the session whenever the validator outcome was
-untrusted — in this run, the whole `grep ...; echo "exit:$?"` compound
+untrusted. In this run that was the whole `grep ...; echo "exit:$?"` compound
 command from seq 470, even though the session had carried on for about 33
 more tool calls after the seq 507 denial and ended for an unrelated reason:
 it launched a background `Agent` sub-agent and ended its turn without a
@@ -25,7 +25,7 @@ report. The engine parked on that grant, the grant request timed out after
 an hour, and the mission blocked. Operator guidance to the validator (one
 command per call, no background agents) made the same validation pass with
 no grant at all, which confirms the denial itself was not what sank the
-run — the 33 calls and the sub-agent after it were.
+run. The 33 calls and the sub-agent after it were.
 
 ## D-A: when a denial stopped the session (operator decision)
 
@@ -51,8 +51,8 @@ Rejected alternatives:
 
 ## D-B: which command is offered (operator decision)
 
-The grant offers the stopping denial's command — the one whose denied tool
-result was the session's last tool call — not the first denied command of
+The grant offers the stopping denial's command (the one whose denied tool
+result was the session's last tool call), not the first denied command of
 the session, and the offered command is the whole command of that stopping
 tool call as recorded, not a fragment of it. In m-7886d9, under D-A no
 denial stopped the session: the last tool call was the background `Agent`
