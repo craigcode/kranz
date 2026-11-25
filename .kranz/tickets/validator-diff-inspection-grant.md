@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Mission m-fbbac4. The diff was already allowed; the pipe into grep and head was what parked. Shipped the named form, validator-only deny rules for git's write and run options, and prompt wording that rules out pipes. Other revision ranges stay allowed, as `git show` and `git log` already read any revision."
 title: A validator's read-only look at the mission diff should not park for a grant
 priority: 2
 schedule: once

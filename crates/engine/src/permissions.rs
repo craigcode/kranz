@@ -158,7 +158,7 @@ const READ_ONLY_DENY: &[&str] = &[
 /// m-dd7d22). Validators are prompt-injectable, so every rule below is judged
 /// by the worst command it matches:
 ///
-/// - `--output`/`-o`, `--ext-diff` and `--textconv` write a file or run an
+/// - `--output`, `--ext-diff` and `--textconv` write a file or run an
 ///   arbitrary program named as the diff/textconv driver; git accepts
 ///   unambiguous long-option abbreviations, so both the mid-pattern form
 ///   (covering `--out=`, `--outp`, `--ext`, `--textc`, etc. anywhere in the

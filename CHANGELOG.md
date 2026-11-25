@@ -5,6 +5,15 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Changed: validators can no longer pass git options that write a file or
+  run a program. `git diff`, `git log` and `git show` were allowed by prefix,
+  which also admitted `--output`, `--ext-diff`, `--textconv` and
+  `git difftool`. Validator-only deny rules now close those, including the
+  abbreviations git accepts. Worker and orchestrator rules are unchanged.
+- Added: `git diff $KRANZ_BASE_SHA..HEAD`, optionally limited to paths, is
+  the sanctioned way for a validator to read the mission diff, and both
+  validator prompts say so. Pipes stay denied: a validator that pipes the
+  diff into a filter still raises a grant request.
 - Added: `kranz lessons list [--json] [--needs-check]`, a read-only listing
   of captured lessons with whether a deterministic check could catch the
   same mistake. The classification lives in a companion record,
