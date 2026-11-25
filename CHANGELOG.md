@@ -5,6 +5,18 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: a milestone completed again after a reopen (for example, a
+  final-gate fix) now moves its `kranz/<mission>/<milestone>` tag to the
+  commit that passed, instead of leaving it on the rejected commit from the
+  earlier completion. `milestone.completed` gains optional `tagCommit`,
+  `retaggedFrom`, and `staleTag` fields recording the tag's new commit, the
+  commit it moved from, and (when a real tag failure leaves the completion
+  untagged) the name of a stale tag that may still point at an earlier
+  completion. The expected case of re-completing a milestone is now logged
+  at info, not warn. Nothing in Kranz resolves the milestone tag to pick a
+  commit: merge detection uses branch tips, and resume and the mission
+  report both ignore the tag field, so only an operator who checked out the
+  tag by hand would have seen the stale commit.
 - Added: `kranz lessons list [--json] [--needs-check]`, a read-only listing
   of captured lessons with whether a deterministic check could catch the
   same mistake. The classification lives in a companion record,
