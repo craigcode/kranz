@@ -20,15 +20,17 @@ So the tag still points at `9742e3a1`, the commit that validation went on to rej
 
 This is the documented behaviour, not a crash. `tag_milestone` in `crates/engine/src/orchestrator.rs` says a pre-existing tag "downgrades to `None` rather than failing the mission". The second completion event is honest about being untagged. What is missing is any sign on the first tag that it was superseded, and any ref for the final state. The warning also reads like a failure when it is the expected path.
 
-## D-X operator decision (DECIDED 2026-11-24: D-X2)
+## D-X operator decision (DECIDED 2026-11-24: D-X3)
 
-The operator chose D-X2: write a second tag for each later completion and never move or delete a tag the engine created. The options are kept for the record.
+The operator chose D-X3: move the tag to the latest completion. The operator first chose D-X2 the same day and changed it after reading the drafted plan. The options are kept for the record.
 
 - D-X1: leave the tag where it is. Record the supersession: the later `milestone.completed` carries the commit it completed at, and the report says the tag names an earlier completion.
 - D-X2: write a second tag for each later completion, for example `kranz/<mission>/<milestone>.2`. Every completion keeps a ref and nothing is moved.
 - D-X3: move the tag to the latest completion. This rewrites a ref the engine created. Tags are part of the audit trail, so this needs a stated reason.
 
-The first completion keeps the plain name `kranz/<mission>/<milestone>`. Later completions take a numbered suffix starting at `.2`. Each `milestone.completed` records the tag it wrote.
+The stated reason: under D-X2 the plain name `kranz/<mission>/<milestone>` keeps naming the tree that validation rejected, which is the complaint this ticket was filed for. Moving the tag makes the plain name always check out the validated tree.
+
+No evidence is lost by the move. The later `milestone.completed` records the commit the tag left, and that commit stays reachable from the mission branch. The engine only ever moves a tag it created for the same mission and milestone.
 
 ## Scoping answers
 
@@ -40,6 +42,6 @@ The first completion keeps the plain name `kranz/<mission>/<milestone>`. Later c
 
 ## Acceptance hints
 
-- A mission test that completes a milestone, reopens it with a finding, and completes it again. It asserts that both tags exist, that the first still names the first completion's commit, that the second names the later one, and that the second `milestone.completed` records the second tag.
+- A mission test that completes a milestone, reopens it with a finding, and completes it again. It asserts that the tag names the later completion's commit, that the second `milestone.completed` records the tag and the commit the tag left, and that the earlier commit is still reachable from the mission branch.
 - A test that a real tag failure still completes the milestone untagged.
 - Anti-vacuity: the test filter matches only the new tests.
