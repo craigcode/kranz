@@ -5,7 +5,8 @@ use kranz_engine::auth_verify::AuthVerdict;
 use kranz_engine::backend::{AgentEvent, PromptMode, SessionExit, SessionSpec};
 use kranz_engine::backend_claude::parse_stream_line;
 use kranz_engine::backend_mock::{
-    mock_denied, mock_init, mock_result_text, mock_text, mock_tool_use, MockBackend, MockScript,
+    mock_denied, mock_init, mock_result_text, mock_text, mock_tool_result, mock_tool_use,
+    MockBackend, MockScript,
 };
 use kranz_engine::control::{self, ControlWatcher};
 use kranz_engine::event_log::{EventLog, LockForce};
@@ -703,6 +704,162 @@ async fn denied_commands_captured_from_codex_command_execution() {
         vec!["gc scan --all".to_string()],
         "a Codex command_execution denial must be captured, not dropped"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Session-end denial (D-A): did the LAST denial stop the session, or did
+// the session carry on (and end for an unrelated reason)?
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn session_end_denial_followed_by_tool_calls_records_no_stopping_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    let script = MockScript {
+        events: vec![
+            mock_init("s-1"),
+            mock_tool_use("Bash", "grep -n foo src/lib.rs; echo exit"),
+            mock_denied("Bash", "permission denied"),
+            mock_tool_use("Read", "src/lib.rs"),
+            mock_tool_result("Read", "file contents"),
+            mock_tool_use("Bash", "grep -n foo src/lib.rs"),
+            mock_tool_result("Bash", "no matches"),
+            mock_tool_use("Agent", "check the dashboard"),
+            mock_tool_result("Agent", "Async agent launched successfully."),
+            mock_result_text("waiting for the background agent"),
+        ],
+        ..Default::default()
+    };
+    let backend = MockBackend::with_scripts(vec![script]);
+    let spec = session_spec(PromptMode::SingleShot("run the task".to_string()));
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-a"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.tool_calls_after_last_denial, Some(3));
+    assert_eq!(outcome.stopping_denied_command, None);
+    assert_eq!(
+        outcome.last_tool_call,
+        Some("Agent: check the dashboard".to_string())
+    );
+    assert!(outcome
+        .denied_commands
+        .contains(&"grep -n foo src/lib.rs; echo exit".to_string()));
+}
+
+#[tokio::test]
+async fn session_end_denial_last_tool_event_records_stopping_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    let script = MockScript {
+        events: vec![
+            mock_init("s-2"),
+            mock_tool_use("Read", "src/lib.rs"),
+            mock_tool_result("Read", "file contents"),
+            mock_tool_use("Bash", "gc audit --deep"),
+            mock_denied("Bash", "permission denied"),
+            mock_text("that was blocked"),
+            mock_result_text("stopped: needs approval"),
+        ],
+        ..Default::default()
+    };
+    let backend = MockBackend::with_scripts(vec![script]);
+    let spec = session_spec(PromptMode::SingleShot("run the task".to_string()));
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-b"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.tool_calls_after_last_denial, Some(0));
+    assert_eq!(
+        outcome.stopping_denied_command,
+        Some("gc audit --deep".to_string())
+    );
+}
+
+#[tokio::test]
+async fn session_end_denial_parallel_batch_counts_as_stopping() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    let script = MockScript {
+        events: vec![
+            mock_init("s-3"),
+            mock_tool_use("Read", "src/lib.rs"),
+            mock_tool_use("Bash", "gc lint"),
+            mock_denied("Bash", "permission denied"),
+            mock_tool_result("Read", "file contents"),
+            mock_result_text("stopped: needs approval"),
+        ],
+        ..Default::default()
+    };
+    let backend = MockBackend::with_scripts(vec![script]);
+    let spec = session_spec(PromptMode::SingleShot("run the task".to_string()));
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-c"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.tool_calls_after_last_denial, Some(0));
+    assert_eq!(outcome.stopping_denied_command, Some("gc lint".to_string()));
+}
+
+#[tokio::test]
+async fn session_end_denial_none_when_nothing_denied() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    let script = MockScript {
+        events: vec![
+            mock_init("s-4"),
+            mock_tool_use("Read", "src/lib.rs"),
+            mock_tool_result("Read", "file contents"),
+            mock_result_text("done"),
+        ],
+        ..Default::default()
+    };
+    let backend = MockBackend::with_scripts(vec![script]);
+    let spec = session_spec(PromptMode::SingleShot("run the task".to_string()));
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-d"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.tool_calls_after_last_denial, None);
+    assert_eq!(outcome.stopping_denied_command, None);
+    assert_eq!(outcome.last_tool_call, Some("Read: src/lib.rs".to_string()));
+}
+
+#[tokio::test]
+async fn session_end_denial_non_shell_last_denial_offers_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = paths(dir.path());
+    let mut log = seeded_log(&p);
+
+    let script = MockScript {
+        events: vec![
+            mock_init("s-5"),
+            mock_tool_use("Bash", "gc scan --all"),
+            mock_denied("Bash", "permission denied"),
+            mock_tool_use("Read", "src/lib.rs"),
+            mock_tool_result("Read", "file contents"),
+            mock_tool_use("Write", "notes.txt"),
+            mock_denied("Write", "permission denied"),
+            mock_result_text("stopped: needs approval"),
+        ],
+        ..Default::default()
+    };
+    let backend = MockBackend::with_scripts(vec![script]);
+    let spec = session_spec(PromptMode::SingleShot("run the task".to_string()));
+    let outcome = run_session(&backend, spec, &mut log, &p, worker_meta("run-e"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.tool_calls_after_last_denial, Some(0));
+    assert_eq!(outcome.stopping_denied_command, None);
 }
 
 #[tokio::test]

@@ -2372,19 +2372,34 @@ impl MissionEngine {
         Ok(true)
     }
 
-    /// If `outcome` was stopped by a grantable command denial, offer the
-    /// operator the narrowest command grant and park, returning `true`. Only the
-    /// first denied command is offered; a re-run surfaces the next. Non-command
-    /// denials (Write/Edit/web — READ_ONLY_DENY, deny-wins) never populate
-    /// `denied_commands`, so they don't reach here. Callers gate this on an
-    /// UNTRUSTED outcome.
+    /// If `outcome` was stopped by a grantable command denial — i.e. the
+    /// denial that stopped the session (D-B) — offer the operator the
+    /// narrowest command grant for that exact command and park, returning
+    /// `true`. Never offers a grant for an EARLIER denied command the session
+    /// continued past: an untrusted validator that kept running after a
+    /// denial needs a retry within the existing budget, not a grant for a
+    /// command it may no longer need. When the session had denied commands
+    /// but none of them stopped it, emits a `not offering a grant for ...`
+    /// decision naming how the session actually ended and returns `false`.
+    /// Non-command denials (Write/Edit/web — READ_ONLY_DENY, deny-wins) never
+    /// populate `denied_commands`, so they don't reach here. Callers gate
+    /// this on an UNTRUSTED outcome.
     fn maybe_park_for_grant(
         &mut self,
         milestone_id: &str,
         role: Role,
         outcome: &runner::RunOutcome,
     ) -> Result<bool> {
-        let Some(command) = outcome.denied_commands.first().cloned() else {
+        let Some(command) = outcome.stopping_denied_command.clone() else {
+            if let Some(first) = outcome.denied_commands.first() {
+                let msg = format!(
+                    "not offering a grant for `{}`: the denial did not stop the {} session; {}",
+                    crate::presentation::visible(first),
+                    role_label(role),
+                    validator_session_end_summary(outcome)
+                );
+                self.emit_decision(&msg, None)?;
+            }
             return Ok(false);
         };
         let desc = format!("{} validation blocked on `{command}`", role_label(role));
@@ -6545,12 +6560,13 @@ impl MissionEngine {
                 self.emit_decision(
                     &format!(
                         "{} {} run did not produce a trusted validator report ({}); retrying once with \
-                         the {} {}",
+                         the {} {}; {}",
                         selected_kind.as_str(),
                         role_label(role),
                         run_outcome_summary(&outcome),
                         retry_kind.as_str(),
-                        role_label(role)
+                        role_label(role),
+                        validator_session_end_summary(&outcome)
                     ),
                     None,
                 )?;
@@ -6646,9 +6662,10 @@ impl MissionEngine {
 
             if !validator_outcome_trusted(&outcome) {
                 let reason = format!(
-                    "{} validation did not produce a trusted report after retry: {}",
+                    "{} validation did not produce a trusted report after retry: {}; {}",
                     role_label(role),
-                    run_outcome_summary(&outcome)
+                    run_outcome_summary(&outcome),
+                    validator_session_end_summary(&outcome)
                 );
                 self.emit_decision(&reason, None)?;
                 self.emit(EventKind::MilestoneBlocked {
@@ -8300,6 +8317,42 @@ fn session_exit_summary(exit: &SessionExit) -> String {
         SessionExit::Aborted => "aborted".to_string(),
         SessionExit::Failed(message) => format!("failed: {}", tail_chars(message, 240)),
     }
+}
+
+/// Describe how a validator session actually ended, for use in a grant-park
+/// decision or an untrusted-validator block reason when a command denial was
+/// NOT what stopped it (D-B): names the terminal state, the last tool call
+/// made, and how many tool calls (if any) ran after the last denied tool
+/// result. Relied on by mission tests for the exact phrases `ended its turn
+/// without a report`, `last tool call: `, and `tool call(s) ran after the
+/// last denied tool result`.
+fn validator_session_end_summary(outcome: &runner::RunOutcome) -> String {
+    let mut parts = Vec::new();
+    parts.push(match &outcome.exit {
+        SessionExit::Aborted => "the session was aborted by the engine".to_string(),
+        SessionExit::Failed(message) => {
+            format!("the session failed: {}", tail_chars(message, 240))
+        }
+        SessionExit::Completed if outcome.result == RunResult::Fail => {
+            "the session ended with an error result".to_string()
+        }
+        SessionExit::Completed if outcome.validator_report.is_none() => {
+            "the session ended its turn without a report".to_string()
+        }
+        SessionExit::Completed => "the session produced a report".to_string(),
+    });
+    parts.push(match &outcome.last_tool_call {
+        Some(last) => format!("last tool call: `{}`", crate::presentation::visible(last)),
+        None => "it made no tool calls".to_string(),
+    });
+    if let Some(n) = outcome.tool_calls_after_last_denial {
+        parts.push(if n > 0 {
+            format!("{n} tool call(s) ran after the last denied tool result")
+        } else {
+            "the last denied tool result was its final tool event".to_string()
+        });
+    }
+    parts.join("; ")
 }
 
 /// Classify a worker run that died on a backend auth/dead-binary signature as
@@ -13264,6 +13317,9 @@ pub(crate) mod tests {
             denied_commands: vec![],
             denied_egress: vec![],
             backgrounded_commands: vec![],
+            tool_calls_after_last_denial: None,
+            stopping_denied_command: None,
+            last_tool_call: None,
         };
 
         let validators_before = (
@@ -13451,7 +13507,114 @@ pub(crate) mod tests {
             denied_commands: vec![],
             denied_egress: vec![],
             backgrounded_commands: vec![],
+            tool_calls_after_last_denial: None,
+            stopping_denied_command: None,
+            last_tool_call: None,
         }
+    }
+
+    /// A minimal validator outcome for [`validator_session_end_summary`]
+    /// tests; callers override the fields under test with struct-update
+    /// syntax.
+    #[cfg(test)]
+    fn validator_base_outcome() -> runner::RunOutcome {
+        runner::RunOutcome {
+            run_id: "r-1".to_string(),
+            session_id: "s-1".to_string(),
+            result: RunResult::Partial,
+            usage: TokenUsage::default(),
+            cost_usd: None,
+            final_text: String::new(),
+            report: None,
+            validator_report: None,
+            exit: SessionExit::Completed,
+            denied_count: 0,
+            denied_commands: vec![],
+            denied_egress: vec![],
+            backgrounded_commands: vec![],
+            tool_calls_after_last_denial: None,
+            stopping_denied_command: None,
+            last_tool_call: None,
+        }
+    }
+
+    #[test]
+    fn validator_session_end_summary_no_report_with_calls_after_denial() {
+        let outcome = runner::RunOutcome {
+            tool_calls_after_last_denial: Some(33),
+            last_tool_call: Some("Agent: check".to_string()),
+            ..validator_base_outcome()
+        };
+        let summary = validator_session_end_summary(&outcome);
+        assert!(
+            summary.contains("ended its turn without a report"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("last tool call: `Agent: check`"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("33 tool call(s) ran after the last denied tool result"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn validator_session_end_summary_denial_was_final_event() {
+        let outcome = runner::RunOutcome {
+            tool_calls_after_last_denial: Some(0),
+            last_tool_call: Some("Bash: ls".to_string()),
+            ..validator_base_outcome()
+        };
+        let summary = validator_session_end_summary(&outcome);
+        assert!(
+            summary.contains("the last denied tool result was its final tool event"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn validator_session_end_summary_aborted() {
+        let outcome = runner::RunOutcome {
+            exit: SessionExit::Aborted,
+            ..validator_base_outcome()
+        };
+        let summary = validator_session_end_summary(&outcome);
+        assert!(summary.contains("was aborted"), "{summary}");
+    }
+
+    #[test]
+    fn validator_session_end_summary_failed() {
+        let outcome = runner::RunOutcome {
+            exit: SessionExit::Failed("boom: connection reset".to_string()),
+            ..validator_base_outcome()
+        };
+        let summary = validator_session_end_summary(&outcome);
+        assert!(summary.contains("failed: "), "{summary}");
+        assert!(summary.contains("boom: connection reset"), "{summary}");
+    }
+
+    #[test]
+    fn validator_session_end_summary_error_result() {
+        let outcome = runner::RunOutcome {
+            result: RunResult::Fail,
+            exit: SessionExit::Completed,
+            ..validator_base_outcome()
+        };
+        let summary = validator_session_end_summary(&outcome);
+        assert!(summary.contains("ended with an error result"), "{summary}");
+    }
+
+    #[test]
+    fn validator_session_end_summary_no_tool_calls() {
+        let outcome = validator_base_outcome();
+        let summary = validator_session_end_summary(&outcome);
+        assert!(summary.contains("it made no tool calls"), "{summary}");
+        assert!(
+            !summary.contains("denied tool result"),
+            "no denial present: {summary}"
+        );
     }
 
     /// Build a minimal worker outcome with the given result/exit for the
@@ -13471,6 +13634,9 @@ pub(crate) mod tests {
             denied_commands: vec![],
             denied_egress: vec![],
             backgrounded_commands: vec![],
+            tool_calls_after_last_denial: None,
+            stopping_denied_command: None,
+            last_tool_call: None,
         }
     }
 

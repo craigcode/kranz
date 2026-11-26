@@ -5,6 +5,11 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: a validator that was denied a command but carried on and later
+  stopped for another reason is no longer parked for a grant on that
+  command; the engine retries it and, if it still has no report, blocks
+  the milestone with a reason saying how the session ended. A denial that
+  was the validator's last tool call still raises a grant request.
 - Changed: by operator decision, `kranz outcomes`'s autonomy ratio now
   follows the definition published in docs/metrics.md and already used
   by `kranz escalation-metrics` (`.autonomy`): abandoned missions no
