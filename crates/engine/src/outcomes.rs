@@ -21,6 +21,14 @@ use crate::events::{Event, EventKind};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Follows the published definition in docs/metrics.md §1, the same rule
+/// [`crate::escalation_metrics`]'s `.autonomy` (`kranz escalation-metrics`)
+/// implements: `closed_missions` counts only missions whose FIRST terminal
+/// event is `mission.completed` or `mission.failed` (an abandoned mission
+/// leaves the denominator), and interventions are the shared
+/// [`crate::escalation_metrics::mission_interventions`] total — grant
+/// decisions, steers classified by seq, revision rulings, and operator
+/// unblocks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutonomyRatio {
@@ -118,6 +126,8 @@ pub struct Outcomes {
     /// Versioned, read-only explanation of recorded causes. Absent in older reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_reasons: Option<reasons::Report>,
+    /// Follows docs/metrics.md §1 and `kranz escalation-metrics`'s
+    /// `.autonomy` — see [`AutonomyRatio`].
     pub autonomy_ratio: AutonomyRatio,
     /// Abandoned missions, beside the autonomy ratio above: it does not feed
     /// the ratio's numerator or denominator, just rides along for visibility.
@@ -301,6 +311,11 @@ pub struct MissionOutcomes {
     pub outcome_reasons: reasons::MissionReasons,
     pub interventions: u64,
     pub is_closed: bool,
+    /// The published autonomy ratio's denominator membership (docs/metrics.md
+    /// §1): true when the mission's FIRST terminal event is completed or
+    /// failed; false when it is abandoned (or when there is none yet).
+    /// Unlike [`Self::is_closed`], abandoned missions are excluded.
+    pub autonomy_closed: bool,
     pub latencies_ms: Vec<u64>,
     pub escalations: Vec<EscalationRow>,
     /// Σ worker.completed costUsd, with token-priced fallback for runs that
@@ -494,30 +509,9 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         )
     });
 
-    let plan_approved_ts = mission_events
-        .iter()
-        .find(|e| matches!(e.kind, EventKind::PlanApproved { .. }))
-        .map(|e| e.ts);
-
-    let mut interventions: u64 = 0;
-    for e in &mission_events {
-        match &e.kind {
-            EventKind::UserMessage { .. } => {
-                if let Some(approved_ts) = plan_approved_ts {
-                    if e.ts >= approved_ts {
-                        interventions += 1;
-                    }
-                }
-            }
-            EventKind::GrantApproved { .. }
-            | EventKind::GrantDenied { .. }
-            | EventKind::PlanRevised { .. }
-            | EventKind::PlanRevisionRejected { .. } => {
-                interventions += 1;
-            }
-            _ => {}
-        }
-    }
+    let interventions =
+        crate::escalation_metrics::mission_interventions(mission_id, events).total();
+    let autonomy_closed = crate::escalation_metrics::counts_toward_autonomy(mission_id, events);
 
     let mut latencies_ms = Vec::new();
     let mut escalations = Vec::new();
@@ -882,6 +876,7 @@ pub fn mission_outcomes(mission_id: &str, events: &[Event]) -> MissionOutcomes {
         outcome_reasons,
         interventions,
         is_closed,
+        autonomy_closed,
         latencies_ms,
         escalations,
         cost_usd,
@@ -1066,7 +1061,7 @@ pub fn compute_outcomes_with_options(
         if let Some(row) = out.abandoned.clone() {
             abandoned_rows.push(row);
         }
-        if out.is_closed {
+        if out.autonomy_closed {
             closed_missions += 1;
             total_interventions += out.interventions;
             if out.interventions == 0 {
@@ -1307,8 +1302,9 @@ pub const MAX_MERGED_CHANGE_WINDOW_DAYS: u64 = 36_525;
 pub struct CostPerMergedChange {
     /// The window in effect (days).
     pub window_days: u64,
-    /// Missions with a terminal event inside the window (any terminal kind —
-    /// the same closed set as [`AutonomyRatio`]).
+    /// Missions with a terminal event inside the window — every terminal
+    /// kind, abandoned included, unlike [`AutonomyRatio`], which excludes
+    /// abandoned missions from its denominator.
     pub closed_in_window: u64,
     /// Σ worker cost over the windowed missions (same rule as
     /// [`CostPerChange::total_cost_usd`]).
@@ -1319,7 +1315,8 @@ pub struct CostPerMergedChange {
     /// window (absent, never zero: no fabricated numbers).
     pub usd_per_merged_change: Option<f64>,
     /// zero-intervention closed / closed over the same window — None when
-    /// nothing closed in it.
+    /// nothing closed in it. The denominator includes abandoned missions
+    /// (same window as `closed_in_window`).
     pub zero_intervention_share: Option<f64>,
 }
 
@@ -1687,6 +1684,115 @@ mod tests {
         )];
         let out = mission_outcomes("m-1", &events);
         assert!(!out.is_closed);
+    }
+
+    #[test]
+    fn interventions_count_operator_unblock_but_not_engine_lift() {
+        let events = vec![
+            ev(
+                1,
+                "m-1",
+                0,
+                EventKind::MilestoneBlocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "workspace gate: bootstrap failed".into(),
+                },
+            ),
+            // Engine-owned lift — not an operator decision, must not count.
+            ev(
+                2,
+                "m-1",
+                100,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: crate::workspace_gate::GATE_LIFT_REASON.to_string(),
+                    validator_guidance: None,
+                },
+            ),
+            ev(
+                3,
+                "m-1",
+                200,
+                EventKind::MilestoneBlocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "fix-cycle cap".into(),
+                },
+            ),
+            // An operator unblock — must count.
+            ev(
+                4,
+                "m-1",
+                300,
+                EventKind::MilestoneUnblocked {
+                    block_context: None,
+                    milestone_id: "ms-1".into(),
+                    reason: "user skipped findings".into(),
+                    validator_guidance: None,
+                },
+            ),
+        ];
+        let out = mission_outcomes("m-1", &events);
+        assert_eq!(out.interventions, 1);
+    }
+
+    #[test]
+    fn interventions_count_steer_by_seq_even_when_ts_is_earlier() {
+        let events = vec![
+            ev(
+                1,
+                "m-1",
+                100,
+                EventKind::PlanApproved {
+                    plan: sample_plan(),
+                    base_sha: None,
+                },
+            ),
+            // seq 2 is after plan.approved's seq 1, but its timestamp
+            // (50s) is BEFORE plan.approved's (100s) — classification is by
+            // seq, not wall clock, so this must still count.
+            ev(
+                2,
+                "m-1",
+                50,
+                EventKind::UserMessage {
+                    text: "steer by seq".into(),
+                    interrupt: false,
+                },
+            ),
+        ];
+        let out = mission_outcomes("m-1", &events);
+        assert_eq!(out.interventions, 1);
+    }
+
+    #[test]
+    fn autonomy_closed_false_for_abandoned_true_for_completed_and_failed() {
+        let abandoned = vec![ev(
+            1,
+            "m-1",
+            0,
+            EventKind::MissionAbandoned { reason: "x".into() },
+        )];
+        let out = mission_outcomes("m-1", &abandoned);
+        assert!(out.is_closed);
+        assert!(!out.autonomy_closed);
+
+        let completed = vec![ev(1, "m-1", 0, EventKind::MissionCompleted {})];
+        let out = mission_outcomes("m-1", &completed);
+        assert!(out.is_closed);
+        assert!(out.autonomy_closed);
+
+        let failed = vec![ev(
+            1,
+            "m-1",
+            0,
+            EventKind::MissionFailed { reason: "x".into() },
+        )];
+        let out = mission_outcomes("m-1", &failed);
+        assert!(out.is_closed);
+        assert!(out.autonomy_closed);
     }
 
     #[test]
@@ -2429,10 +2535,14 @@ mod tests {
 
             let outcomes = compute_outcomes(root).unwrap();
             let ratio = outcomes.autonomy_ratio;
-            assert_eq!(ratio.closed_missions, 2);
-            assert_eq!(ratio.total_interventions, 1);
+            // Aligned with the published definition on the operator's
+            // 2026-11-24 decision: m-2 is abandoned, so it now leaves the
+            // ratio's denominator entirely (it used to count closed 2,
+            // share 0.5 — the abandoned mission inflated both).
+            assert_eq!(ratio.closed_missions, 1);
+            assert_eq!(ratio.total_interventions, 0);
             assert_eq!(ratio.zero_intervention_missions, 1);
-            assert_eq!(ratio.zero_intervention_share, 0.5);
+            assert_eq!(ratio.zero_intervention_share, 1.0);
 
             let abandoned = &outcomes.abandoned;
             assert_eq!(abandoned.missions, 1);
@@ -2659,6 +2769,173 @@ mod tests {
                 !value.as_object().unwrap().contains_key("divergences"),
                 "no divergences key on the wire without pools: {value}"
             );
+        }
+
+        /// Cross-fold regression (operator decision, 2026-11-24): `kranz
+        /// outcomes`' autonomy ratio and `kranz escalation-metrics`'
+        /// `.autonomy` must agree over a fixture that exercises all three
+        /// divergences the two folds used to disagree on:
+        /// - m-steer exercises the seq-vs-timestamp steer classification
+        ///   (its `user.message` is after `plan.approved` by seq but before
+        ///   it by wall clock);
+        /// - m-unblock exercises operator unblocks counting as
+        ///   interventions (the old outcomes.rs loop omitted them);
+        /// - m-abandoned exercises the denominator excluding abandoned
+        ///   missions (the old outcomes.rs loop included them).
+        ///
+        /// m-clean is the control: a plain, intervention-free completion.
+        #[test]
+        fn autonomy_ratio_outcomes_matches_escalation_metrics() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+
+            fn mk(seq: u64, mission_id: &str, secs: i64, kind: EventKind) -> Event {
+                Event {
+                    seq,
+                    ts: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+                    mission_id: mission_id.to_string(),
+                    kind,
+                }
+            }
+
+            write_timed_log(
+                root,
+                "m-steer",
+                vec![
+                    mk(1, "m-steer", 0, created("steer")),
+                    mk(
+                        2,
+                        "m-steer",
+                        200,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    // seq 3 is after plan.approved's seq 2, but its
+                    // timestamp (150s) is BEFORE plan.approved's (200s) —
+                    // the seq-based rule must still count it.
+                    mk(
+                        3,
+                        "m-steer",
+                        150,
+                        EventKind::UserMessage {
+                            text: "steer by seq, not by clock".into(),
+                            interrupt: false,
+                        },
+                    ),
+                    mk(4, "m-steer", 300, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            write_timed_log(
+                root,
+                "m-unblock",
+                vec![
+                    mk(1, "m-unblock", 0, created("unblock")),
+                    mk(
+                        2,
+                        "m-unblock",
+                        10,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    mk(
+                        3,
+                        "m-unblock",
+                        20,
+                        EventKind::MilestoneBlocked {
+                            block_context: None,
+                            milestone_id: "ms-1".into(),
+                            reason: "fix-cycle cap".into(),
+                        },
+                    ),
+                    // An operator unblock (reason is an operator decision,
+                    // not the engine-owned workspace-gate lift) — must
+                    // count as an intervention.
+                    mk(
+                        4,
+                        "m-unblock",
+                        30,
+                        EventKind::MilestoneUnblocked {
+                            block_context: None,
+                            milestone_id: "ms-1".into(),
+                            reason: "operator decision".into(),
+                            validator_guidance: None,
+                        },
+                    ),
+                    mk(
+                        5,
+                        "m-unblock",
+                        40,
+                        EventKind::MissionFailed {
+                            reason: "honest failure".into(),
+                        },
+                    ),
+                ],
+            );
+
+            write_timed_log(
+                root,
+                "m-clean",
+                vec![
+                    mk(1, "m-clean", 0, created("clean")),
+                    mk(
+                        2,
+                        "m-clean",
+                        10,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    mk(3, "m-clean", 20, EventKind::MissionCompleted {}),
+                ],
+            );
+
+            write_timed_log(
+                root,
+                "m-abandoned",
+                vec![
+                    mk(1, "m-abandoned", 0, created("abandoned")),
+                    mk(
+                        2,
+                        "m-abandoned",
+                        10,
+                        EventKind::PlanApproved {
+                            plan: sample_plan(),
+                            base_sha: None,
+                        },
+                    ),
+                    mk(
+                        3,
+                        "m-abandoned",
+                        20,
+                        EventKind::MissionAbandoned {
+                            reason: "giving up".into(),
+                        },
+                    ),
+                ],
+            );
+
+            let outcomes = compute_outcomes(root).unwrap();
+            let metrics = crate::escalation_metrics::compute_escalation_metrics(root).unwrap();
+
+            assert_eq!(outcomes.autonomy_ratio.closed_missions, 3);
+            assert_eq!(metrics.autonomy.closed_missions, 3);
+
+            assert_eq!(outcomes.autonomy_ratio.zero_intervention_missions, 1);
+            assert_eq!(metrics.autonomy.zero_intervention_missions, 1);
+
+            assert_eq!(
+                Some(outcomes.autonomy_ratio.zero_intervention_share),
+                Some(1.0 / 3.0)
+            );
+            assert_eq!(metrics.autonomy.zero_intervention_share, Some(1.0 / 3.0));
+
+            assert_eq!(outcomes.autonomy_ratio.total_interventions, 2);
         }
     }
 

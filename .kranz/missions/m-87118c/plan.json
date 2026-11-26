@@ -1,0 +1,146 @@
+{
+  "goal": "Make `kranz outcomes`' AutonomyRatio follow the published definition in docs/metrics.md, the one escalation_metrics.rs implements: abandoned missions leave the denominator, operator unblocks count as interventions, and steers are classified by seq. Prove the two folds agree with a regression test, and record the change in the figures in CHANGELOG.md.",
+  "validationContract": [
+    {
+      "id": "a1",
+      "statement": "A regression test writes one fixture repo with an abandoned mission, an operator unblock, and a steer whose seq is after plan.approved but whose timestamp is before it. It shows that compute_outcomes' autonomyRatio and compute_escalation_metrics' autonomy agree, with closed 3, zero-intervention 1 and share 1/3. The filter matches exactly that one test.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --lib autonomy_ratio_outcomes_matches_escalation_metrics 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. 1 passed'",
+      "timeoutSecs": 1800
+    },
+    {
+      "id": "a2",
+      "statement": "The existing test abandoned_missions_fold_outcomes_ratio_unchanged now pins the aligned numbers (closed_missions 1, total_interventions 0, zero_intervention_share 1.0) and passes.",
+      "check": "command",
+      "command": "body=$(awk '/fn abandoned_missions_fold_outcomes_ratio_unchanged\\(/,/^        }$/' crates/engine/src/outcomes.rs) && printf '%s\\n' \"$body\" | grep -qF 'assert_eq!(ratio.closed_missions, 1);' && printf '%s\\n' \"$body\" | grep -qF 'assert_eq!(ratio.total_interventions, 0);' && printf '%s\\n' \"$body\" | grep -qF 'assert_eq!(ratio.zero_intervention_share, 1.0);' && out=$(cargo test -p kranz-engine --lib abandoned_missions_fold_outcomes_ratio_unchanged 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. 1 passed'",
+      "timeoutSecs": 1800
+    },
+    {
+      "id": "a3",
+      "statement": "mission_outcomes counts interventions through the shared escalation_metrics::mission_interventions rule. The old timestamp-based steer comparison is gone from outcomes.rs.",
+      "check": "command",
+      "command": "grep -q 'mission_interventions' crates/engine/src/outcomes.rs && ! grep -qF 'e.ts >= approved_ts' crates/engine/src/outcomes.rs"
+    },
+    {
+      "id": "a4",
+      "statement": "Every engine lib test in the outcomes module, including outcomes/reasons_tests and the unchanged is_closed_true_for_each_terminal_event, passes.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --lib outcomes:: 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "timeoutSecs": 1800
+    },
+    {
+      "id": "a5",
+      "statement": "Every engine lib test in the escalation_metrics and evidence_bundle modules passes.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --lib escalation_metrics:: 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed' && out=$(cargo test -p kranz-engine --lib evidence_bundle 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "timeoutSecs": 1800
+    },
+    {
+      "id": "a6",
+      "statement": "The engine integration tests for the merged-change report and the mission report pass.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --test outcomes_report_merged_test 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed' && out=$(cargo test -p kranz-engine --test report_test 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed'",
+      "timeoutSecs": 1800
+    },
+    {
+      "id": "a7",
+      "statement": "The .abandoned section is unchanged: the abandoned-missions fold tests pass, escalation_metrics.rs gets additions only, and no outcomes.rs line that builds the abandoned rows or their summary is added or removed.",
+      "check": "command",
+      "command": "out=$(cargo test -p kranz-engine --lib abandoned_missions_fold 2>&1) && printf '%s\\n' \"$out\" | grep -qE 'test result: ok\\. [1-9][0-9]* passed' && ! git diff $KRANZ_BASE_SHA -- crates/engine/src/escalation_metrics.rs | grep -qE '^-([^-]|$)' && ! git diff $KRANZ_BASE_SHA -- crates/engine/src/outcomes.rs | grep -E '^[-+]([^-+]|$)' | grep -qE 'abandoned_mission_row|summarize_abandoned|abandoned_rows'",
+      "timeoutSecs": 1800
+    },
+    {
+      "id": "a8",
+      "statement": "docs/metrics.md is unchanged, so no new definition is published.",
+      "check": "command",
+      "command": "git diff --quiet $KRANZ_BASE_SHA -- docs/metrics.md"
+    },
+    {
+      "id": "a9",
+      "statement": "CHANGELOG.md gains an entry that names `kranz outcomes`, the autonomy figures and abandoned missions.",
+      "check": "command",
+      "command": "d=$(git diff $KRANZ_BASE_SHA -- CHANGELOG.md | grep -E '^\\+([^+]|$)') && printf '%s\\n' \"$d\" | grep -qF 'kranz outcomes' && printf '%s\\n' \"$d\" | grep -qi 'autonomy' && printf '%s\\n' \"$d\" | grep -qi 'abandon' && printf '%s\\n' \"$d\" | grep -qi 'unblock'"
+    },
+    {
+      "id": "a10",
+      "statement": "The CostPerMergedChange doc comments no longer claim the window uses the same closed set as AutonomyRatio.",
+      "check": "command",
+      "command": "! grep -qF 'the same closed set as' crates/engine/src/outcomes.rs"
+    },
+    {
+      "id": "a11",
+      "statement": "The workspace is rustfmt-clean, and kranz-engine has no clippy warnings in any target.",
+      "check": "command",
+      "command": "cargo fmt --all --check && cargo clippy -p kranz-engine --all-targets -- -D warnings",
+      "timeoutSecs": 1800
+    },
+    {
+      "id": "a12",
+      "statement": "The CHANGELOG entry says that the `kranz outcomes` autonomy figures change and why: they now follow docs/metrics.md and `kranz escalation-metrics`, per an operator decision. It names the three rule changes. It names the side effects: the evidence bundle's Interventions figure and the intervention count behind the `kranz outcomes --all` / cost-per-merged-change autonomy share now use the same rule, while that share's denominator still counts abandoned missions. It also says the .abandoned section is unchanged.",
+      "check": "agent-judgement"
+    }
+  ],
+  "milestones": [
+    {
+      "title": "kranz outcomes autonomy ratio follows the published definition",
+      "features": [
+        {
+          "title": "Align outcomes.rs AutonomyRatio with escalation_metrics and add the cross-fold regression test",
+          "spec": "Repository: kranz, a Rust workspace. Engine crate: `kranz-engine` at crates/engine.\n\nBACKGROUND. `crates/engine/src/outcomes.rs` (the `kranz outcomes` fold) computes an `AutonomyRatio` (struct near line 26) that disagrees in three ways with the published definition in docs/metrics.md §1, which `crates/engine/src/escalation_metrics.rs` implements:\n(1) Its denominator includes ABANDONED missions. In `mission_outcomes` (near line 472), `is_closed` matches MissionCompleted | MissionFailed | MissionAbandoned, and `compute_outcomes_with_options` (near line 1069) feeds `if out.is_closed` into the ratio. The published ratio counts only missions whose FIRST terminal event is MissionCompleted or MissionFailed. See `mission_escalation` (near line 393) and `aggregate` (near line 583) in escalation_metrics.rs.\n(2) Its intervention loop (outcomes.rs near lines 497-520) omits operator unblocks.\n(3) It classifies post-approval `user.message` steers by TIMESTAMP (`e.ts >= approved_ts`) instead of SEQ.\nThe shared rule is `pub fn mission_interventions(mission_id, events) -> InterventionCounts` in escalation_metrics.rs (near line 264). It covers grant decisions, steers by seq, revision rulings, and operator unblocks other than the engine workspace-gate lift, and `.total()` sums them. The operator decided on 2026-11-24 to align `kranz outcomes` with the published definition.\n\nWHAT TO DO.\nA. In escalation_metrics.rs, ADD (additions only; do not modify, reorder or delete any existing line in that file) a small `pub(crate) fn` that reports whether a mission counts toward the autonomy ratio's denominator. Suggested name: `counts_toward_autonomy(mission_id: &str, events: &[Event]) -> bool`. It filters to `mission_id`, finds the FIRST terminal event (MissionCompleted / MissionFailed / MissionAbandoned) in slice order, and returns true only if it is Completed or Failed, which is the same first-terminal rule `mission_escalation` uses. Give it a doc comment. Do NOT refactor `mission_escalation`, `aggregate`, `abandoned_mission_row` or `summarize_abandoned` to use it.\nB. In outcomes.rs `mission_outcomes`: replace the inline intervention loop with `crate::escalation_metrics::mission_interventions(mission_id, events).total()`. Delete the old loop and the `plan_approved_ts` variable if nothing else uses it. The string `e.ts >= approved_ts` must no longer appear in the file. Add a new field to `MissionOutcomes` (near line 300), e.g. `pub autonomy_closed: bool`, with a doc comment saying it is the published ratio's denominator membership (completed or failed, abandoned excluded, first-terminal rule). Set it from the helper in A. `MissionOutcomes` is constructed only in `mission_outcomes` (near line 881).\nC. KEEP `MissionOutcomes.is_closed` meaning 'reached any terminal event, abandoned included'. It still feeds cycle time, per-task-class `closed_missions` (near line 1091) and the evidence bundle's `Closed:` line (evidence_bundle.rs near line 628). Do not change those uses, and do not change the test `is_closed_true_for_each_terminal_event`.\nD. In `compute_outcomes_with_options` (near line 1069), make the AutonomyRatio block use `if out.autonomy_closed` instead of `if out.is_closed`. `total_interventions` and `zero_intervention_missions` keep using `out.interventions`, which now holds the shared rule's total. Update the doc comments on `AutonomyRatio` / `Outcomes.autonomy_ratio` to say it follows docs/metrics.md §1 and `kranz escalation-metrics` `.autonomy`. Do not change the AutonomyRatio struct's fields or serde names; the dashboard, CLI and Slack read them.\nE. Leave every line that builds the `.abandoned` section unchanged: the `abandoned:` field in MissionOutcomes and the `abandoned_rows` / `summarize_abandoned` code in compute_outcomes_with_options. Do not add or remove any line containing `abandoned_mission_row`, `summarize_abandoned` or `abandoned_rows`.\nF. `compute_cost_per_merged_change` (near line 1334) and `CostPerMergedChange` (near line 1305) stay behaviourally as they are, apart from picking up the new `interventions` value. Their window and `closed_in_window` still count every terminal kind, abandoned included. Fix the now-stale doc comments: the `closed_in_window` doc currently says 'the same closed set as [`AutonomyRatio`]', and the string 'the same closed set as' must not appear anywhere in outcomes.rs afterwards. Reword it to say it counts every terminal kind, abandoned included, unlike AutonomyRatio. Also say on `zero_intervention_share` that its denominator includes abandoned missions.\nG. Update the existing test `abandoned_missions_fold_outcomes_ratio_unchanged` (module `compute_outcomes_tests` inside outcomes.rs tests, near line 2387). Keep its NAME and fixture. Change its ratio assertions to exactly these lines: `assert_eq!(ratio.closed_missions, 1);`, `assert_eq!(ratio.total_interventions, 0);`, `assert_eq!(ratio.zero_intervention_missions, 1);`, `assert_eq!(ratio.zero_intervention_share, 1.0);`. Keep the `.abandoned` assertions unchanged. Add a short comment that the numbers were aligned with the published definition on the operator's 2026-11-24 decision; before that the test pinned closed 2 and share 0.5. Fix any other existing outcomes.rs test whose expected numbers change because of the shared rule, and mention each one in your report.\nH. Add ONE new regression test named exactly `autonomy_ratio_outcomes_matches_escalation_metrics` inside `compute_outcomes_tests` in outcomes.rs. Make sure no other test name contains that string. In a TempDir, write hand-timed logs with the existing helpers `write_timed_log` / `timed` (near line 1984; they write events.jsonl with fixed seq and ts, seq contiguous from 1 per mission). Write four missions:\n  m-steer: mission.created, plan.approved (seq 2, ts 200s), user.message (seq 3, ts 150s: after approval by seq, BEFORE it by timestamp), mission.completed.\n  m-unblock: mission.created, plan.approved, milestone.blocked, milestone.unblocked with reason 'operator decision' and block_context None (an operator unblock, not the workspace-gate lift), mission.failed.\n  m-clean: mission.created, plan.approved, mission.completed.\n  m-abandoned: mission.created, plan.approved, mission.abandoned.\nThen call `compute_outcomes(root)` and `crate::escalation_metrics::compute_escalation_metrics(root)` over the same root. Assert: outcomes.autonomy_ratio.closed_missions == metrics.autonomy.closed_missions == 3; zero_intervention_missions equal in both == 1; Some(outcomes.autonomy_ratio.zero_intervention_share) == metrics.autonomy.zero_intervention_share == Some(1.0/3.0); outcomes.autonomy_ratio.total_interventions == 2. Add a comment naming which mission exercises which of the three divergences. If EventLog::read_events rejects a timestamp that goes backwards, do NOT weaken the test, because a tie does not separate the two rules. Stop and report it as blocked.\nI. Add unit tests on `mission_outcomes` with these names: one showing an operator `milestone.unblocked` counts as an intervention while the workspace-gate lift (reason `crate::workspace_gate::GATE_LIFT_REASON`, block_context None) does not; one showing a user.message after plan.approved by seq but earlier by timestamp counts; one showing `autonomy_closed` is false and `is_closed` true for an abandoned-only mission, and both true for completed and for failed. Name them so none contains 'autonomy_ratio_outcomes_matches_escalation_metrics'.\n\nTESTING DISCIPLINE (important). Run ONLY filtered engine tests, e.g. `cargo test -p kranz-engine --lib autonomy_ratio_outcomes_matches_escalation_metrics`, `cargo test -p kranz-engine --lib outcomes::`, `cargo test -p kranz-engine --lib escalation_metrics::`, `cargo test -p kranz-engine --lib evidence_bundle`, `cargo test -p kranz-engine --test outcomes_report_merged_test`, `cargo test -p kranz-engine --test report_test`. Do NOT run unfiltered `cargo test -p kranz-engine --lib` or `cargo test --workspace`: they can outrun your command limit. Before finishing, run `cargo fmt --all` and `cargo clippy -p kranz-engine --all-targets -- -D warnings`. Touch only crates/engine/src/outcomes.rs and crates/engine/src/escalation_metrics.rs. Do not edit CHANGELOG.md or docs/; another feature does the changelog.",
+          "validationCriteria": [
+            "`cargo test -p kranz-engine --lib autonomy_ratio_outcomes_matches_escalation_metrics` runs exactly 1 test and it passes. Over one fixture repo (an abandoned mission, an operator unblock on a failed mission, a steer whose seq is after plan.approved but whose ts is before it, and a clean completion), compute_outcomes and compute_escalation_metrics both report closed 3, zero-intervention 1, share 1/3, and outcomes reports total_interventions 2",
+            "abandoned_missions_fold_outcomes_ratio_unchanged asserts closed_missions 1, total_interventions 0, zero_intervention_missions 1, zero_intervention_share 1.0, keeps its .abandoned assertions, and passes",
+            "mission_outcomes counts an operator milestone.unblocked as an intervention but not the workspace-gate lift (GATE_LIFT_REASON)",
+            "mission_outcomes counts a user.message whose seq is at or after plan.approved even when its ts is earlier",
+            "For an abandoned-only mission, is_closed is true and autonomy_closed is false; for a completed mission and for a failed mission, both are true",
+            "is_closed_true_for_each_terminal_event still passes unchanged",
+            "escalation_metrics.rs diff is additions only; no line containing abandoned_mission_row, summarize_abandoned or abandoned_rows is added or removed in outcomes.rs",
+            "the string 'the same closed set as' no longer appears in outcomes.rs, and the string 'e.ts >= approved_ts' no longer appears either",
+            "`cargo test -p kranz-engine --lib outcomes::`, `--lib escalation_metrics::`, `--lib evidence_bundle`, `--test outcomes_report_merged_test` and `--test report_test` all pass; `cargo fmt --all --check` and `cargo clippy -p kranz-engine --all-targets -- -D warnings` are clean"
+          ]
+        },
+        {
+          "title": "Changelog entry for the changed kranz outcomes autonomy figures",
+          "spec": "Repository: kranz (Rust workspace). Edit ONLY CHANGELOG.md. Add one new bullet at the TOP of the `## Unreleased` section, directly under that heading, above the existing first bullet. Match the existing bullets' style: start with `- Changed: `, use plain sentences, and wrap lines at about 76 columns with a two-space continuation indent. Do not edit or remove any existing bullet. That includes the older bullet saying 'Neither autonomy ratio changes.', which recorded a past release accurately.\n\nCONTEXT (already implemented in crates/engine/src/outcomes.rs by an earlier feature; do not touch code). The autonomy ratio that `kranz outcomes` reports (JSON `.autonomyRatio`: closedMissions, totalInterventions, interventionsPerClosedMission, zeroInterventionMissions, zeroInterventionShare) now follows the definition published in docs/metrics.md and reported by `kranz escalation-metrics` (`.autonomy`). The operator decided this on 2026-11-24. Three rules changed: abandoned missions no longer count as closed missions; operator unblocks count as interventions (the engine's own workspace-gate lift still does not); and steers are counted by event order (seq), not by timestamp. As a result, `kranz outcomes` and `kranz escalation-metrics` now give the same autonomy ratio for the same repo. Before, they could differ.\nSide effects the entry must also state: the same intervention rule now feeds the `Interventions:` figure in a mission's evidence bundle, and the intervention count behind the per-repo autonomy share in `kranz outcomes --all` and `GET /api/cost-per-merged-change` (`zeroInterventionShare`). That share's denominator still counts abandoned missions, as before. The `.abandoned` section is unchanged. docs/metrics.md is unchanged; it needs no new definition.\n\nThe entry must contain the literal text `kranz outcomes` and the words 'autonomy', 'abandoned' and 'unblock'. Say plainly that the reported numbers change for repos with abandoned missions, operator unblocks, or steers recorded with out-of-order timestamps.\n\nTo check your diff, run `git diff $KRANZ_BASE_SHA -- CHANGELOG.md`. Do not run cargo builds or tests; this feature changes no code.",
+          "validationCriteria": [
+            "`git diff $KRANZ_BASE_SHA -- CHANGELOG.md` shows only added lines, all in one new `- Changed:` bullet at the top of `## Unreleased`",
+            "the added lines contain `kranz outcomes`, 'autonomy', 'abandoned' and 'unblock'",
+            "the entry says why (aligned with docs/metrics.md / `kranz escalation-metrics` per the operator decision), names all three rule changes, names the evidence-bundle Interventions figure and the `kranz outcomes --all` / cost-per-merged-change share as also affected, says that share's denominator still counts abandoned missions, and says .abandoned is unchanged",
+            "no file other than CHANGELOG.md is modified by this feature"
+          ]
+        }
+      ]
+    }
+  ],
+  "consideredAlternatives": {
+    "chosen": "Use the shared mission_interventions rule for every reader of MissionOutcomes.interventions, add a separate first-terminal completed/failed flag used only by AutonomyRatio, and keep is_closed meaning 'reached any terminal event'. The ratio matches the published definition with one intervention rule, and the evidence bundle's Closed line, cycle time and task-class closed counts keep their meaning.",
+    "rejected": [
+      {
+        "approach": "Change is_closed itself to exclude abandoned, as the ticket's option text literally says",
+        "tradeOff": "An abandoned mission's evidence bundle would read 'Outcome: abandoned … Closed: no', per-task-class closedMissions would drop silently, and is_closed_true_for_each_terminal_event would have to be rewritten."
+      },
+      {
+        "approach": "Use the shared intervention rule only for AutonomyRatio and keep the old inline loop for the evidence bundle and cost-per-merged-change",
+        "tradeOff": "Keeps a second copy of the intervention rule, which the ticket asks to avoid, so the evidence bundle's Interventions figure stays out of step with the mission report's Interventions line."
+      },
+      {
+        "approach": "Also remove abandoned missions from the denominator of the `kranz outcomes --all` / cost-per-merged-change autonomy share",
+        "tradeOff": "That figure's closedInWindow also feeds its cost numerator, and changing it is a separate scope decision the operator has not made. It also adds a feature and touches outcomes_report_merged_test.rs."
+      }
+    ]
+  },
+  "commandGrants": [
+    "git diff $KRANZ_BASE_SHA -- crates/engine/src/escalation_metrics.rs",
+    "git diff $KRANZ_BASE_SHA -- crates/engine/src/outcomes.rs",
+    "git diff $KRANZ_BASE_SHA -- CHANGELOG.md",
+    "git diff --quiet $KRANZ_BASE_SHA -- docs/metrics.md",
+    "git diff $KRANZ_BASE_SHA -- crates/engine/src/escalation_metrics.rs | grep -qE '^-([^-]|$)'",
+    "git diff $KRANZ_BASE_SHA -- crates/engine/src/outcomes.rs | grep -E '^[-+]([^-+]|$)'",
+    "git diff $KRANZ_BASE_SHA -- CHANGELOG.md | grep -E '^\\+([^+]|$)'"
+  ],
+  "touchSet": [
+    "crates/engine/src/outcomes.rs",
+    "crates/engine/src/escalation_metrics.rs",
+    "CHANGELOG.md"
+  ]
+}

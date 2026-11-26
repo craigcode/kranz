@@ -301,6 +301,28 @@ pub fn mission_interventions(mission_id: &str, events: &[Event]) -> Intervention
     counts
 }
 
+/// Reports whether `mission_id` counts toward the autonomy ratio's
+/// denominator (docs/metrics.md §1): the mission's FIRST terminal event, in
+/// slice order, must be `mission.completed` or `mission.failed` — the same
+/// first-terminal rule [`mission_escalation`] uses. An abandoned mission (or
+/// one with no terminal event at all) returns `false`. `events` may contain
+/// other missions' events too (filtered out).
+pub(crate) fn counts_toward_autonomy(mission_id: &str, events: &[Event]) -> bool {
+    let terminal = events
+        .iter()
+        .filter(|e| e.mission_id == mission_id)
+        .find_map(|e| match &e.kind {
+            EventKind::MissionCompleted {} => Some(TerminalOutcome::Completed),
+            EventKind::MissionFailed { .. } => Some(TerminalOutcome::Failed),
+            EventKind::MissionAbandoned { .. } => Some(TerminalOutcome::Abandoned),
+            _ => None,
+        });
+    matches!(
+        terminal,
+        Some(TerminalOutcome::Completed) | Some(TerminalOutcome::Failed)
+    )
+}
+
 /// Render an [`InterventionCounts`] as the one human-readable summary shared
 /// by the mission report and the CLI (`escalation-metrics` / `outcomes`).
 pub fn format_intervention_classes(counts: &InterventionCounts) -> String {
