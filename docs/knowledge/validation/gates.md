@@ -428,6 +428,12 @@ the mission's event log (`command_result.rs`). Its fields: `milestoneId`,
 `stdoutTruncated`/`stderrTruncated`, and `failureDigest`. The event changes
 no verdict and nothing the validator is shown.
 
+`stage` is one of three wire values: `validation` (a due assertion run in a
+milestone validation round), `validation-notdue` (an assertion scoped to a
+later milestone, run as advisory in a validation round) or `final-gate` (the
+final gate's run of every assertion regardless of due-at). The final-gate
+result is recorded against the mission's last milestone.
+
 The tails are the engine's existing per-stream captures (up to 1500 chars
 each), scrubbed and then bounded to 4096 bytes, keeping the end. A timed-out
 run has empty tails.
@@ -438,11 +444,12 @@ approval lint and external-gate checks are not recorded.
 `failureDigest` appears only on a non-pass. It is a sha256 over the outcome
 label, exit code, signal, start error and the normalised tails, where
 normalising means unifying line endings, stripping trailing whitespace per
-line and masking duration tokens (`0.53s`, `120ms`, ...) as `<dur>`, so two
-runs of the same failing check that only differ in how long they took still
-compare equal. Known limit: after a code change, cargo's `Compiling ...`
-lines differ, so a real repeat failure may not match — digest equality is
-evidence of the same failure, inequality is not proof of a different one.
+line, dropping trailing empty lines and masking duration tokens (`0.53s`,
+`120ms`, ...) as `<dur>`, so two runs of the same failing check that only
+differ in how long they took still compare equal. Known limit: after a code
+change, cargo's `Compiling ...` lines differ, so a real repeat failure may
+not match — digest equality is evidence of the same failure, inequality is
+not proof of a different one.
 
 ## Runtime-gated tests: skip loudly, fail where required
 
