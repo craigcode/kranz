@@ -2396,7 +2396,7 @@ impl MissionEngine {
                     "not offering a grant for `{}`: the denial did not stop the {} session; {}",
                     crate::presentation::visible(first),
                     role_label(role),
-                    validator_session_end_summary(outcome)
+                    session_end_summary(outcome, outcome.validator_report.is_some())
                 );
                 self.emit_decision(&msg, None)?;
             }
@@ -2465,27 +2465,48 @@ impl MissionEngine {
         self.park_for_grant(milestone_id, GrantKind::TouchPath, &path, &desc)
     }
 
-    /// If the worker's `outcome` was blocked by a deny rule, offer the operator
-    /// a grant to LIFT that rule and park, returning `true`. The park discards
-    /// this run's outcome, so either decision re-runs the worker when the run
-    /// loop re-enters this still-Active feature. Approving adds the rule to
-    /// `deny_exceptions` (subtracting it from the worker deny set) so the
-    /// re-run has it lifted; deny/timeout leaves it in force and saturates the
-    /// request cap, so the re-run's denial is not re-offered and flows to the
-    /// normal judgement/respawn. Bounded by the same per-milestone cap.
+    /// If the worker's `outcome` was blocked by a deny rule AND that denial
+    /// is what STOPPED the session (D-A/D-B: `outcome.stopping_denied_command`
+    /// is `Some`, i.e. no tool call followed the last denied tool result),
+    /// offer the operator a grant to LIFT the matching rule and park,
+    /// returning `true`. The park discards this run's outcome, so either
+    /// decision re-runs the worker when the run loop re-enters this still-Active
+    /// feature. Approving adds the rule to `deny_exceptions` (subtracting it
+    /// from the worker deny set) so the re-run has it lifted; deny/timeout
+    /// leaves it in force and saturates the request cap, so the re-run's
+    /// denial is not re-offered and flows to the normal judgement/respawn.
+    /// Bounded by the same per-milestone cap.
+    ///
+    /// When the denial did NOT stop the session (the worker made a further
+    /// tool call — it worked around the denial or moved on before failing for
+    /// some other reason), this emits one `not offering a grant for ...`
+    /// decision naming the first denied command and how the session actually
+    /// ended, and returns `false` so the run goes to the normal judgement and
+    /// is charged to `max_respawns` like any other failure. A worker that
+    /// retries a variant command still makes a tool call before failing, so
+    /// the grant (if any) is keyed to the LAST denied command, not the first.
     ///
     /// The grant TARGET is the deny RULE (e.g. `Bash(git push*)`), not the
     /// command — that is what `deny_exceptions` removes and what the operator is
     /// consenting to lift (coarser than one command, but deny-rule removal is
     /// inherently rule-granular). Only a command blocked by a liftable
     /// `Bash(...)` deny rule is offered; a hook denial or a non-Bash tool denial
-    /// matches no rule and is not grantable this way.
+    /// matches no rule, and emits a `matches no liftable worker deny rule`
+    /// decision instead of parking.
     fn maybe_park_for_worker_deny_grant(
         &mut self,
         milestone_id: &str,
         outcome: &runner::RunOutcome,
     ) -> Result<bool> {
-        let Some(command) = outcome.denied_commands.first().cloned() else {
+        let Some(command) = outcome.stopping_denied_command.clone() else {
+            if let Some(first) = outcome.denied_commands.first() {
+                let msg = format!(
+                    "not offering a grant for `{}`: the denial did not stop the worker session; {}",
+                    crate::presentation::visible(first),
+                    session_end_summary(outcome, outcome.report.is_some())
+                );
+                self.emit_decision(&msg, None)?;
+            }
             return Ok(false);
         };
         // The worker's CURRENT deny set (already-lifted rules removed) still
@@ -2499,6 +2520,11 @@ impl MissionEngine {
         );
         let Some(rule) = permissions::matching_deny_rule(&command, &profile.disallowed_tools)
         else {
+            let msg = format!(
+                "not offering a grant for `{}`: it matches no liftable worker deny rule",
+                crate::presentation::visible(&command)
+            );
+            self.emit_decision(&msg, None)?;
             return Ok(false);
         };
         let desc = format!("worker command `{command}` blocked by deny rule `{rule}`");
@@ -6566,7 +6592,7 @@ impl MissionEngine {
                         run_outcome_summary(&outcome),
                         retry_kind.as_str(),
                         role_label(role),
-                        validator_session_end_summary(&outcome)
+                        session_end_summary(&outcome, outcome.validator_report.is_some())
                     ),
                     None,
                 )?;
@@ -6665,7 +6691,7 @@ impl MissionEngine {
                     "{} validation did not produce a trusted report after retry: {}; {}",
                     role_label(role),
                     run_outcome_summary(&outcome),
-                    validator_session_end_summary(&outcome)
+                    session_end_summary(&outcome, outcome.validator_report.is_some())
                 );
                 self.emit_decision(&reason, None)?;
                 self.emit(EventKind::MilestoneBlocked {
@@ -8319,14 +8345,17 @@ fn session_exit_summary(exit: &SessionExit) -> String {
     }
 }
 
-/// Describe how a validator session actually ended, for use in a grant-park
-/// decision or an untrusted-validator block reason when a command denial was
-/// NOT what stopped it (D-B): names the terminal state, the last tool call
-/// made, and how many tool calls (if any) ran after the last denied tool
-/// result. Relied on by mission tests for the exact phrases `ended its turn
-/// without a report`, `last tool call: `, and `tool call(s) ran after the
-/// last denied tool result`.
-fn validator_session_end_summary(outcome: &runner::RunOutcome) -> String {
+/// Describe how a worker or validator session actually ended, for use in a
+/// grant-park decision or an untrusted-validator block reason when a command
+/// denial was NOT what stopped it (D-B): names the terminal state, the last
+/// tool call made, and how many tool calls (if any) ran after the last
+/// denied tool result. `has_report` is whether the session produced its
+/// role's report (`validator_report` for a validator, `report` for a
+/// worker) — callers pass the field for their own role so this stays
+/// role-agnostic. Relied on by mission tests for the exact phrases `ended
+/// its turn without a report`, `last tool call: `, and `tool call(s) ran
+/// after the last denied tool result`.
+fn session_end_summary(outcome: &runner::RunOutcome, has_report: bool) -> String {
     let mut parts = Vec::new();
     parts.push(match &outcome.exit {
         SessionExit::Aborted => "the session was aborted by the engine".to_string(),
@@ -8336,7 +8365,7 @@ fn validator_session_end_summary(outcome: &runner::RunOutcome) -> String {
         SessionExit::Completed if outcome.result == RunResult::Fail => {
             "the session ended with an error result".to_string()
         }
-        SessionExit::Completed if outcome.validator_report.is_none() => {
+        SessionExit::Completed if !has_report => {
             "the session ended its turn without a report".to_string()
         }
         SessionExit::Completed => "the session produced a report".to_string(),
@@ -13513,7 +13542,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// A minimal validator outcome for [`validator_session_end_summary`]
+    /// A minimal validator outcome for [`session_end_summary`]
     /// tests; callers override the fields under test with struct-update
     /// syntax.
     #[cfg(test)]
@@ -13545,7 +13574,7 @@ pub(crate) mod tests {
             last_tool_call: Some("Agent: check".to_string()),
             ..validator_base_outcome()
         };
-        let summary = validator_session_end_summary(&outcome);
+        let summary = session_end_summary(&outcome, false);
         assert!(
             summary.contains("ended its turn without a report"),
             "{summary}"
@@ -13567,7 +13596,7 @@ pub(crate) mod tests {
             last_tool_call: Some("Bash: ls".to_string()),
             ..validator_base_outcome()
         };
-        let summary = validator_session_end_summary(&outcome);
+        let summary = session_end_summary(&outcome, false);
         assert!(
             summary.contains("the last denied tool result was its final tool event"),
             "{summary}"
@@ -13580,7 +13609,7 @@ pub(crate) mod tests {
             exit: SessionExit::Aborted,
             ..validator_base_outcome()
         };
-        let summary = validator_session_end_summary(&outcome);
+        let summary = session_end_summary(&outcome, false);
         assert!(summary.contains("was aborted"), "{summary}");
     }
 
@@ -13590,7 +13619,7 @@ pub(crate) mod tests {
             exit: SessionExit::Failed("boom: connection reset".to_string()),
             ..validator_base_outcome()
         };
-        let summary = validator_session_end_summary(&outcome);
+        let summary = session_end_summary(&outcome, false);
         assert!(summary.contains("failed: "), "{summary}");
         assert!(summary.contains("boom: connection reset"), "{summary}");
     }
@@ -13602,14 +13631,14 @@ pub(crate) mod tests {
             exit: SessionExit::Completed,
             ..validator_base_outcome()
         };
-        let summary = validator_session_end_summary(&outcome);
+        let summary = session_end_summary(&outcome, false);
         assert!(summary.contains("ended with an error result"), "{summary}");
     }
 
     #[test]
     fn validator_session_end_summary_no_tool_calls() {
         let outcome = validator_base_outcome();
-        let summary = validator_session_end_summary(&outcome);
+        let summary = session_end_summary(&outcome, false);
         assert!(summary.contains("it made no tool calls"), "{summary}");
         assert!(
             !summary.contains("denied tool result"),
