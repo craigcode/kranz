@@ -2,7 +2,7 @@
 title: Child containment (children are hostile by default)
 owner: human
 freshness: check-on-touch
-last_verified: 2026-11-23
+last_verified: 2026-11-27
 verified_against:
   - AGENTS.md
   - crates/engine/src/agent_env.rs
@@ -16,6 +16,16 @@ verified_against:
   - crates/engine/src/validator_snapshot.rs
   - docs/acp-containment.md
 ---
+
+Rechecked 2026-11-27 (UTC) by an agent under the human-note rule in
+`CONVENTIONS.md`: `command_exec.rs` now reports each contract command's signal,
+a could-not-start message, the duration and separate stdout and stderr tails
+on `ContractCommandRun`, and `BoundedOutcome` gains `CouldNotStart` and
+`Failed` so a spawn failure is told apart from a completed run. The joined
+output string, child spawn, the armed process-group kill, the fail-closed
+gate sandbox wrap and the shell wrap are unchanged. No containment rule,
+sandbox profile or gate signal policy changed, and nothing this note states
+changed.
 
 Rechecked 2026-11-23 (UTC) by an agent under the human-note rule in
 `CONVENTIONS.md`: `command_exec.rs` splits its bounded-execution core into a
