@@ -29,9 +29,9 @@ The operator approved re-applying the setting on 2026-11-27 and it was done thro
 
 A workflow that fails at startup cannot report on itself. A check that lives only inside an affected workflow would not have caught this.
 
-## D-X operator decision
+## D-X operator decision (DECIDED 2026-11-27: D-X1)
 
-Where the comparison runs.
+The operator chose D-X1: a local comparison script run with the operator's own credentials, with no new credential in CI. The options are kept for the record.
 
 - D-X1: a local script, for example `scripts/check-actions-setting.py`, that reads the setting with the operator's own `gh` credentials and compares it with the file. Documented as a step in the Actions-bump routine in `docs/public-readiness.md`. No new credential in CI. It relies on someone running it.
 - D-X2: D-X1, plus a CI job that runs the same comparison on pull requests that touch `.github/actions-allowlist.json` and on a schedule. This needs a token that can read the repository's Actions settings. The default `GITHUB_TOKEN` is not expected to have that permission (to be confirmed during scoping), so it means a new read-only repository secret and a decision about which jobs may see it.
@@ -44,8 +44,8 @@ A related, smaller choice that can be made on its own: make `codeql` a required 
 - The check only reads. Applying the setting stays an operator action. No job and no script in this ticket writes to the repository's Actions settings.
 - Compare all three fields: `patterns_allowed` as a set, `github_owned_allowed` and `verified_allowed`. Report entries missing from the setting and entries the setting has that the file does not.
 - Keep `scripts/check-actions-allowlist.py` offline and deterministic. The network comparison is a separate script or a separate mode, and its absence of credentials must not fail the existing `supply-chain` job.
-- Under D-X2, a pull request from a fork gets no secret. The job must skip with a clear message there and must not fail open silently on main.
-- Any new workflow or job follows the existing rules: actions pinned by full commit SHA and listed in the file, least-privilege `permissions`.
+- D-X1 adds no workflow, no job and no secret. A CI comparison (D-X2) is out of scope unless the operator reopens it.
+- When the script cannot read the setting (no `gh` login, or a login without access to the repository's Actions settings), it says so and exits nonzero. It never reports a match it did not verify.
 - A file change that is ahead of the setting is the normal state of an Actions-bump PR before the operator re-applies it. The check should say which side is behind, so the operator knows whether to apply the setting or fix the file.
 
 ## Acceptance hints
