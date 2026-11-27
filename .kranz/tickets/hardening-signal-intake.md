@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Mission m-c5cd5f, delivered by PR #192 on 2026-11-14. The mission ended blocked on one pre-existing test failing in the contract gate, and the operator accepted the branch. The Sentry replay key is derived from the signed body; an accepted delivery is remembered for 24 hours on the server clock; the endpoint and credential-source fields are global-only."
 title: Authenticate replay protection and pin configuration for signal intake
 priority: 3
 schedule: once

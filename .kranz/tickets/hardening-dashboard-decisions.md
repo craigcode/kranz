@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Mission m-373b57, delivered by PR #194 on 2026-11-14. The mission ended blocked when a validator grant request timed out unanswered, and the operator accepted the branch. Grant decisions are bound to the request sequence number and kind; panel drafts clear on a mission switch; board polling pauses after an authentication failure; an expired permission card stays in place."
 title: Tighten how the dashboard binds and presents pending decisions
 priority: 3
 schedule: once
