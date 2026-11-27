@@ -5,6 +5,11 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Added: each contract command the engine runs (validation round,
+  not-yet-due run, final gate) now leaves a `contract.command.result`
+  event in the mission's event log, carrying the exit code or signal, a
+  timed-out or could-not-start marker, the duration, bounded stdout and
+  stderr tails, and a failure digest for comparing repeat failures.
 - Fixed: a worker that was denied a command but carried on and later
   failed for another reason is no longer parked for a grant to lift that
   deny rule; the run goes to the normal judgement and respawn budget, and

@@ -5090,3 +5090,109 @@ fn milestone_tag_fields_serde_round_trip_and_omission_when_none() {
     assert!(!payload.contains_key("retaggedFrom"));
     assert!(!payload.contains_key("staleTag"));
 }
+
+// ---------------------------------------------------------------------------
+// contract.command.result fold compatibility (feature f-2-3)
+// ---------------------------------------------------------------------------
+
+/// A log recorded before `contract.command.result` existed has none of the
+/// events, and still folds to completion — the event is additive and
+/// nothing in the fold depends on its presence.
+#[test]
+fn command_result_old_log_without_result_events_folds() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/gate-results-ladder.events.jsonl");
+    let text = std::fs::read_to_string(&fixture).unwrap();
+    assert!(
+        !text.contains("contract.command.result"),
+        "fixture must predate the contract.command.result event for this test to be meaningful"
+    );
+
+    let events = kranz_engine::event_log::EventLog::read_events(&fixture).unwrap();
+    let state = fold(&events).unwrap();
+    assert_eq!(state.mission.status, MissionStatus::Complete);
+}
+
+/// A minimal `contract.command.result` event — only the required
+/// `assertionId` and `stage` fields, everything else defaulted by serde —
+/// folds cleanly and changes nothing beyond the reducer's own seq
+/// bookkeeping: it is audit-only (reducer.rs, mirrors validation.pty.transcript).
+#[test]
+fn command_result_minimal_event_folds_without_state_change() {
+    let base_kinds = vec![
+        created(),
+        EventKind::PlanApproved {
+            plan: plan(),
+            base_sha: None,
+        },
+    ];
+    let base_events: Vec<Event> = base_kinds
+        .into_iter()
+        .enumerate()
+        .map(|(i, k)| ev(i as u64 + 1, k))
+        .collect();
+    let without = fold(&base_events).unwrap();
+
+    let extra_json = serde_json::json!({
+        "seq": 3,
+        "ts": base_ts() + chrono::Duration::seconds(3),
+        "missionId": MISSION,
+        "type": "contract.command.result",
+        "payload": {
+            "milestoneId": "ms-1",
+            "result": {
+                "assertionId": "a-1",
+                "stage": "validation"
+            }
+        }
+    });
+    let extra_event: Event = serde_json::from_value(extra_json).unwrap();
+    let mut events_with = base_events;
+    events_with.push(extra_event);
+    let with = fold(&events_with).unwrap();
+
+    let mut without_value = serde_json::to_value(&without).unwrap();
+    let mut with_value = serde_json::to_value(&with).unwrap();
+    without_value["lastSeq"] = serde_json::Value::Null;
+    with_value["lastSeq"] = serde_json::Value::Null;
+    assert_eq!(
+        with_value, without_value,
+        "an audit-only contract.command.result must change nothing but lastSeq"
+    );
+}
+
+/// A `contract.command.result` naming a milestone that does not exist is
+/// rejected the same way every other audit-only event guards its milestone
+/// reference (mirrors grant_requested_for_unknown_milestone_is_rejected).
+#[test]
+fn command_result_event_for_unknown_milestone_is_rejected() {
+    let mut state = state_at_active_milestone();
+    let next = state.last_seq + 1;
+    let err = apply(
+        &mut state,
+        &ev(
+            next,
+            EventKind::ContractCommandResult {
+                milestone_id: "ms-nope".to_string(),
+                result: kranz_engine::command_result::ContractCommandResult {
+                    assertion_id: "a-1".to_string(),
+                    stage: kranz_engine::command_result::CommandStage::Validation,
+                    passed: false,
+                    exit_code: None,
+                    signal: None,
+                    timed_out: false,
+                    could_not_start: false,
+                    start_error: None,
+                    duration_ms: 0,
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    failure_digest: None,
+                },
+            },
+        ),
+    )
+    .expect_err("contract.command.result for an unknown milestone must be rejected");
+    assert!(matches!(err, EngineError::InvalidState(_)), "got {err:?}");
+}
