@@ -2,7 +2,7 @@
 title: Lessons — curated index
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-25
+last_verified: 2026-11-27
 verified_against:
   - .kranz/lessons/index.md
   - crates/engine/src/lessons.rs
@@ -10,6 +10,8 @@ verified_against:
   - AGENTS.md
   - docs/knowledge/decisions/inviolable-invariants.md
 ---
+
+Rechecked 2026-11-27 (UTC) against `.kranz/lessons/index.md`, which gained the m-4ad3ae lesson (list a feature spec's verification commands in priority order and have the worker commit once the tests that encode the criteria pass). The curated list is unchanged.
 
 Rechecked 2026-11-25 (UTC) against `.kranz/lessons/index.md`, which gained the m-fbbac4 lesson (pair a prefix `git` allow rule on a read-only role with deny rules for the options that write or run programs). The curated list is unchanged.
 

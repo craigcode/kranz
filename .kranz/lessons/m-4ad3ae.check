@@ -1,0 +1,4 @@
+# Lesson check record for m-4ad3ae.
+# The operator may set 'operator:' and 'link:' by hand; the operator's
+# value wins over the orchestrator's classification.
+orchestrator: not-checkable

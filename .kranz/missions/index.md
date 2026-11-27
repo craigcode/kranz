@@ -68,3 +68,4 @@ Approved plans, newest last.
 - 2026-11-25 · [m-e7b464](m-e7b464/plan.md) — When a milestone is completed again after a reopen, the engine moves the local tag `kranz/<mission>/<milestone>` to the … [truncated] · [report](m-e7b464/report.md)
 - 2026-11-25 · [m-87118c](m-87118c/plan.md) — Make `kranz outcomes`' AutonomyRatio follow the published definition in docs/metrics.md, the one escalation_metrics.rs i… [truncated] · [report](m-87118c/report.md)
 - 2026-11-25 · [m-e36de6](m-e36de6/plan.md) — Offer a validator a command grant only when a denial is what stopped its session; when an earlier denial did not stop an… [truncated] · [report](m-e36de6/report.md)
+- 2026-11-27 · [m-4ad3ae](m-4ad3ae/plan.md) — Park a non-passing worker run for a WorkerDeny grant only when the denial that stopped the session matches a liftable Ba… [truncated] · [report](m-4ad3ae/report.md)

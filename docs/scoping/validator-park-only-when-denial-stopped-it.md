@@ -102,12 +102,38 @@ have let the session continue past that point.
   grant, but `prompts.rs` is frozen under
   `docs/knowledge/decisions/positioning-governance-evidence-layer.md`, so
   prompt changes are deferred.
-- The worker deny-grant path (`maybe_park_for_worker_deny_grant`) still
-  offers the first denied command of the session and has the same shape as
-  the old validator path. It was not touched.
+- The worker deny-grant path (`maybe_park_for_worker_deny_grant`) now also
+  follows D-A/D-B (ticket `worker-deny-grant-only-when-denial-stopped-it`,
+  operator decision D-X1). See "Worker path (D-X1)" below.
 - Egress grants are unchanged: a proxy denial has no position in the event
   stream to compare against "last tool call," so the stopping-denial rule
   does not apply to it.
 - Attribution inside a parallel tool batch can still name the wrong command
   of that batch. This is pre-existing and was confirmed by the operator as
   a separate, already-known gap, not something this change fixes.
+
+## Worker path (D-X1)
+
+`maybe_park_for_worker_deny_grant` offers the `WorkerDeny` grant only for the
+deny rule matching `stopping_denied_command`: the same D-A/D-B test
+`maybe_park_for_grant` uses, read from the same `RunOutcome` fields. There
+are two cases where it does not offer a grant, each recorded as one
+`orchestrator.decision`:
+
+- The denial did not stop the session (a tool call followed it):
+  `not offering a grant for `<first denied command>`: the denial did not
+  stop the worker session; <how the session actually ended>`.
+- The denial that did stop the session matches no liftable worker deny rule
+  (a hook denial or a non-Bash tool denial): `not offering a grant for
+  `<command>`: it matches no liftable worker deny rule`.
+
+In both cases the run is not parked: it goes to the normal judgement and is
+charged to `max_respawns` like any other non-passing run. Only a run that
+IS parked for a `WorkerDeny` grant has its respawn credited via
+`grant_respawns`, so it does not also consume the respawn budget.
+
+The accepted caveat: a worker that retries a variant of a denied command
+(for example, denied `git stash`, then later denied `git push`) makes a
+tool call after the first denial before failing, so the grant offered is
+for the LAST denied command's rule, whose matching rule may differ from the
+first denial's rule.
