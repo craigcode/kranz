@@ -13368,3 +13368,260 @@ async fn pack_contract_invalid_pack_fails_closed_before_approval() {
         "neither consent nor spend may occur when the pack cannot load"
     );
 }
+
+/// A failing command assertion: prints distinct markers on stdout/stderr and
+/// exits 3, so tests can assert on the exit code and both tails.
+const COMMAND_RESULT_FAIL: &str = "echo kranz-out-marker && echo kranz-err-marker 1>&2 && exit 3";
+
+/// Two validation rounds of the same failing command assertion must each
+/// leave a `contract.command.result` record (plan §3, roadmap M5) with
+/// identical failure digests, so the two runs can be compared as strings.
+/// Scripting copied from `loop_guard_blocks_milestone_after_max_fix_cycles`
+/// above, changing only the plan to use a command assertion.
+#[tokio::test(flavor = "multi_thread")]
+async fn command_result_two_validation_rounds_record_equal_digests() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let finding = json!([{
+        "subject": "part 1 works",
+        "severity": "major",
+        "evidence": "still failing",
+        "suggestedFix": ""
+    }]);
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            fix_features(1),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            fix_features(1),
+        ]),
+        validator_with(finding.clone()),
+        worker_pass(),
+        validator_with(finding),
+    ]));
+
+    let cfg = MissionConfig {
+        skip_functional: false,
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine
+        .approve_plan(simple_plan(
+            1,
+            vec![assertion(
+                "a-fail",
+                "the check passes",
+                Some(COMMAND_RESULT_FAIL),
+            )],
+        ))
+        .unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    let records: Vec<(
+        u64,
+        kranz_engine::command_result::ContractCommandResult,
+        String,
+    )> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ContractCommandResult {
+                milestone_id,
+                result,
+            } if result.assertion_id == "a-fail"
+                && result.stage == kranz_engine::command_result::CommandStage::Validation =>
+            {
+                Some((e.seq, result.clone(), milestone_id.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        records.len(),
+        2,
+        "expected exactly two validation-stage records for a-fail: {records:?}"
+    );
+
+    for (_, result, milestone_id) in &records {
+        assert_eq!(milestone_id, "ms-1");
+        assert_eq!(result.exit_code, Some(3));
+        assert!(!result.passed);
+        assert!(!result.could_not_start);
+        assert!(!result.timed_out);
+        assert!(
+            result.stdout_tail.contains("kranz-out-marker"),
+            "stdout tail: {}",
+            result.stdout_tail
+        );
+        assert!(
+            result.stderr_tail.contains("kranz-err-marker"),
+            "stderr tail: {}",
+            result.stderr_tail
+        );
+        assert!(
+            result
+                .failure_digest
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("sha256:"),
+            "digest: {:?}",
+            result.failure_digest
+        );
+    }
+
+    assert_eq!(
+        records[0].1.failure_digest, records[1].1.failure_digest,
+        "two runs of the same failing check must produce equal digests"
+    );
+
+    let between = events.iter().any(|e| {
+        matches!(e.kind, EventKind::MilestoneValidating { .. })
+            && e.seq > records[0].0
+            && e.seq < records[1].0
+    });
+    assert!(
+        between,
+        "a milestone.validating event must lie between the two rounds' records: {records:?}"
+    );
+}
+
+/// A final-gate run of a failing (unscoped) command assertion must leave a
+/// `contract.command.result` record for each gate run, matching the number
+/// of `validation.finding` events raised for that assertion. Scripting
+/// copied from `assertion_due_final_gate_fails_scoped_assertion` above,
+/// using an unscoped assertion instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn command_result_final_gate_records_failing_assertion() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let contract = vec![assertion(
+        "a-1",
+        "the build succeeds",
+        Some(COMMAND_RESULT_FAIL),
+    )];
+
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "command not runnable in this environment"),
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            waive_reply("a-1", "still not runnable"),
+        ]),
+        worker_pass(),
+    ]));
+
+    let cfg = MissionConfig {
+        max_fix_cycles_per_milestone: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(1, contract)).unwrap();
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Blocked);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+
+    // test_cfg() skips the functional validator, so no validation-round
+    // records should exist for this assertion.
+    let validation_records = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.kind,
+                EventKind::ContractCommandResult { result, .. }
+                    if result.assertion_id == "a-1"
+                        && result.stage == kranz_engine::command_result::CommandStage::Validation
+            )
+        })
+        .count();
+    assert_eq!(
+        validation_records, 0,
+        "test_cfg() skips the functional validator; no validation-stage records expected"
+    );
+
+    let gate_records: Vec<kranz_engine::command_result::ContractCommandResult> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ContractCommandResult { result, .. }
+                if result.assertion_id == "a-1"
+                    && result.stage == kranz_engine::command_result::CommandStage::FinalGate =>
+            {
+                Some(result.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !gate_records.is_empty(),
+        "expected at least one final-gate record for a-1"
+    );
+
+    let finding_count = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                &e.kind,
+                EventKind::ValidationFinding { finding, .. }
+                    if finding.subject == "a-1" && finding.class == "command-assertion"
+            )
+        })
+        .count();
+
+    assert_eq!(
+        gate_records.len(),
+        finding_count,
+        "each final-gate run yields exactly one record and one finding for a-1"
+    );
+
+    for result in &gate_records {
+        assert_eq!(result.exit_code, Some(3));
+        assert!(!result.passed);
+        assert!(
+            result.stderr_tail.contains("kranz-err-marker"),
+            "stderr tail: {}",
+            result.stderr_tail
+        );
+        assert!(
+            result.stdout_tail.contains("kranz-out-marker"),
+            "stdout tail: {}",
+            result.stdout_tail
+        );
+        assert!(result.failure_digest.is_some());
+    }
+
+    if gate_records.len() > 1 {
+        let first = &gate_records[0].failure_digest;
+        for result in &gate_records[1..] {
+            assert_eq!(&result.failure_digest, first, "all digests must be equal");
+        }
+    }
+}
