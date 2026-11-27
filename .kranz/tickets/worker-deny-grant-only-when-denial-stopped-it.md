@@ -25,15 +25,15 @@ The runner already records what is needed. Since m-e36de6, `RunOutcome` carries 
 
 The rule for validators is recorded in `docs/scoping/validator-park-only-when-denial-stopped-it.md` as D-A (a denial stopped the session when no tool call followed the last denied tool result) and D-B (the command offered is the one whose denial stopped the session).
 
-## D-X operator decision
+## D-X operator decision (DECIDED 2026-11-26: D-X1)
 
-Whether the worker path takes the validator rule as it stands.
+The operator chose D-X1: the worker path takes the validator rule as it stands. The options are kept for the record.
 
 - D-X1: apply D-A and D-B unchanged. Offer a `WorkerDeny` grant only for `stopping_denied_command`. When the session had denials but none stopped it, offer nothing and let the run go to the normal judgement and respawn.
 - D-X2: keep offering the first denied command, and only add the session-end detail to the grant description so the operator can judge.
 - D-X3: leave the worker path alone until a mission is seen to park wrongly on it.
 
-One difference from validators to weigh: a worker that is denied a command often tries a variant of it next. Under D-A that second attempt counts as a tool call after the denial, so the first denial did not stop the session. If the variant is denied too and the worker then stops, the grant offered is for the last denied command, and its matching rule may differ from the first.
+One difference from validators, accepted with D-X1: a worker that is denied a command often tries a variant of it next. Under D-A that second attempt counts as a tool call after the denial, so the first denial did not stop the session. If the variant is denied too and the worker then stops, the grant offered is for the last denied command, and its matching rule may differ from the first.
 
 ## Scoping answers
 
