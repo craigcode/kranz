@@ -283,6 +283,18 @@ mod tests {
 
         assert_ne!(r_base.failure_digest, r_code.failure_digest);
         assert_ne!(r_base.failure_digest, r_tail.failure_digest);
+
+        let mut signalled_9 = base_run();
+        signalled_9.code = None;
+        signalled_9.signal = Some(9);
+        let mut signalled_15 = base_run();
+        signalled_15.code = None;
+        signalled_15.signal = Some(15);
+
+        let r_signal_9 = from_run("a-1", CommandStage::Validation, &signalled_9);
+        let r_signal_15 = from_run("a-1", CommandStage::Validation, &signalled_15);
+
+        assert_ne!(r_signal_9.failure_digest, r_signal_15.failure_digest);
     }
 
     #[test]
@@ -328,14 +340,20 @@ mod tests {
     fn command_result_tail_redacts_secret_before_bounding() {
         let secret = ["sk-ant-api03-", &"A".repeat(40)].concat();
         let filler = "x ".repeat((TAIL_MAX_BYTES - 20) / 2);
-        let text = format!("{filler}{secret} tail-end");
+        let text = format!("{secret}{filler} tail-end");
         let mut run = base_run();
-        run.stderr_tail = text;
+        run.stderr_tail = text.clone();
+
+        // Control assertion: proves the secret straddles the raw last-4096-byte
+        // cut point, so bounding before scrubbing would leak part of it.
+        let raw_window = &text[text.len() - TAIL_MAX_BYTES..];
+        assert!(raw_window.contains("AAAAAAAAAA"));
+        assert!(!raw_window.contains("sk-ant-"));
 
         let result = from_run("a-1", CommandStage::Validation, &run);
 
-        assert!(!result.stderr_tail.contains("sk-ant-"));
-        assert!(!result.stderr_tail.contains(&"A".repeat(40)));
+        assert!(!result.stderr_tail.contains("AAAAAAAAAA"));
+        assert!(result.stderr_tail.len() <= TAIL_MAX_BYTES);
     }
 
     #[test]
