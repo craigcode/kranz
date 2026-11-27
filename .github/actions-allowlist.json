@@ -8,10 +8,10 @@
     "actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333",
     "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1",
     "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
-    "anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c",
+    "anchore/sbom-action@dfcb83b97731532d72be422cbc51ee64adb6fd56",
     "dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30",
-    "github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066",
-    "github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066",
+    "github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea",
+    "github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea",
     "softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3"
   ]
 }
