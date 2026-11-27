@@ -2,7 +2,7 @@
 title: Glossary
 owner: mixed
 freshness: check-on-touch
-last_verified: 2026-11-25
+last_verified: 2026-11-27
 verified_against:
   - crates/engine/src/contract_timeout.rs
   - crates/engine/src/contract_lint.rs
@@ -26,6 +26,8 @@ verified_against:
   - crates/slack/src/format.rs
   - AGENTS.md
 ---
+
+Rechecked 2026-11-27 (UTC) against the worker deny-grant change in `orchestrator.rs`: a worker is offered a grant to lift a deny rule only for the command whose denial stopped its session (`RunOutcome.stopping_denied_command`), and otherwise the engine records one decision and the run goes to the normal judgement and respawn budget. Nothing this note states changed.
 
 Rechecked 2026-11-25 (UTC) against the milestone tag change (`milestone_tag.rs`, `git_ops.rs`, `orchestrator.rs`, `events.rs`): a milestone completed again after a reopen moves its local `kranz/<mission>/<milestone>` tag to the commit that passed, and `milestone.completed` gained optional `tagCommit`, `retaggedFrom` and `staleTag` fields. No term defined here changed meaning.
 
