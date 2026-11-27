@@ -1528,17 +1528,12 @@ pub(crate) struct ContractCommandRun {
     pub code: Option<i32>,
     pub output: String,
     pub timed_out: bool,
-    #[allow(dead_code)] // read by contract.command.result emission
     pub signal: Option<i32>,
     /// `Some(<start error>)` when the command never started (sandbox-wrap
     /// failure or `cmd.spawn()` failure) — distinct from a non-zero exit.
-    #[allow(dead_code)] // read by contract.command.result emission
     pub could_not_start: Option<String>,
-    #[allow(dead_code)] // read by contract.command.result emission
     pub stdout_tail: String,
-    #[allow(dead_code)] // read by contract.command.result emission
     pub stderr_tail: String,
-    #[allow(dead_code)] // read by contract.command.result emission
     pub duration: std::time::Duration,
 }
 

@@ -509,6 +509,20 @@ pub enum EventKind {
         detail: String,
     },
 
+    /// An audit-only record of one engine-run contract command (validation
+    /// round, not-yet-due run, or final gate): the assertion id, stage, exit
+    /// code or signal, a could-not-start or timed-out marker, the duration,
+    /// scrubbed byte-bounded stdout/stderr tails, and a stable failure
+    /// digest (module [`crate::command_result`]), so two runs of the same
+    /// failing check can be compared as strings. Record-only; absent in
+    /// pre-field logs, which never recorded this detail.
+    #[serde(rename = "contract.command.result")]
+    ContractCommandResult {
+        #[serde(rename = "milestoneId")]
+        milestone_id: String,
+        result: crate::command_result::ContractCommandResult,
+    },
+
     /// A validator finding whose `subject` named a not-yet-due contract
     /// assertion (see [`EventKind::ValidationAssertionNotDue`]): diverted
     /// here instead of `validation.finding` so it never reaches
@@ -1286,6 +1300,7 @@ impl EventKind {
             EventKind::ValidationConfirm { .. } => "validation.confirm",
             EventKind::ValidationPtyTranscript { .. } => "validation.pty.transcript",
             EventKind::ValidationAssertionNotDue { .. } => "validation.assertion.notdue",
+            EventKind::ContractCommandResult { .. } => "contract.command.result",
             EventKind::ValidationFindingNotDue { .. } => "validation.finding.notdue",
             EventKind::GateResult { .. } => "gate.result",
             EventKind::HookGateFired { .. } => "hook.gate.fired",
@@ -2048,6 +2063,75 @@ mod tests {
         let back: EventKind = serde_json::from_value(legacy).unwrap();
         match back {
             EventKind::ValidationPtyTranscript { detail, .. } => assert_eq!(detail, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// The additive `contract.command.result` event: wire name, payload
+    /// shape, and round-trip — the audit record binding one engine-run
+    /// contract command to its machine-readable result must survive serde
+    /// verbatim, and a minimal payload with only the required fields still
+    /// decodes (serde defaults on the rest).
+    #[test]
+    fn command_result_event_roundtrips_and_minimal_json_deserializes() {
+        let result = crate::command_result::ContractCommandResult {
+            assertion_id: "a-1".to_string(),
+            stage: crate::command_result::CommandStage::Validation,
+            passed: false,
+            exit_code: Some(3),
+            signal: None,
+            timed_out: false,
+            could_not_start: false,
+            start_error: None,
+            duration_ms: 42,
+            stdout_tail: "out".to_string(),
+            stderr_tail: "err".to_string(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            failure_digest: Some("sha256:deadbeef".to_string()),
+        };
+        let event = EventKind::ContractCommandResult {
+            milestone_id: "ms-1".to_string(),
+            result: result.clone(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "contract.command.result");
+        assert_eq!(json["payload"]["milestoneId"], "ms-1");
+        assert_eq!(json["payload"]["result"]["assertionId"], "a-1");
+        assert_eq!(json["payload"]["result"]["stage"], "validation");
+        assert_eq!(event.type_name(), "contract.command.result");
+        let back: EventKind = serde_json::from_value(json).unwrap();
+        match back {
+            EventKind::ContractCommandResult {
+                milestone_id,
+                result: r,
+            } => {
+                assert_eq!(milestone_id, "ms-1");
+                assert_eq!(r, result);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let minimal = serde_json::json!({
+            "type": "contract.command.result",
+            "payload": {
+                "milestoneId": "ms-1",
+                "result": {
+                    "assertionId": "a-1",
+                    "stage": "final-gate"
+                }
+            }
+        });
+        let back: EventKind = serde_json::from_value(minimal).unwrap();
+        match back {
+            EventKind::ContractCommandResult {
+                milestone_id,
+                result,
+            } => {
+                assert_eq!(milestone_id, "ms-1");
+                assert_eq!(result.assertion_id, "a-1");
+                assert_eq!(result.stage, crate::command_result::CommandStage::FinalGate);
+            }
             _ => panic!("wrong variant"),
         }
     }

@@ -70,7 +70,6 @@ pub struct ContractCommandResult {
 /// Scrubs `text`, then keeps at most [`TAIL_MAX_BYTES`] bytes from the end,
 /// cutting on a UTF-8 char boundary. Returns the bounded text and whether
 /// anything was cut.
-#[allow(dead_code)] // wired by contract.command.result emission
 pub(crate) fn bound_tail(text: &str) -> (String, bool) {
     let scrubbed = crate::scrub::scrub(text);
     if scrubbed.len() <= TAIL_MAX_BYTES {
@@ -93,7 +92,6 @@ fn duration_token_re() -> &'static regex::Regex {
 /// Normalises text for digest comparison: CRLF/CR become LF, trailing
 /// whitespace is stripped per line, trailing empty lines are dropped, and
 /// duration tokens are replaced with `<dur>`.
-#[allow(dead_code)] // wired by contract.command.result emission
 pub(crate) fn normalise_for_digest(text: &str) -> String {
     let unified = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines: Vec<String> = unified
@@ -135,7 +133,6 @@ fn outcome_label(
 /// Computes a stable `sha256:`-prefixed digest from the canonical,
 /// length-prefixed encoding of the outcome, exit code, signal, and the
 /// normalised start error / stdout tail / stderr tail, in that order.
-#[allow(dead_code)] // wired by contract.command.result emission
 pub(crate) fn failure_digest(
     outcome: &str,
     exit_code: Option<i32>,
@@ -162,7 +159,6 @@ pub(crate) fn failure_digest(
 
 /// Builds a [`ContractCommandResult`] from a completed
 /// [`ContractCommandRun`](crate::command_exec::ContractCommandRun).
-#[allow(dead_code)] // wired by contract.command.result emission
 pub(crate) fn from_run(
     assertion_id: &str,
     stage: CommandStage,
@@ -214,7 +210,6 @@ pub(crate) fn from_run(
 
 /// Builds a [`ContractCommandResult`] for an assertion with `check=command`
 /// but no command text to run.
-#[allow(dead_code)] // wired by contract.command.result emission
 pub(crate) fn missing_command(assertion_id: &str, stage: CommandStage) -> ContractCommandResult {
     let start_error = "assertion has check=command but no command";
     let digest = failure_digest("could-not-start", None, None, start_error, "", "");

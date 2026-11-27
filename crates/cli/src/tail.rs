@@ -496,6 +496,35 @@ impl EventRenderer {
                     }
                 ),
             ),
+            EventKind::ContractCommandResult {
+                milestone_id,
+                result,
+            } => (
+                format!("milestone {milestone_id}"),
+                if result.passed {
+                    ansi::DIM
+                } else {
+                    ansi::YELLOW
+                },
+                format!(
+                    "contract command [{}] {:?}: {}",
+                    result.assertion_id,
+                    result.stage,
+                    if result.passed {
+                        "PASS".to_string()
+                    } else if result.could_not_start {
+                        "could not start".to_string()
+                    } else if result.timed_out {
+                        "TIMEOUT".to_string()
+                    } else if let Some(code) = result.exit_code {
+                        format!("exit {code}")
+                    } else if let Some(signal) = result.signal {
+                        format!("signal {signal}")
+                    } else {
+                        "could not start".to_string()
+                    }
+                ),
+            ),
             EventKind::ValidationFindingNotDue {
                 milestone_id,
                 due_milestone_id,
