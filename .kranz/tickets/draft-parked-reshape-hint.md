@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Mission m-7886d9, delivered by PR #195 on 2026-11-15."
 title: Correct the reshape hint printed for a parked draft
 priority: 3
 schedule: once

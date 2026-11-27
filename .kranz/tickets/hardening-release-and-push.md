@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Mission m-daa3aa, delivered by PR #188 on 2026-11-13. The mission ended blocked on engine test failures that came from where the contract scratch directory lives, and the operator accepted the branch. Release builds restore no cache; the Actions allowlist admits only exact reviewed commits; kranz exec --push preflights the remote before a mission is created."
 title: Tighten the release build, the Actions allowlist and push validation
 priority: 3
 schedule: once
