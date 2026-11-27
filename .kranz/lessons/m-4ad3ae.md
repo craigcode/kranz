@@ -1,0 +1,3 @@
+In feature specs for this repo, list the verification commands in priority order and tell the worker to commit as soon as the criteria-enco…
+
+In feature specs for this repo, list the verification commands in priority order and tell the worker to commit as soon as the criteria-encoding tests pass. Each `cargo test` filter costs a tool turn in this workspace, and a worker that runs the full filtered checklist plus fmt and clippy before committing can hit the session's turn cap with correct but uncommitted work.

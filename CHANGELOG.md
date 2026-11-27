@@ -5,6 +5,12 @@ Notable user-visible changes are documented here. This project follows
 
 ## Unreleased
 
+- Fixed: a worker that was denied a command but carried on and later
+  failed for another reason is no longer parked for a grant to lift that
+  deny rule; the run goes to the normal judgement and respawn budget, and
+  a decision records why no grant was offered. A denial that was the
+  worker's last tool call still raises a grant request, for the rule
+  matching that command.
 - Fixed: a validator that was denied a command but carried on and later
   stopped for another reason is no longer parked for a grant on that
   command; the engine retries it and, if it still has no report, blocks

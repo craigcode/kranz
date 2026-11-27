@@ -7656,6 +7656,186 @@ async fn worker_deny_grant_respawn_does_not_eat_the_respawn_budget() {
     );
 }
 
+/// D-A/D-B: a worker denied `git push` that then makes further tool calls
+/// (and so recovered or moved on) before failing for an unrelated reason must
+/// NOT be offered a grant for the early denial — the denial did not stop the
+/// session, so the run is charged to the ordinary respawn budget like any
+/// other failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_deny_stop_rule_continued_past_is_charged_to_the_respawn_budget() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let report = json!({ "result": "fail", "summary": "tests still failing" });
+    let worker_denied_then_continued = MockScript {
+        events: vec![
+            mock_init("w1"),
+            mock_tool_use("Bash", "git push origin main"),
+            mock_denied("Bash", "Permission denied: Bash(git push origin main)"),
+            mock_tool_use("Read", "src/lib.rs"),
+            mock_tool_result("Read", "fn main() {}"),
+            mock_tool_use("Bash", "cargo test"),
+            mock_tool_result("Bash", "test result: FAILED"),
+            mock_text(&report.to_string()),
+            mock_result_json(&report),
+        ],
+        ..Default::default()
+    };
+
+    // FIFO: f-1-1 attempt 1 (denied, then continued, then fails — no grant),
+    // f-1-1 attempt 2 (the one allowed respawn, also fails → budget
+    // exhausted), f-1-2 (pass), orchestrator (dirty-tree, judgement, capture).
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_denied_then_continued,
+        worker_fail(),
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+
+    let cfg = MissionConfig {
+        max_respawns: 1,
+        ..test_cfg()
+    };
+    let mut engine = make_engine(&backend, &root, cfg);
+    engine.approve_plan(simple_plan(2, vec![])).unwrap();
+    engine.set_grant_request_timeout(Duration::from_millis(0));
+
+    let status = timeout(TEST_TIMEOUT, engine.run())
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(status, MissionStatus::Complete);
+
+    let ms = &engine.state().mission.milestones[0];
+    assert_eq!(ms.features[0].status, FeatureStatus::Failed);
+    assert_eq!(ms.features[0].respawns, 1);
+    assert_eq!(ms.features[0].worker_runs.len(), 2);
+    assert_eq!(ms.features[1].status, FeatureStatus::Complete);
+
+    let paths = engine.paths().clone();
+    drop(engine);
+    let events = read_log(&paths);
+    let types = event_types(&events);
+    assert!(
+        !types.contains(&"grant.requested"),
+        "the early denial did not stop the session, so no grant must be offered: {types:?}"
+    );
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::FeatureFailed { feature_id, reason, .. }
+            if feature_id == "f-1-1" && reason.contains("respawn budget exhausted")
+    )));
+    assert!(events.iter().any(|e| matches!(
+        &e.kind,
+        EventKind::OrchestratorDecision { summary, .. }
+            if summary.contains(
+                "not offering a grant for `git push origin main`: the denial did not stop the worker session"
+            ) && summary.contains("2 tool call(s) ran after the")
+    )), "{events:?}");
+}
+
+/// D-A/D-B: a worker denied twice must be offered a grant for the RULE
+/// matching the LAST denied command (the one that stopped the session), even
+/// though an earlier denial in the same session matched a different rule.
+#[tokio::test]
+async fn worker_deny_stop_rule_last_call_parks_for_that_rule() {
+    if !setup() {
+        return;
+    }
+    let (_dir, root) = init_repo();
+
+    let report = json!({ "result": "fail", "summary": "blocked from pushing" });
+    let worker_denied_twice = MockScript {
+        events: vec![
+            mock_init("w1"),
+            mock_tool_use("Bash", "git stash"),
+            mock_denied("Bash", "Permission denied: Bash(git stash)"),
+            mock_tool_use("Read", "src/lib.rs"),
+            mock_tool_result("Read", "fn main() {}"),
+            mock_tool_use("Bash", "git push origin main"),
+            mock_denied("Bash", "Permission denied: Bash(git push origin main)"),
+            mock_text(&report.to_string()),
+            mock_result_json(&report),
+        ],
+        ..Default::default()
+    };
+
+    // FIFO: f-1-1 attempt 1 (denied twice → parks on the LAST rule), f-1-1
+    // attempt 2 after approval (pass), orchestrator (dirty-tree, judgement,
+    // capture).
+    let backend = Arc::new(MockBackend::with_scripts(vec![
+        worker_denied_twice,
+        worker_pass(),
+        orch_script(vec![
+            dirty_tree_commit_as_is(),
+            judgement("complete", ""),
+            no_lesson(),
+        ]),
+    ]));
+
+    let mut engine = make_engine(&backend, &root, test_cfg());
+    engine.approve_plan(simple_plan(1, vec![])).unwrap();
+    let paths = engine.paths().clone();
+
+    let handle = tokio::spawn(async move {
+        let result = engine.run().await;
+        (engine, result)
+    });
+
+    wait_for_pending_grant(&paths).await;
+    let snap = reducer::read_snapshot(&paths.state_file()).unwrap();
+    let pending = snap
+        .pending_grant_request
+        .expect("parked worker-deny grant");
+    assert_eq!(pending.kind, GrantKind::WorkerDeny);
+    assert_eq!(pending.command, "Bash(git push*)");
+    control::enqueue(
+        &paths,
+        &ControlCommand::ApproveGrant {
+            command: "Bash(git push*)".to_string(),
+            grant_kind: None,
+            request_seq: None,
+        },
+    )
+    .unwrap();
+
+    let (engine, result) = timeout(TEST_TIMEOUT, handle)
+        .await
+        .expect("run must not hang")
+        .unwrap();
+    assert_eq!(result.unwrap(), MissionStatus::Complete);
+    let paths = engine.paths().clone();
+
+    let events = read_log(&paths);
+    let granted: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::GrantRequested { command, .. } => Some(command.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        granted,
+        vec!["Bash(git push*)".to_string()],
+        "exactly one grant request, for the LAST denied command's rule"
+    );
+    assert!(
+        !granted.contains(&"Bash(git stash*)".to_string()),
+        "the earlier denial must never be offered"
+    );
+
+    let deny_exceptions = &engine.state().mission.deny_exceptions;
+    assert!(deny_exceptions.contains(&"Bash(git push*)".to_string()));
+    assert!(!deny_exceptions.contains(&"Bash(git stash*)".to_string()));
+    drop(engine);
+}
+
 /// Egress grant (3.3b): a sandboxed (`fs+net`) validator refused a destination
 /// by its egress proxy parks an EGRESS grant naming `host:port`; approving
 /// extends `egress_grants` (and ONLY egress_grants), the re-run's proxy
