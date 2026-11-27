@@ -4250,9 +4250,9 @@ Used by:
 - bitflags 2.13.0 <https://github.com/bitflags/bitflags>
 - log 0.4.33 <https://github.com/rust-lang/log>
 - num-traits 0.2.19 <https://github.com/rust-num/num-traits>
-- regex-automata 0.4.18 <https://github.com/rust-lang/regex>
-- regex-syntax 0.8.11 <https://github.com/rust-lang/regex>
-- regex 1.13.1 <https://github.com/rust-lang/regex>
+- regex-automata 0.4.19 <https://github.com/rust-lang/regex>
+- regex-syntax 0.8.12 <https://github.com/rust-lang/regex>
+- regex 1.13.2 <https://github.com/rust-lang/regex>
 
 Copyright (c) 2014 The Rust Project Developers
 
@@ -7176,7 +7176,7 @@ SOFTWARE.
 MIT License (MIT)
 Used by:
 - ambient-authority 0.0.2 <https://github.com/sunfishcode/ambient-authority>
-- anyhow 1.0.104 <https://github.com/dtolnay/anyhow>
+- anyhow 1.0.105 <https://github.com/dtolnay/anyhow>
 - async-trait 0.1.92 <https://github.com/dtolnay/async-trait>
 - atomic-waker 1.1.2 <https://github.com/smol-rs/atomic-waker>
 - cap-fs-ext 4.0.3 <https://github.com/bytecodealliance/cap-std>
@@ -7601,7 +7601,7 @@ THE SOFTWARE.
 MIT License (MIT)
 Used by:
 - aho-corasick 1.1.4 <https://github.com/BurntSushi/aho-corasick>
-- globset 0.4.21 <https://github.com/BurntSushi/ripgrep/tree/master/crates/globset>
+- globset 0.4.22 <https://github.com/BurntSushi/ripgrep/tree/master/crates/globset>
 - memchr 2.8.2 <https://github.com/BurntSushi/memchr>
 
 The MIT License (MIT)
