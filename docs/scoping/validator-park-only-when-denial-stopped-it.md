@@ -115,7 +115,7 @@ have let the session continue past that point.
 ## Worker path (D-X1)
 
 `maybe_park_for_worker_deny_grant` offers the `WorkerDeny` grant only for the
-deny rule matching `stopping_denied_command` — the same D-A/D-B test
+deny rule matching `stopping_denied_command`: the same D-A/D-B test
 `maybe_park_for_grant` uses, read from the same `RunOutcome` fields. There
 are two cases where it does not offer a grant, each recorded as one
 `orchestrator.decision`:

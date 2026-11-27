@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Mission m-4ad3ae, decision D-X1. A worker is offered a deny-rule grant only for the command whose denial stopped its session, meaning no tool call followed the last denied tool result. Otherwise the engine records one decision saying why no grant was offered and the run goes to the normal judgement and respawn budget. Egress grants are unchanged."
 title: Offer a worker a deny-rule grant only when the denial stopped it
 priority: 3
 schedule: once
