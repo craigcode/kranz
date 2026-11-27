@@ -471,6 +471,15 @@ pub fn apply(state: &mut MissionState, event: &Event) -> Result<()> {
             milestone_mut(state, milestone_id)?;
         }
 
+        EventKind::ContractCommandResult { milestone_id, .. } => {
+            // Audit-only record: the machine-readable result of one
+            // engine-run contract command. It drives no state transition —
+            // only its own validation/finalization pass acts on the run
+            // itself. Validate the milestone reference as a corruption
+            // guard only (mirrors validation.pty.transcript).
+            milestone_mut(state, milestone_id)?;
+        }
+
         EventKind::ValidationFindingNotDue {
             milestone_id,
             run_id,

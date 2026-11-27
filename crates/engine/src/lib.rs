@@ -29,6 +29,7 @@ pub(crate) mod appcontainer_windows;
 pub mod auth_verify;
 pub mod backend_readiness;
 pub mod command_exec;
+pub mod command_result;
 pub mod comparison_metrics;
 pub mod config;
 pub mod container_egress;

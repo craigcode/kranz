@@ -1,4 +1,6 @@
 ---
+state: done
+state-note: "Delivered by mission m-59089f: every engine-run contract command now leaves a contract.command.result event."
 title: Record each contract command's exit code and output tail in the event log
 priority: 2
 schedule: once

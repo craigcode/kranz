@@ -6024,7 +6024,7 @@ impl MissionEngine {
         sandbox: &crate::command_exec::GateSandbox,
         shell: &crate::contract_shell::HostShell,
         config: &MissionConfig,
-    ) -> Option<String> {
+    ) -> Option<(String, Vec<crate::command_result::ContractCommandResult>)> {
         let command_assertions: Vec<Assertion> = contract
             .iter()
             .filter(|a| a.check == AssertionCheck::Command)
@@ -6034,6 +6034,7 @@ impl MissionEngine {
             return None;
         }
         let mut rendered = String::new();
+        let mut records = Vec::new();
         for assertion in command_assertions {
             let id = &assertion.id;
             match assertion.command.as_deref() {
@@ -6067,13 +6068,24 @@ impl MissionEngine {
                         "- [{id}] `{command}` → {verdict} (shell: {})\n{tail}",
                         shell.label()
                     ));
+                    records.push(crate::command_result::from_run(
+                        id,
+                        crate::command_result::CommandStage::Validation,
+                        &run,
+                    ));
                 }
-                None => rendered.push_str(&format!(
-                    "- [{id}] (check=command but no command — cannot run)\n"
-                )),
+                None => {
+                    rendered.push_str(&format!(
+                        "- [{id}] (check=command but no command — cannot run)\n"
+                    ));
+                    records.push(crate::command_result::missing_command(
+                        id,
+                        crate::command_result::CommandStage::Validation,
+                    ));
+                }
             }
         }
-        Some(rendered)
+        Some((rendered, records))
     }
 
     /// Run a NOT-YET-DUE contract's command assertions engine-side with the
@@ -6089,13 +6101,17 @@ impl MissionEngine {
         sandbox: &crate::command_exec::GateSandbox,
         shell: &crate::contract_shell::HostShell,
         config: &MissionConfig,
-    ) -> Vec<(String, bool, String)> {
+    ) -> (
+        Vec<(String, bool, String)>,
+        Vec<crate::command_result::ContractCommandResult>,
+    ) {
         let command_assertions: Vec<Assertion> = contract
             .iter()
             .filter(|a| a.check == AssertionCheck::Command)
             .cloned()
             .collect();
         let mut results = Vec::new();
+        let mut records = Vec::new();
         for assertion in command_assertions {
             let id = assertion.id.clone();
             match assertion.command.as_deref() {
@@ -6121,16 +6137,27 @@ impl MissionEngine {
                         );
                     }
                     let ok = !run.timed_out && run.code == Some(0);
+                    records.push(crate::command_result::from_run(
+                        &id,
+                        crate::command_result::CommandStage::ValidationNotdue,
+                        &run,
+                    ));
                     results.push((id, ok, detail));
                 }
-                None => results.push((
-                    id,
-                    false,
-                    "(check=command but no command — cannot run)".to_string(),
-                )),
+                None => {
+                    records.push(crate::command_result::missing_command(
+                        &id,
+                        crate::command_result::CommandStage::ValidationNotdue,
+                    ));
+                    results.push((
+                        id,
+                        false,
+                        "(check=command but no command — cannot run)".to_string(),
+                    ));
+                }
             }
         }
-        results
+        (results, records)
     }
 
     /// Called for the resolved primary, retry and confirmation before any
@@ -6252,7 +6279,7 @@ impl MissionEngine {
                 "contract commands run under the resolved contract shell",
                 Some(format!("shell: {}", shell.label())),
             )?;
-            let rendered = Self::run_contract_commands_for_validation(
+            let due_outcome = Self::run_contract_commands_for_validation(
                 &contract,
                 &root,
                 &env,
@@ -6261,6 +6288,16 @@ impl MissionEngine {
                 &self.state.config,
             )
             .await;
+            let rendered = due_outcome.as_ref().map(|(text, _)| text.clone());
+            for record in due_outcome.map(|(_, records)| records).unwrap_or_default() {
+                if let Err(error) = self.emit(EventKind::ContractCommandResult {
+                    milestone_id: milestone_id.clone(),
+                    result: record,
+                }) {
+                    gate_sandbox.cleanup()?;
+                    return Err(error);
+                }
+            }
             // Pty-script assertions (ticket pty-functional-validation): the
             // M5 functional-QA lane extended to terminal-interactive targets.
             // Driven engine-side in THIS evidence pass — same root, same
@@ -6341,7 +6378,7 @@ impl MissionEngine {
             // `contract_results` and is recorded only as
             // `validation.assertion.notdue`, never a blocking finding.
             if !not_due_contract.is_empty() {
-                let notdue_commands = Self::run_contract_commands_notdue(
+                let (notdue_commands, notdue_records) = Self::run_contract_commands_notdue(
                     &not_due_contract,
                     &root,
                     &env,
@@ -6350,6 +6387,15 @@ impl MissionEngine {
                     &self.state.config,
                 )
                 .await;
+                for record in notdue_records {
+                    if let Err(error) = self.emit(EventKind::ContractCommandResult {
+                        milestone_id: milestone_id.clone(),
+                        result: record,
+                    }) {
+                        gate_sandbox.cleanup()?;
+                        return Err(error);
+                    }
+                }
                 for (assertion_id, ok, detail) in notdue_commands {
                     let due_milestone_id = notdue_due_milestone
                         .get(&assertion_id)
@@ -17477,7 +17523,7 @@ pub(crate) mod tests {
             false,
             &[root.path().to_path_buf()],
         );
-        let rendered = MissionEngine::run_contract_commands_for_validation(
+        let (rendered, _records) = MissionEngine::run_contract_commands_for_validation(
             &contract,
             root.path(),
             &env,
@@ -17490,6 +17536,109 @@ pub(crate) mod tests {
         assert!(
             rendered.contains(&format!("(shell: {})", shell.label())),
             "expected a shell label on the validation-round line: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_result_validation_helper_returns_one_record_per_command_assertion() {
+        let contract = vec![
+            Assertion {
+                id: "a-pass".to_string(),
+                statement: "exits zero".to_string(),
+                check: AssertionCheck::Command,
+                command: Some("exit 0".to_string()),
+                milestone: None,
+                negative_control: None,
+                timeout_secs: None,
+                pty_script: None,
+            },
+            Assertion {
+                id: "a-fail".to_string(),
+                statement: "fails with marker output".to_string(),
+                check: AssertionCheck::Command,
+                command: Some(
+                    "echo kranz-out-marker && echo kranz-err-marker 1>&2 && exit 3".to_string(),
+                ),
+                milestone: None,
+                negative_control: None,
+                timeout_secs: None,
+                pty_script: None,
+            },
+        ];
+        let root = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let sandbox = crate::command_exec::GateSandbox::Disabled;
+        let shell = crate::contract_shell::resolve_contract_shell(
+            crate::contract_shell::ShellLane::Contract,
+            false,
+            &[root.path().to_path_buf()],
+        );
+        let (rendered, records) = MissionEngine::run_contract_commands_for_validation(
+            &contract,
+            root.path(),
+            &env,
+            &sandbox,
+            &shell,
+            &MissionConfig::default(),
+        )
+        .await
+        .expect("two command assertions render lines");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].assertion_id, "a-pass");
+        assert_eq!(
+            records[0].stage,
+            crate::command_result::CommandStage::Validation
+        );
+        assert_eq!(records[0].exit_code, Some(0));
+        assert_eq!(records[0].failure_digest, None);
+        assert_eq!(records[1].assertion_id, "a-fail");
+        assert_eq!(
+            records[1].stage,
+            crate::command_result::CommandStage::Validation
+        );
+        assert_eq!(records[1].exit_code, Some(3));
+        assert!(records[1].failure_digest.is_some());
+
+        assert!(rendered.contains("→ PASS"), "{rendered}");
+        assert!(rendered.contains("→ FAIL"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn command_result_validation_helper_notdue_records_stage() {
+        let contract = vec![Assertion {
+            id: "a1".to_string(),
+            statement: "exits zero".to_string(),
+            check: AssertionCheck::Command,
+            command: Some("exit 0".to_string()),
+            milestone: None,
+            negative_control: None,
+            timeout_secs: None,
+            pty_script: None,
+        }];
+        let root = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let sandbox = crate::command_exec::GateSandbox::Disabled;
+        let shell = crate::contract_shell::resolve_contract_shell(
+            crate::contract_shell::ShellLane::Contract,
+            false,
+            &[root.path().to_path_buf()],
+        );
+        let (_results, records) = MissionEngine::run_contract_commands_notdue(
+            &contract,
+            root.path(),
+            &env,
+            &sandbox,
+            &shell,
+            &MissionConfig::default(),
+        )
+        .await;
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].assertion_id, "a1");
+        assert_eq!(
+            records[0].stage,
+            crate::command_result::CommandStage::ValidationNotdue
         );
     }
 }

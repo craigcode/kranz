@@ -229,11 +229,29 @@ impl MissionEngine {
         )?;
 
         // command assertions — engine-run (design.md: the hard gate).
+        let final_gate_milestone_id = self
+            .state
+            .mission
+            .milestones
+            .last()
+            .expect("mission has at least one milestone")
+            .id
+            .clone();
         for assertion in contract
             .iter()
             .filter(|a| a.check == AssertionCheck::Command)
         {
             let Some(command) = assertion.command.as_deref() else {
+                if let Err(error) = self.emit(EventKind::ContractCommandResult {
+                    milestone_id: final_gate_milestone_id.clone(),
+                    result: crate::command_result::missing_command(
+                        &assertion.id,
+                        crate::command_result::CommandStage::FinalGate,
+                    ),
+                }) {
+                    gate_sandbox.cleanup()?;
+                    return Err(error);
+                }
                 findings.push(Finding {
                     subject: assertion.id.clone(),
                     severity: "critical".to_string(),
@@ -254,6 +272,17 @@ impl MissionEngine {
                 &contract_shell,
             )
             .await;
+            if let Err(error) = self.emit(EventKind::ContractCommandResult {
+                milestone_id: final_gate_milestone_id.clone(),
+                result: crate::command_result::from_run(
+                    &assertion.id,
+                    crate::command_result::CommandStage::FinalGate,
+                    &run,
+                ),
+            }) {
+                gate_sandbox.cleanup()?;
+                return Err(error);
+            }
             if run.timed_out {
                 findings.push(Finding {
                     subject: assertion.id.clone(),

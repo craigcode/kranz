@@ -1528,6 +1528,13 @@ pub(crate) struct ContractCommandRun {
     pub code: Option<i32>,
     pub output: String,
     pub timed_out: bool,
+    pub signal: Option<i32>,
+    /// `Some(<start error>)` when the command never started (sandbox-wrap
+    /// failure or `cmd.spawn()` failure) — distinct from a non-zero exit.
+    pub could_not_start: Option<String>,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    pub duration: std::time::Duration,
 }
 
 /// [`run_contract_command_sandboxed_with_code`], additionally reporting
@@ -1543,6 +1550,7 @@ pub(crate) async fn run_contract_command_timed(
     sandbox: &GateSandbox,
     shell: &crate::contract_shell::HostShell,
 ) -> ContractCommandRun {
+    let started = std::time::Instant::now();
     let env = contract_shell_env(
         gate_env_for_sandbox(env, sandbox),
         sandbox,
@@ -1552,13 +1560,18 @@ pub(crate) async fn run_contract_command_timed(
     let wrapped = match sandbox.wrap_contract_shell(command, &env, shell) {
         Ok(wrapped) => wrapped,
         Err(error) => {
+            let message =
+                format!("gate sandbox wrap failed closed (the command did not run): {error}");
             return ContractCommandRun {
                 code: None,
-                output: format!(
-                    "gate sandbox wrap failed closed (the command did not run): {error}"
-                ),
+                output: message.clone(),
                 timed_out: false,
-            }
+                signal: None,
+                could_not_start: Some(message),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                duration: started.elapsed(),
+            };
         }
     };
     let client_env = match sandbox {
@@ -1575,6 +1588,20 @@ pub(crate) async fn run_contract_command_timed(
     )
     .await;
     let timed_out = outcome.timed_out();
+    let (signal, stdout_tail, stderr_tail, could_not_start) = match &outcome {
+        BoundedOutcome::Completed {
+            signal,
+            stdout,
+            stderr,
+            ..
+        } => (*signal, stdout.clone(), stderr.clone(), None),
+        BoundedOutcome::CouldNotStart(message) => {
+            (None, String::new(), String::new(), Some(message.clone()))
+        }
+        BoundedOutcome::Failed(_) | BoundedOutcome::TimedOut(_) => {
+            (None, String::new(), String::new(), None)
+        }
+    };
     let (code, output) = outcome.into_code_output();
     if code.is_none() {
         if let Some((program, args)) = wrapped.timeout_teardown {
@@ -1593,6 +1620,11 @@ pub(crate) async fn run_contract_command_timed(
         code,
         output,
         timed_out,
+        signal,
+        could_not_start,
+        stdout_tail,
+        stderr_tail,
+        duration: started.elapsed(),
     }
 }
 
@@ -1656,21 +1688,35 @@ pub(crate) fn run_contract_command_timed_blocking(
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
+                    let message = format!("failed to create approval gate runtime: {error}");
                     return ContractCommandRun {
                         code: None,
-                        output: format!("failed to create approval gate runtime: {error}"),
+                        output: message.clone(),
                         timed_out: false,
-                    }
+                        signal: None,
+                        could_not_start: Some(message),
+                        stdout_tail: String::new(),
+                        stderr_tail: String::new(),
+                        duration: Duration::ZERO,
+                    };
                 }
             };
             runtime.block_on(run_contract_command_timed(
                 cwd, command, timeout, env, sandbox, shell,
             ))
         });
-        worker.join().unwrap_or_else(|_| ContractCommandRun {
-            code: None,
-            output: "approval gate runner panicked before producing a verdict".to_string(),
-            timed_out: false,
+        worker.join().unwrap_or_else(|_| {
+            let message = "approval gate runner panicked before producing a verdict".to_string();
+            ContractCommandRun {
+                code: None,
+                output: message.clone(),
+                timed_out: false,
+                signal: None,
+                could_not_start: Some(message),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                duration: Duration::ZERO,
+            }
         })
     })
 }
@@ -1918,14 +1964,26 @@ impl Drop for ArmedChildGroup {
 /// callers that need to report a timeout as a timeout (rather than an
 /// ordinary failure) don't have to infer it from the output text.
 enum BoundedOutcome {
-    Completed(Option<i32>, String),
+    Completed {
+        code: Option<i32>,
+        signal: Option<i32>,
+        stdout: String,
+        stderr: String,
+        output: String,
+    },
+    /// `cmd.spawn()` itself failed — the process never started.
+    CouldNotStart(String),
+    /// Spawn succeeded but a later read or wait failed.
+    Failed(String),
     TimedOut(String),
 }
 
 impl BoundedOutcome {
     fn into_code_output(self) -> (Option<i32>, String) {
         match self {
-            BoundedOutcome::Completed(code, output) => (code, output),
+            BoundedOutcome::Completed { code, output, .. } => (code, output),
+            BoundedOutcome::CouldNotStart(output) => (None, output),
+            BoundedOutcome::Failed(output) => (None, output),
             BoundedOutcome::TimedOut(output) => (None, output),
         }
     }
@@ -1933,6 +1991,19 @@ impl BoundedOutcome {
     fn timed_out(&self) -> bool {
         matches!(self, BoundedOutcome::TimedOut(_))
     }
+}
+
+/// `std::process::ExitStatus::signal()` is unix-only; elsewhere a process
+/// never dies to a signal, so there is nothing to report.
+#[cfg(unix)]
+fn exit_status_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_status_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 async fn run_command_bounded(
@@ -1951,7 +2022,7 @@ async fn run_command_bounded_core(
     let mut cmd = cmd;
     let mut child = match cmd.spawn() {
         Ok(child) => ArmedChildGroup(child),
-        Err(e) => return BoundedOutcome::Completed(None, format!("failed to spawn shell: {e}")),
+        Err(e) => return BoundedOutcome::CouldNotStart(format!("failed to spawn shell: {e}")),
     };
     let stdout = child
         .0
@@ -2023,31 +2094,29 @@ async fn run_command_bounded_core(
             }
             let _ = child.0.start_kill();
             let _ = child.0.wait().await;
-            BoundedOutcome::Completed(None, error)
+            BoundedOutcome::Failed(error)
         }
         Ok(Ok((stdout, stderr))) => {
             #[cfg(unix)]
             crate::backend_claude::kill_unreaped_group(&child.0);
             let status = match child.0.wait().await {
                 Ok(status) => status,
-                Err(e) => {
-                    return BoundedOutcome::Completed(
-                        None,
-                        format!("failed waiting for shell: {e}"),
-                    )
-                }
+                Err(e) => return BoundedOutcome::Failed(format!("failed waiting for shell: {e}")),
             };
-            let mut combined = stdout;
+            let mut combined = stdout.clone();
             if !stderr.trim().is_empty() {
                 combined.push_str("\n--- stderr ---\n");
                 combined.push_str(stderr.trim_end());
             }
             // `status.code()` is None on signal termination; the bool shape
             // (`success()`) is recovered by callers as `code == Some(0)`.
-            BoundedOutcome::Completed(
-                status.code(),
-                tail_chars(combined.trim_end(), COMMAND_OUTPUT_TAIL),
-            )
+            BoundedOutcome::Completed {
+                code: status.code(),
+                signal: exit_status_signal(&status),
+                stdout,
+                stderr,
+                output: tail_chars(combined.trim_end(), COMMAND_OUTPUT_TAIL),
+            }
         }
     }
 }
@@ -2591,6 +2660,151 @@ mod tests {
         assert!(!run.timed_out, "{}", run.output);
         assert_eq!(run.code, None);
         assert!(run.output.contains("failed to spawn"), "{}", run.output);
+    }
+
+    #[tokio::test]
+    async fn command_result_stdout_and_stderr_kept_separately() {
+        let shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("sh"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+
+        let run = run_contract_command_timed(
+            dir.path(),
+            "echo kranz-out-marker; echo kranz-err-marker 1>&2; exit 3",
+            Duration::from_secs(5),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(run.code, Some(3));
+        assert!(run.could_not_start.is_none(), "{:?}", run.could_not_start);
+        assert!(!run.timed_out);
+        assert!(
+            run.stdout_tail.contains("kranz-out-marker"),
+            "{}",
+            run.stdout_tail
+        );
+        assert!(
+            !run.stdout_tail.contains("kranz-err-marker"),
+            "{}",
+            run.stdout_tail
+        );
+        assert!(
+            run.stderr_tail.contains("kranz-err-marker"),
+            "{}",
+            run.stderr_tail
+        );
+        assert!(run.duration > Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn command_result_output_unchanged_for_validator() {
+        let shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("sh"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+
+        let run = run_contract_command_timed(
+            dir.path(),
+            "echo kranz-out-marker; echo kranz-err-marker 1>&2; exit 3",
+            Duration::from_secs(5),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        let mut expected = run.stdout_tail.clone();
+        expected.push_str("\n--- stderr ---\n");
+        expected.push_str(run.stderr_tail.trim_end());
+        let expected = tail_chars(expected.trim_end(), COMMAND_OUTPUT_TAIL);
+        assert_eq!(run.output, expected);
+    }
+
+    #[tokio::test]
+    async fn command_result_could_not_start_records_marker_not_exit_code() {
+        // The Disabled wrap uses `shell.program` directly as the spawned
+        // program (see `wrap_contract_shell`'s `(Disabled, Sh)` arm), so a
+        // bogus program path fails at `cmd.spawn()`.
+        let shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("/nonexistent/kranz-no-such-shell"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+
+        let run = run_contract_command_timed(
+            dir.path(),
+            "exit 0",
+            Duration::from_secs(5),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(run.code, None);
+        assert_eq!(run.signal, None);
+        assert!(!run.timed_out);
+        let marker = run
+            .could_not_start
+            .as_ref()
+            .expect("spawn failure must set could_not_start");
+        assert!(!marker.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_result_signal_recorded() {
+        let shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("sh"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+
+        let run = run_contract_command_timed(
+            dir.path(),
+            "kill -9 $$",
+            Duration::from_secs(5),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert_eq!(run.code, None);
+        assert_eq!(run.signal, Some(9), "{}", run.output);
+        assert!(run.could_not_start.is_none(), "{:?}", run.could_not_start);
+        assert!(!run.timed_out);
+    }
+
+    #[tokio::test]
+    async fn command_result_timeout_has_no_start_marker() {
+        let shell = crate::contract_shell::HostShell {
+            kind: crate::contract_shell::ShellKind::Sh,
+            program: std::path::PathBuf::from("sh"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let env = HashMap::new();
+        let command = crate::test_shell::contract::sleep_millis(dir.path(), 5_000);
+
+        let run = run_contract_command_timed(
+            dir.path(),
+            &command,
+            Duration::from_secs(1),
+            &env,
+            &GateSandbox::Disabled,
+            &shell,
+        )
+        .await;
+        assert!(run.timed_out, "{}", run.output);
+        assert!(run.could_not_start.is_none(), "{:?}", run.could_not_start);
+        assert_eq!(run.stdout_tail, "");
+        assert_eq!(run.stderr_tail, "");
     }
 
     /// Resolve the uncontained Windows contract shell, asserting a real

@@ -65,7 +65,10 @@ verified_against:
   - scripts/audit-operator-markers.py
   - docs/tickets.md
   - crates/engine/src/git_ops.rs
+  - crates/engine/src/command_result.rs
 ---
+
+Rechecked 2026-11-27 (UTC) against `command_result.rs`: every validation-round, not-yet-due and final-gate contract command now also emits an audit-only `contract.command.result` event carrying the exit code or signal, a could-not-start/timed-out marker, the duration, scrubbed byte-bounded stdout/stderr tails and a failure digest. No gate changed: the event drives no verdict.
 
 Rechecked 2026-11-27 (UTC) against the worker deny-grant change in `orchestrator.rs`: a worker is offered a grant to lift a deny rule only for the command whose denial stopped its session (`RunOutcome.stopping_denied_command`), and otherwise the engine records one decision and the run goes to the normal judgement and respawn budget. Nothing this note states changed.
 
@@ -414,6 +417,39 @@ assertion for each of these shapes:
 The anti-vacuity form above single-quotes its grep pattern, so it is flagged
 on a Windows host that resolves to `cmd`. Install Git for Windows, or write
 the check with double quotes only.
+
+## Recorded contract command results
+
+Every validation-round, not-yet-due and final-gate contract command the
+engine runs also emits an audit-only `contract.command.result` event into
+the mission's event log (`command_result.rs`). Its fields: `milestoneId`,
+`assertionId`, `stage`, `passed`, `exitCode`, `signal`, `timedOut`,
+`couldNotStart`, `startError`, `durationMs`, `stdoutTail`, `stderrTail`,
+`stdoutTruncated`/`stderrTruncated`, and `failureDigest`. The event changes
+no verdict and nothing the validator is shown.
+
+`stage` is one of three wire values: `validation` (a due assertion run in a
+milestone validation round), `validation-notdue` (an assertion scoped to a
+later milestone, run as advisory in a validation round) or `final-gate` (the
+final gate's run of every assertion regardless of due-at). The final-gate
+result is recorded against the mission's last milestone.
+
+The tails are the engine's existing per-stream captures (up to 1500 chars
+each), scrubbed and then bounded to 4096 bytes, keeping the end. A timed-out
+run has empty tails.
+
+Validation-round results exist only when the functional validator runs. The
+approval lint and external-gate checks are not recorded.
+
+`failureDigest` appears only on a non-pass. It is a sha256 over the outcome
+label, exit code, signal, start error and the normalised tails, where
+normalising means unifying line endings, stripping trailing whitespace per
+line, dropping trailing empty lines and masking duration tokens (`0.53s`,
+`120ms`, ...) as `<dur>`, so two runs of the same failing check that only
+differ in how long they took still compare equal. Known limit: after a code
+change, cargo's `Compiling ...` lines differ, so a real repeat failure may
+not match — digest equality is evidence of the same failure, inequality is
+not proof of a different one.
 
 ## Runtime-gated tests: skip loudly, fail where required
 
